@@ -1,5 +1,9 @@
 # Hotpath
 
+[![Tests](https://github.com/rdzehtsiar/hotpath/actions/workflows/tests.yml/badge.svg)](https://github.com/rdzehtsiar/hotpath/actions/workflows/tests.yml)
+[![codecov](https://codecov.io/gh/rdzehtsiar/hotpath/graph/badge.svg)](https://codecov.io/gh/rdzehtsiar/hotpath)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=rdzehtsiar_hotpath&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=rdzehtsiar_hotpath)
+
 Hotpath is an offline, local-first codebase intelligence tool for engineers who need to find risky, expensive, unstable, bloated, or architecturally drifting parts of a repository.
 
 The intended experience is simple: install one binary, run one command in a repo, and get useful codebase intelligence in minutes without sending code anywhere.
