@@ -16,6 +16,9 @@ struct Cli {
 enum Commands {
     /// Scan a repository and print an early placeholder report.
     Scan(ScanArgs),
+
+    /// Check the local Hotpath index health.
+    Doctor,
 }
 
 #[derive(Debug, Args)]
@@ -32,10 +35,11 @@ struct ScanArgs {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    let result = match cli.command {
-        Commands::Scan(args) if args.json => hotpath::scan_json(),
-        Commands::Scan(args) if args.summary => hotpath::scan_summary(),
-        Commands::Scan(_) => hotpath::scan_summary(),
+    let result: Result<String, Box<dyn std::error::Error>> = match cli.command {
+        Commands::Scan(args) if args.json => hotpath::scan_json().map_err(Into::into),
+        Commands::Scan(args) if args.summary => hotpath::scan_summary().map_err(Into::into),
+        Commands::Scan(_) => hotpath::scan_summary().map_err(Into::into),
+        Commands::Doctor => hotpath::doctor().map_err(Into::into),
     };
 
     match result {

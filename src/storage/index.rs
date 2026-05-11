@@ -6,7 +6,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, types::Type, Connection, OptionalExtension, Row, Transaction};
+use rusqlite::{params, types::Type, Connection, OpenFlags, OptionalExtension, Row, Transaction};
 
 use crate::{ContentKind, FileRecord, FileWarning, ScanReport, ScanWarning, SCAN_SCHEMA_VERSION};
 
@@ -35,6 +35,27 @@ pub struct IndexStore {
     connection: Connection,
     path: PathBuf,
     schema_version: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexInspection {
+    Missing { path: PathBuf },
+    Healthy { path: PathBuf, schema_version: u32 },
+}
+
+impl IndexInspection {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Missing { path } | Self::Healthy { path, .. } => path,
+        }
+    }
+
+    pub fn schema_version(&self) -> Option<u32> {
+        match self {
+            Self::Missing { .. } => None,
+            Self::Healthy { schema_version, .. } => Some(*schema_version),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +105,59 @@ pub struct PersistedFileWarning {
 }
 
 impl IndexStore {
+    pub fn inspect(repo_root: impl AsRef<Path>) -> Result<IndexInspection, IndexError> {
+        let path = default_index_path(repo_root);
+        let parent = path
+            .parent()
+            .expect("default index path should always have a parent");
+
+        if !existing_index_dir_is_safe(parent)? {
+            return Ok(IndexInspection::Missing { path });
+        }
+
+        match fs::metadata(&path) {
+            Ok(_) => {}
+            Err(source) if source.kind() == ErrorKind::NotFound => {
+                return Ok(IndexInspection::Missing { path });
+            }
+            Err(source) => {
+                return Err(IndexError::AccessIndex { path, source });
+            }
+        }
+
+        let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|source| IndexError::OpenDatabase {
+                path: path.clone(),
+                source,
+            })?;
+        verify_database_integrity(&connection, &path)?;
+        let schema_version = read_user_version(&connection, &path)?;
+
+        if schema_version > CURRENT_SCHEMA_VERSION {
+            return Err(IndexError::IncompatibleFutureSchema {
+                path,
+                found_version: schema_version,
+                supported_version: CURRENT_SCHEMA_VERSION,
+            });
+        }
+
+        if schema_version != CURRENT_SCHEMA_VERSION {
+            return Err(IndexError::CorruptMetadata {
+                path,
+                message: format!(
+                    "schema version {schema_version} is not initialized for this binary; run 'hotpath scan' to create or migrate the index"
+                ),
+            });
+        }
+
+        verify_metadata(&connection, &path)?;
+
+        Ok(IndexInspection::Healthy {
+            path,
+            schema_version,
+        })
+    }
+
     pub fn open(repo_root: impl AsRef<Path>) -> Result<Self, IndexError> {
         let path = default_index_path(repo_root);
         let parent = path
@@ -293,6 +367,10 @@ pub enum IndexError {
         path: PathBuf,
         source: rusqlite::Error,
     },
+    AccessIndex {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     CorruptDatabase {
         path: PathBuf,
         source: rusqlite::Error,
@@ -340,6 +418,9 @@ impl fmt::Display for IndexError {
             ),
             Self::OpenDatabase { path, source } => {
                 write!(f, "failed to open Hotpath index '{}': {source}", path.display())
+            }
+            Self::AccessIndex { path, source } => {
+                write!(f, "failed to access Hotpath index '{}': {source}", path.display())
             }
             Self::CorruptDatabase { path, source } => write!(
                 f,
@@ -398,6 +479,7 @@ impl StdError for IndexError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::CreateIndexDir { source, .. } => Some(source),
+            Self::AccessIndex { source, .. } => Some(source),
             Self::OpenDatabase { source, .. }
             | Self::CorruptDatabase { source, .. }
             | Self::Migration { source, .. }
@@ -829,6 +911,36 @@ fn ensure_index_dir(path: &Path) -> Result<(), IndexError> {
             path: path.to_path_buf(),
             source,
         }),
+    }
+}
+
+fn existing_index_dir_is_safe(path: &Path) -> Result<bool, IndexError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(IndexError::AccessIndex {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    if is_redirecting_path(&metadata) {
+        return Err(IndexError::UnsafeIndexDir {
+            path: path.to_path_buf(),
+            message: "existing .hotpath directory is a symlink or filesystem reparse point"
+                .to_owned(),
+        });
+    }
+
+    if metadata.file_type().is_dir() {
+        Ok(true)
+    } else {
+        Err(IndexError::CorruptMetadata {
+            path: path.to_path_buf(),
+            message: "existing .hotpath path is not a directory".to_owned(),
+        })
     }
 }
 

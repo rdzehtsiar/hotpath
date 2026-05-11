@@ -80,6 +80,26 @@ fn scan_json(current_dir: &Path) -> (String, Value) {
     (stdout, value)
 }
 
+fn expected_doctor_stdout() -> &'static str {
+    concat!(
+        "Hotpath doctor\n",
+        "index path: .hotpath/index.db\n",
+        "schema version: 1\n",
+        "readable: yes\n",
+        "health: healthy\n",
+    )
+}
+
+fn expected_missing_doctor_stdout() -> &'static str {
+    concat!(
+        "Hotpath doctor\n",
+        "index path: .hotpath/index.db\n",
+        "schema version: none\n",
+        "readable: no\n",
+        "health: missing\n",
+    )
+}
+
 fn file_by_path<'a>(value: &'a Value, path: &str) -> &'a Value {
     value["files"]
         .as_array()
@@ -342,6 +362,56 @@ fn create_symlink_or_skip(
         Err(error) if symlink_setup_should_skip(&error) => Err(error),
         Err(error) => panic!("unexpected symlink setup error: {error}"),
     }
+}
+
+#[test]
+fn doctor_reports_missing_index_without_initializing() {
+    let fixture = Fixture::new("doctor-missing");
+
+    assert!(!fixture.path.join(".hotpath").exists());
+
+    let stdout = successful_stdout(&["doctor"], &fixture.path);
+
+    assert_eq!(stdout, expected_missing_doctor_stdout());
+    assert!(!stdout.contains("health: healthy"));
+    assert!(!fixture.path.join(".hotpath").join("index.db").exists());
+}
+
+#[test]
+fn doctor_reports_healthy_existing_index() {
+    let fixture = Fixture::new("doctor-existing");
+    fixture.write("src/lib.rs", "pub fn lib() {}\n");
+
+    successful_stdout(&["scan"], &fixture.path);
+
+    let stdout = successful_stdout(&["doctor"], &fixture.path);
+
+    assert_eq!(stdout, expected_doctor_stdout());
+}
+
+#[test]
+fn doctor_fails_actionably_for_corrupt_index() {
+    let fixture = Fixture::new("doctor-corrupt");
+    fixture.write_bytes(".hotpath/index.db", b"not a sqlite database");
+
+    let output = hotpath(&["doctor"], &fixture.path);
+
+    assert!(
+        !output.status.success(),
+        "doctor unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+
+    assert!(stderr.starts_with("hotpath: failed to inspect Hotpath index:"));
+    assert!(stderr.contains("index.db"));
+    assert!(
+        stderr.contains("failed to open Hotpath index") || stderr.contains("unreadable or corrupt"),
+        "unexpected stderr: {stderr}"
+    );
 }
 
 #[test]

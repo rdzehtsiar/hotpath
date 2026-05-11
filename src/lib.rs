@@ -254,6 +254,38 @@ impl StdError for ScanError {
     }
 }
 
+#[derive(Debug)]
+pub enum DoctorError {
+    CurrentDir(std::io::Error),
+    Index(storage::index::IndexError),
+}
+
+impl fmt::Display for DoctorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CurrentDir(source) => {
+                write!(f, "failed to determine the current directory: {source}")
+            }
+            Self::Index(source) => write!(f, "failed to inspect Hotpath index: {source}"),
+        }
+    }
+}
+
+impl StdError for DoctorError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::CurrentDir(source) => Some(source),
+            Self::Index(source) => Some(source),
+        }
+    }
+}
+
+impl From<storage::index::IndexError> for DoctorError {
+    fn from(source: storage::index::IndexError) -> Self {
+        Self::Index(source)
+    }
+}
+
 impl From<storage::index::IndexError> for ScanError {
     fn from(source: storage::index::IndexError) -> Self {
         Self::Index(source)
@@ -352,6 +384,33 @@ pub fn scan_json() -> Result<String, ScanError> {
     render_json(&scan_current_dir_and_persist()?)
 }
 
+pub fn doctor() -> Result<String, DoctorError> {
+    let root = env::current_dir().map_err(DoctorError::CurrentDir)?;
+
+    doctor_repository(root)
+}
+
+pub fn doctor_repository(root: impl AsRef<Path>) -> Result<String, DoctorError> {
+    let root = root.as_ref();
+    let inspection = storage::index::IndexStore::inspect(root)?;
+    let index_path = inspection
+        .path()
+        .strip_prefix(root)
+        .unwrap_or_else(|_| inspection.path())
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    match inspection.schema_version() {
+        Some(schema_version) => Ok(render_doctor(
+            &index_path,
+            &schema_version.to_string(),
+            "yes",
+            "healthy",
+        )),
+        None => Ok(render_doctor(&index_path, "none", "no", "missing")),
+    }
+}
+
 fn scan_current_dir_and_persist() -> Result<ScanReport, ScanError> {
     let root = env::current_dir().map_err(ScanError::CurrentDir)?;
     let report = scan_repository(&root)?;
@@ -368,6 +427,12 @@ fn render_json(scan: &ScanReport) -> Result<String, ScanError> {
         warnings: &scan.warnings,
         files: &scan.files,
     })?)
+}
+
+fn render_doctor(index_path: &str, schema_version: &str, readable: &str, health: &str) -> String {
+    format!(
+        "Hotpath doctor\nindex path: {index_path}\nschema version: {schema_version}\nreadable: {readable}\nhealth: {health}"
+    )
 }
 
 fn is_internal_entry(root: &Path, entry: &DirEntry) -> bool {
