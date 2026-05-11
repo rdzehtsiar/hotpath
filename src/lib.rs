@@ -441,7 +441,7 @@ fn ignore_error_message(error: &IgnoreError) -> String {
         } => {
             format!("error parsing glob '{glob}': {err}")
         }
-        IgnoreError::Glob { glob: None, err } => err.to_owned(),
+        IgnoreError::Glob { glob: _, err } => err.to_owned(),
         IgnoreError::UnrecognizedFileType(file_type) => {
             format!("unrecognized file type: {file_type}")
         }
@@ -812,7 +812,7 @@ mod tests {
 
     impl Fixture {
         fn new(name: &str) -> Self {
-            let path = std::env::current_dir()
+            let path = env::current_dir()
                 .expect("test should have a current directory")
                 .join("target")
                 .join("test-fixtures")
