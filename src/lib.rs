@@ -119,74 +119,86 @@ impl ScanReport {
     }
 
     fn summary(&self) -> ScanSummary {
-        let mut summary = ScanSummary {
-            total_files: self.files.len() as u64,
-            total_bytes: 0,
-            content: ContentSummary {
-                text_files: 0,
-                binary_files: 0,
-                unknown_files: 0,
-            },
-            flags: FlagSummary {
-                generated_files: 0,
-                vendor_files: 0,
-            },
-            warnings: WarningSummary {
-                total_warnings: 0,
-                scan_warnings: self.warnings.len() as u64,
-                unreadable_warnings: 0,
-                skipped_warnings: 0,
-            },
-            languages: BTreeMap::new(),
-        };
+        let mut summary = initial_scan_summary(self.files.len(), self.warnings.len());
 
-        summary.warnings.total_warnings += summary.warnings.scan_warnings;
-
-        for warning in &self.warnings {
-            if is_unreadable_warning(warning.code) {
-                summary.warnings.unreadable_warnings += 1;
-            }
-
-            if is_skipped_warning(warning.code) {
-                summary.warnings.skipped_warnings += 1;
-            }
-        }
-
+        accumulate_scan_warnings(&mut summary.warnings, &self.warnings);
         for file in &self.files {
-            summary.total_bytes += file.byte_size.unwrap_or(0);
-
-            match file.content {
-                ContentKind::Text => summary.content.text_files += 1,
-                ContentKind::Binary => summary.content.binary_files += 1,
-                ContentKind::Unknown => summary.content.unknown_files += 1,
-            }
-
-            if file.is_generated {
-                summary.flags.generated_files += 1;
-            }
-
-            if file.is_vendor {
-                summary.flags.vendor_files += 1;
-            }
-
-            if let Some(language) = file.language {
-                *summary.languages.entry(language).or_insert(0) += 1;
-            }
-
-            for warning in &file.warnings {
-                summary.warnings.total_warnings += 1;
-
-                if is_unreadable_warning(warning.code) {
-                    summary.warnings.unreadable_warnings += 1;
-                }
-
-                if is_skipped_warning(warning.code) {
-                    summary.warnings.skipped_warnings += 1;
-                }
-            }
+            accumulate_file_facts(&mut summary, file);
         }
 
         summary
+    }
+}
+
+fn initial_scan_summary(total_files: usize, scan_warnings: usize) -> ScanSummary {
+    ScanSummary {
+        total_files: total_files as u64,
+        total_bytes: 0,
+        content: ContentSummary {
+            text_files: 0,
+            binary_files: 0,
+            unknown_files: 0,
+        },
+        flags: FlagSummary {
+            generated_files: 0,
+            vendor_files: 0,
+        },
+        warnings: WarningSummary {
+            total_warnings: scan_warnings as u64,
+            scan_warnings: scan_warnings as u64,
+            unreadable_warnings: 0,
+            skipped_warnings: 0,
+        },
+        languages: BTreeMap::new(),
+    }
+}
+
+fn accumulate_scan_warnings(summary: &mut WarningSummary, warnings: &[ScanWarning]) {
+    for warning in warnings {
+        accumulate_warning_counters(summary, warning.code);
+    }
+}
+
+fn accumulate_file_facts(summary: &mut ScanSummary, file: &FileRecord) {
+    summary.total_bytes += file.byte_size.unwrap_or(0);
+    accumulate_content_count(&mut summary.content, file.content);
+    accumulate_flag_counts(&mut summary.flags, file);
+
+    if let Some(language) = file.language {
+        *summary.languages.entry(language).or_insert(0) += 1;
+    }
+
+    for warning in &file.warnings {
+        summary.warnings.total_warnings += 1;
+        accumulate_warning_counters(&mut summary.warnings, warning.code);
+    }
+}
+
+fn accumulate_content_count(summary: &mut ContentSummary, content: ContentKind) {
+    match content {
+        ContentKind::Text => summary.text_files += 1,
+        ContentKind::Binary => summary.binary_files += 1,
+        ContentKind::Unknown => summary.unknown_files += 1,
+    }
+}
+
+fn accumulate_flag_counts(summary: &mut FlagSummary, file: &FileRecord) {
+    if file.is_generated {
+        summary.generated_files += 1;
+    }
+
+    if file.is_vendor {
+        summary.vendor_files += 1;
+    }
+}
+
+fn accumulate_warning_counters(summary: &mut WarningSummary, code: &str) {
+    if is_unreadable_warning(code) {
+        summary.unreadable_warnings += 1;
+    }
+
+    if is_skipped_warning(code) {
+        summary.skipped_warnings += 1;
     }
 }
 
