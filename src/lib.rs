@@ -361,6 +361,7 @@ pub enum HotspotsCommandError {
     Scan(ScanError),
     PersistScan(storage::index::IndexError),
     PersistGitAnalysis(storage::index::IndexError),
+    PersistHotspots(storage::index::IndexError),
 }
 
 #[derive(Debug)]
@@ -371,6 +372,7 @@ pub enum ExplainCommandError {
     Scan(ScanError),
     PersistScan(storage::index::IndexError),
     PersistGitAnalysis(storage::index::IndexError),
+    PersistHotspots(storage::index::IndexError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -396,6 +398,9 @@ impl fmt::Display for ExplainCommandError {
             }
             Self::PersistGitAnalysis(source) => {
                 write_explain_persistence_error(f, "persist Git analysis", source)
+            }
+            Self::PersistHotspots(source) => {
+                write_explain_persistence_error(f, "persist hotspot scores", source)
             }
         }
     }
@@ -432,7 +437,9 @@ impl StdError for ExplainCommandError {
             Self::Git(source) => Some(source),
             Self::Path(source) => Some(source),
             Self::Scan(source) => Some(source),
-            Self::PersistScan(source) | Self::PersistGitAnalysis(source) => Some(source),
+            Self::PersistScan(source)
+            | Self::PersistGitAnalysis(source)
+            | Self::PersistHotspots(source) => Some(source),
         }
     }
 }
@@ -465,6 +472,9 @@ impl fmt::Display for HotspotsCommandError {
             Self::PersistGitAnalysis(source) => {
                 write_hotspots_persistence_error(f, "persist Git analysis", source)
             }
+            Self::PersistHotspots(source) => {
+                write_hotspots_persistence_error(f, "persist hotspot scores", source)
+            }
         }
     }
 }
@@ -475,7 +485,9 @@ impl StdError for HotspotsCommandError {
             Self::CurrentDir(source) => Some(source),
             Self::Git(source) => Some(source),
             Self::Scan(source) => Some(source),
-            Self::PersistScan(source) | Self::PersistGitAnalysis(source) => Some(source),
+            Self::PersistScan(source)
+            | Self::PersistGitAnalysis(source)
+            | Self::PersistHotspots(source) => Some(source),
         }
     }
 }
@@ -585,7 +597,7 @@ pub fn hotspots() -> Result<String, HotspotsCommandError> {
     let mut index = storage::index::IndexStore::open(&analysis.worktree_root)
         .map_err(HotspotsCommandError::PersistScan)?;
 
-    index
+    let scan_run = index
         .persist_scan(&scan)
         .map_err(HotspotsCommandError::PersistScan)?;
     index
@@ -599,16 +611,14 @@ pub fn hotspots() -> Result<String, HotspotsCommandError> {
         )
         .map_err(HotspotsCommandError::PersistGitAnalysis)?;
 
-    let raw_metrics = scoring::raw_score_metrics_from_scan_and_git(
+    let ranked = ranked_hotspot_scores_from_scan_and_git(
         &scan.files,
         &analysis.file_metrics,
         &analysis.co_changes,
     );
-    let scores = raw_metrics
-        .into_iter()
-        .map(scoring::calculate_hotspot_score)
-        .collect::<Vec<_>>();
-    let ranked = scoring::rank_hotspot_scores(&scores);
+    index
+        .persist_hotspots(scan_run.id, &ranked)
+        .map_err(HotspotsCommandError::PersistHotspots)?;
 
     Ok(render_hotspots(&ranked, analysis.recent_window_days))
 }
@@ -627,7 +637,7 @@ pub fn explain(requested_path: impl AsRef<Path>) -> Result<String, ExplainComman
     let mut index = storage::index::IndexStore::open(&analysis.worktree_root)
         .map_err(ExplainCommandError::PersistScan)?;
 
-    index
+    let scan_run = index
         .persist_scan(&scan)
         .map_err(ExplainCommandError::PersistScan)?;
     index
@@ -641,17 +651,21 @@ pub fn explain(requested_path: impl AsRef<Path>) -> Result<String, ExplainComman
         )
         .map_err(ExplainCommandError::PersistGitAnalysis)?;
 
-    let score = scoring::raw_score_metrics_from_scan_and_git(
+    let ranked = ranked_hotspot_scores_from_scan_and_git(
         &scan.files,
         &analysis.file_metrics,
         &analysis.co_changes,
-    )
-    .into_iter()
-    .find(|metrics| metrics.path == path)
-    .map(scoring::calculate_hotspot_score)
-    .ok_or(ExplainCommandError::Path(ExplainPathError::NotCurrentFile))?;
+    );
+    index
+        .persist_hotspots(scan_run.id, &ranked)
+        .map_err(ExplainCommandError::PersistHotspots)?;
+    let score = ranked
+        .iter()
+        .find(|ranked_score| ranked_score.score.path == path.as_str())
+        .map(|ranked_score| &ranked_score.score)
+        .ok_or(ExplainCommandError::Path(ExplainPathError::NotCurrentFile))?;
 
-    Ok(render_explain(&score, analysis.recent_window_days))
+    Ok(render_explain(score, analysis.recent_window_days))
 }
 
 pub fn doctor() -> Result<String, DoctorError> {
@@ -708,6 +722,20 @@ fn scan_current_dir_and_persist() -> Result<ScanReport, ScanError> {
     index.persist_scan(&report)?;
 
     Ok(report)
+}
+
+fn ranked_hotspot_scores_from_scan_and_git(
+    files: &[FileRecord],
+    git_metrics: &[git::GitFileMetrics],
+    co_changes: &[git::GitCoChange],
+) -> Vec<scoring::RankedHotspotScore> {
+    let raw_metrics = scoring::raw_score_metrics_from_scan_and_git(files, git_metrics, co_changes);
+    let scores = raw_metrics
+        .into_iter()
+        .map(scoring::calculate_hotspot_score)
+        .collect::<Vec<_>>();
+
+    scoring::rank_hotspot_scores(&scores)
 }
 
 fn render_json(scan: &ScanReport) -> Result<String, ScanError> {
@@ -1196,7 +1224,8 @@ fn write_persistence_error(
             "could not migrate index schema from version {from_version} to {to_version}; remove .hotpath/index.db to rebuild if the index can be discarded"
         ),
         storage::index::IndexError::PersistScan { .. }
-        | storage::index::IndexError::PersistGitAnalysis { .. } => write!(
+        | storage::index::IndexError::PersistGitAnalysis { .. }
+        | storage::index::IndexError::PersistHotspots { .. } => write!(
             f,
             "could not update .hotpath/index.db; ensure the index is writable"
         ),
@@ -1205,7 +1234,8 @@ fn write_persistence_error(
             "could not read .hotpath/index.db; inspect the index with `hotpath doctor`"
         ),
         storage::index::IndexError::InvalidScanData { message, .. }
-        | storage::index::IndexError::InvalidGitAnalysisData { message, .. } => {
+        | storage::index::IndexError::InvalidGitAnalysisData { message, .. }
+        | storage::index::IndexError::InvalidHotspotData { message, .. } => {
             write!(f, "{message}")
         }
     }

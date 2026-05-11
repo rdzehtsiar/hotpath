@@ -144,7 +144,46 @@ fn hotspots_ranks_current_files_and_persists_scan_and_git_inputs() {
             ("src/stable.rs", 1),
         ]
     );
-    assert_eq!(hotspot_row_count(fixture.path()), 0);
+
+    let persisted_hotspots = IndexStore::open(fixture.path())
+        .expect("index should reopen for hotspots")
+        .latest_hotspots()
+        .expect("hotspots should read");
+    assert_eq!(
+        persisted_hotspots
+            .iter()
+            .map(|hotspot| (hotspot.rank, hotspot.path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, "src/risky.rs"),
+            (2, "src/related.rs"),
+            (3, "src/stable.rs"),
+        ]
+    );
+    assert!(persisted_hotspots
+        .iter()
+        .all(|hotspot| hotspot.formula_version == "hotpath.score.v1"));
+    assert_eq!(hotspot_row_count(fixture.path()), 3);
+    let risky_raw_metrics = serde_json::from_str::<serde_json::Value>(
+        persisted_hotspots[0]
+            .raw_metrics_json
+            .as_deref()
+            .expect("raw metrics JSON should be stored"),
+    )
+    .expect("raw metrics JSON should parse");
+    assert_eq!(risky_raw_metrics["path"], "src/risky.rs");
+    assert_eq!(risky_raw_metrics["line_count"], 100);
+    let risky_explanation = serde_json::from_str::<serde_json::Value>(
+        persisted_hotspots[0]
+            .explanation
+            .as_deref()
+            .expect("explanation JSON should be stored"),
+    )
+    .expect("explanation JSON should parse");
+    assert_eq!(
+        risky_explanation["weighted_terms"][0]["formula_version"]["id"],
+        "hotpath.score.v1"
+    );
 }
 
 #[test]
@@ -213,6 +252,11 @@ fn hotspots_reports_empty_current_file_set_after_all_files_are_deleted() {
         .expect("scan should read")
         .expect("scan should exist");
     assert!(persisted.files.is_empty());
+    let persisted_hotspots = IndexStore::open(fixture.path())
+        .expect("index should reopen for hotspots")
+        .latest_hotspots()
+        .expect("hotspots should read");
+    assert!(persisted_hotspots.is_empty());
     assert_eq!(hotspot_row_count(fixture.path()), 0);
 }
 

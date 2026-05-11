@@ -9,8 +9,10 @@ use std::path::{Path, PathBuf};
 use rusqlite::{
     params, types::Type, Connection, OpenFlags, OptionalExtension, Row, Statement, Transaction,
 };
+use serde::Serialize;
 
 use crate::git::{GitCoChange, GitFileMetrics};
+use crate::scoring::{NormalizedScoreMetrics, RankedHotspotScore, ScoreLimitation, WeightedTerm};
 use crate::{ContentKind, FileRecord, FileWarning, ScanReport, ScanWarning, SCAN_SCHEMA_VERSION};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 2;
@@ -154,6 +156,28 @@ pub struct PersistedGitCoChange {
     pub left_path: String,
     pub right_path: String,
     pub commit_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedHotspot {
+    pub path: String,
+    pub score: f64,
+    pub rank: u64,
+    pub formula_version: String,
+    pub raw_metrics_json: Option<String>,
+    pub explanation: Option<String>,
+    pub limitation: Option<String>,
+}
+
+#[derive(Serialize)]
+struct HotspotExplanationPayload<'a> {
+    normalized_metrics: &'a NormalizedScoreMetrics,
+    weighted_terms: &'a [WeightedTerm],
+}
+
+#[derive(Serialize)]
+struct HotspotLimitationsPayload<'a> {
+    limitations: &'a [ScoreLimitation],
 }
 
 impl IndexStore {
@@ -637,6 +661,77 @@ impl IndexStore {
         })
     }
 
+    pub fn persist_hotspots(
+        &mut self,
+        scan_run_id: i64,
+        ranked_scores: &[RankedHotspotScore],
+    ) -> Result<(), IndexError> {
+        let index_path = self.path.clone();
+        let transaction =
+            self.connection
+                .transaction()
+                .map_err(|source| IndexError::PersistHotspots {
+                    path: index_path.clone(),
+                    source,
+                })?;
+        let repo_id = ensure_repo_for_hotspots(&transaction, &index_path)?;
+
+        transaction
+            .execute("DELETE FROM hotspots WHERE repo_id = ?1;", params![repo_id])
+            .map_err(|source| IndexError::PersistHotspots {
+                path: index_path.clone(),
+                source,
+            })?;
+
+        {
+            let mut file_id_query = transaction
+                .prepare("SELECT id FROM files WHERE repo_id = ?1 AND path = ?2;")
+                .map_err(|source| IndexError::PersistHotspots {
+                    path: index_path.clone(),
+                    source,
+                })?;
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO hotspots (
+                        file_id,
+                        repo_id,
+                        scan_run_id,
+                        score,
+                        rank,
+                        formula_version,
+                        raw_metrics_json,
+                        explanation,
+                        limitation
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);",
+                )
+                .map_err(|source| IndexError::PersistHotspots {
+                    path: index_path.clone(),
+                    source,
+                })?;
+
+            for ranked_score in ranked_scores {
+                persist_hotspot(
+                    &mut file_id_query,
+                    &mut insert,
+                    &index_path,
+                    repo_id,
+                    scan_run_id,
+                    ranked_score,
+                )?;
+            }
+        }
+
+        transaction
+            .commit()
+            .map_err(|source| IndexError::PersistHotspots {
+                path: index_path,
+                source,
+            })?;
+
+        Ok(())
+    }
+
     pub fn latest_scan(&self) -> Result<Option<PersistedScan>, IndexError> {
         let Some(run) = self
             .connection
@@ -751,6 +846,42 @@ impl IndexStore {
             co_changes,
         }))
     }
+
+    pub fn latest_hotspots(&self) -> Result<Vec<PersistedHotspot>, IndexError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT
+                    files.path,
+                    hotspots.score,
+                    hotspots.rank,
+                    hotspots.formula_version,
+                    hotspots.raw_metrics_json,
+                    hotspots.explanation,
+                    hotspots.limitation
+                 FROM hotspots
+                 INNER JOIN files ON files.id = hotspots.file_id
+                 INNER JOIN repos ON repos.id = hotspots.repo_id
+                 WHERE repos.root_key = '.'
+                 ORDER BY hotspots.rank, files.path;",
+            )
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })?;
+        let rows = statement
+            .query_map([], read_persisted_hotspot)
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })
+    }
 }
 
 #[derive(Debug)]
@@ -798,6 +929,10 @@ pub enum IndexError {
         path: PathBuf,
         source: rusqlite::Error,
     },
+    PersistHotspots {
+        path: PathBuf,
+        source: rusqlite::Error,
+    },
     ReadIndex {
         path: PathBuf,
         source: rusqlite::Error,
@@ -807,6 +942,10 @@ pub enum IndexError {
         message: String,
     },
     InvalidGitAnalysisData {
+        path: PathBuf,
+        message: String,
+    },
+    InvalidHotspotData {
         path: PathBuf,
         message: String,
     },
@@ -870,6 +1009,11 @@ impl fmt::Display for IndexError {
                 "failed to persist Git analysis to Hotpath index '{}': {source}",
                 path.display()
             ),
+            Self::PersistHotspots { path, source } => write!(
+                f,
+                "failed to persist hotspot scores to Hotpath index '{}': {source}",
+                path.display()
+            ),
             Self::ReadIndex { path, source } => write!(
                 f,
                 "failed to read Hotpath index '{}': {source}",
@@ -883,6 +1027,11 @@ impl fmt::Display for IndexError {
             Self::InvalidGitAnalysisData { path, message } => write!(
                 f,
                 "Git analysis cannot be persisted to Hotpath index '{}': {message}",
+                path.display()
+            ),
+            Self::InvalidHotspotData { path, message } => write!(
+                f,
+                "hotspot scores cannot be persisted to Hotpath index '{}': {message}",
                 path.display()
             ),
         }
@@ -899,12 +1048,14 @@ impl StdError for IndexError {
             | Self::Migration { source, .. }
             | Self::PersistScan { source, .. }
             | Self::PersistGitAnalysis { source, .. }
+            | Self::PersistHotspots { source, .. }
             | Self::ReadIndex { source, .. } => Some(source),
             Self::CorruptMetadata { .. }
             | Self::UnsafeIndexDir { .. }
             | Self::IncompatibleFutureSchema { .. }
             | Self::InvalidScanData { .. }
-            | Self::InvalidGitAnalysisData { .. } => None,
+            | Self::InvalidGitAnalysisData { .. }
+            | Self::InvalidHotspotData { .. } => None,
         }
     }
 }
@@ -957,6 +1108,28 @@ fn ensure_repo_for_git(transaction: &Transaction<'_>, path: &Path) -> Result<i64
         })
 }
 
+fn ensure_repo_for_hotspots(transaction: &Transaction<'_>, path: &Path) -> Result<i64, IndexError> {
+    transaction
+        .execute(
+            "INSERT INTO repos (root_key)
+             VALUES ('.')
+             ON CONFLICT(root_key) DO NOTHING;",
+            [],
+        )
+        .map_err(|source| IndexError::PersistHotspots {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    transaction
+        .query_row("SELECT id FROM repos WHERE root_key = '.';", [], |row| {
+            row.get(0)
+        })
+        .map_err(|source| IndexError::PersistHotspots {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
 fn ensure_git_path_file(
     transaction: &Transaction<'_>,
     index_path: &Path,
@@ -991,6 +1164,70 @@ fn ensure_git_path_file(
             source,
         })?;
     file_ids.insert(file_path.to_owned(), file_id);
+
+    Ok(())
+}
+
+fn persist_hotspot(
+    file_id_query: &mut Statement<'_>,
+    insert: &mut Statement<'_>,
+    index_path: &Path,
+    repo_id: i64,
+    scan_run_id: i64,
+    ranked_score: &RankedHotspotScore,
+) -> Result<(), IndexError> {
+    let score = &ranked_score.score;
+
+    if !score.value.is_finite() || score.value < 0.0 {
+        return Err(IndexError::InvalidHotspotData {
+            path: index_path.to_path_buf(),
+            message: format!(
+                "hotspot score for '{}' must be a finite non-negative number",
+                score.path
+            ),
+        });
+    }
+
+    let rank = u64_to_i64_for_hotspot(ranked_score.rank, index_path, "rank")?;
+    let raw_metrics_json = hotspot_json(&score.raw_metrics, index_path, "raw_metrics_json")?;
+    let explanation = hotspot_json(
+        &HotspotExplanationPayload {
+            normalized_metrics: &score.normalized_metrics,
+            weighted_terms: &score.weighted_terms,
+        },
+        index_path,
+        "explanation",
+    )?;
+    let limitation = hotspot_json(
+        &HotspotLimitationsPayload {
+            limitations: &score.limitations,
+        },
+        index_path,
+        "limitation",
+    )?;
+    let file_id = file_id_query
+        .query_row(params![repo_id, &score.path], |row| row.get::<_, i64>(0))
+        .map_err(|source| IndexError::PersistHotspots {
+            path: index_path.to_path_buf(),
+            source,
+        })?;
+
+    insert
+        .execute(params![
+            file_id,
+            repo_id,
+            scan_run_id,
+            score.value,
+            rank,
+            &score.formula_version.id,
+            raw_metrics_json,
+            explanation,
+            limitation,
+        ])
+        .map_err(|source| IndexError::PersistHotspots {
+            path: index_path.to_path_buf(),
+            source,
+        })?;
 
     Ok(())
 }
@@ -1374,6 +1611,18 @@ fn read_persisted_git_co_change(row: &Row<'_>) -> rusqlite::Result<PersistedGitC
     })
 }
 
+fn read_persisted_hotspot(row: &Row<'_>) -> rusqlite::Result<PersistedHotspot> {
+    Ok(PersistedHotspot {
+        path: row.get(0)?,
+        score: row.get(1)?,
+        rank: i64_to_u64(row.get(2)?, 2)?,
+        formula_version: row.get(3)?,
+        raw_metrics_json: row.get(4)?,
+        explanation: row.get(5)?,
+        limitation: row.get(6)?,
+    })
+}
+
 fn read_persisted_scan_warning(row: &Row<'_>) -> rusqlite::Result<PersistedScanWarning> {
     Ok(PersistedScanWarning {
         code: row.get(0)?,
@@ -1424,6 +1673,28 @@ fn u64_to_i64_for_git(
     i64::try_from(value).map_err(|_| IndexError::InvalidGitAnalysisData {
         path: path.to_path_buf(),
         message: format!("{field_name} value {value} exceeds SQLite INTEGER range"),
+    })
+}
+
+fn u64_to_i64_for_hotspot(
+    value: u64,
+    path: &Path,
+    field_name: &'static str,
+) -> Result<i64, IndexError> {
+    i64::try_from(value).map_err(|_| IndexError::InvalidHotspotData {
+        path: path.to_path_buf(),
+        message: format!("{field_name} value {value} exceeds SQLite INTEGER range"),
+    })
+}
+
+fn hotspot_json<T: Serialize>(
+    value: &T,
+    path: &Path,
+    field_name: &'static str,
+) -> Result<String, IndexError> {
+    serde_json::to_string(value).map_err(|source| IndexError::InvalidHotspotData {
+        path: path.to_path_buf(),
+        message: format!("failed to serialize {field_name} as JSON: {source}"),
     })
 }
 
@@ -3244,6 +3515,7 @@ fn read_metadata_schema_identifier(
 mod tests {
     use super::*;
 
+    use crate::scoring::{calculate_hotspot_score, rank_hotspot_scores, RawScoreMetrics};
     use crate::{FileWarning, ScanWarning};
 
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3961,6 +4233,117 @@ mod tests {
             .file_stats
             .iter()
             .all(|stats| !stats.path.contains(&fixture.path.display().to_string())));
+    }
+
+    #[test]
+    fn persist_hotspots_records_ranked_scores_json_payloads_and_replaces_rows() {
+        let fixture = Fixture::new("persist-hotspots");
+        let mut store = IndexStore::open(&fixture.path).expect("index should open");
+        let mut risky_file = scan_file(
+            "src/risky.rs",
+            Some(131_072),
+            Some("Rust"),
+            ContentKind::Binary,
+        );
+        risky_file.line_count = None;
+        let mut stable_file = scan_file("src/stable.rs", Some(20), Some("Rust"), ContentKind::Text);
+        stable_file.line_count = Some(1);
+        let scan_run = store
+            .persist_scan(&scan_report(vec![risky_file, stable_file]))
+            .expect("scan should persist");
+        let scores = vec![
+            calculate_hotspot_score(RawScoreMetrics {
+                path: "src/stable.rs".to_owned(),
+                byte_size: Some(20),
+                line_count: Some(1),
+                commits_per_file: Some(1),
+                total_churn_lines: Some(1),
+                recent_churn_lines: Some(0),
+                author_count: Some(1),
+                dominant_owner_share: Some(1.0),
+                co_changed_file_count: Some(0),
+            }),
+            calculate_hotspot_score(RawScoreMetrics {
+                path: "src/risky.rs".to_owned(),
+                byte_size: Some(131_072),
+                line_count: None,
+                commits_per_file: Some(4),
+                total_churn_lines: Some(2_000),
+                recent_churn_lines: Some(200),
+                author_count: Some(4),
+                dominant_owner_share: Some(0.25),
+                co_changed_file_count: Some(3),
+            }),
+        ];
+        let ranked = rank_hotspot_scores(&scores);
+
+        store
+            .persist_hotspots(scan_run.id, &ranked)
+            .expect("hotspots should persist");
+
+        let persisted = store.latest_hotspots().expect("hotspots should read");
+        assert_eq!(
+            persisted
+                .iter()
+                .map(|hotspot| (hotspot.rank, hotspot.path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "src/risky.rs"), (2, "src/stable.rs")]
+        );
+        assert_eq!(persisted[0].formula_version, "hotpath.score.v1");
+        assert!(persisted[0].score > persisted[1].score);
+
+        let raw_metrics = serde_json::from_str::<serde_json::Value>(
+            persisted[0]
+                .raw_metrics_json
+                .as_deref()
+                .expect("raw metrics JSON should be stored"),
+        )
+        .expect("raw metrics JSON should parse");
+        assert_eq!(raw_metrics["path"], "src/risky.rs");
+        assert_eq!(raw_metrics["byte_size"], 131_072);
+        assert!(raw_metrics["line_count"].is_null());
+
+        let explanation = serde_json::from_str::<serde_json::Value>(
+            persisted[0]
+                .explanation
+                .as_deref()
+                .expect("explanation JSON should be stored"),
+        )
+        .expect("explanation JSON should parse");
+        assert_eq!(explanation["normalized_metrics"]["size"], 1.0);
+        assert_eq!(explanation["weighted_terms"][0]["name"], "churn_score");
+        assert_eq!(
+            explanation["weighted_terms"][0]["formula_version"]["id"],
+            "hotpath.score.v1"
+        );
+
+        let limitation = serde_json::from_str::<serde_json::Value>(
+            persisted[0]
+                .limitation
+                .as_deref()
+                .expect("limitation JSON should be stored"),
+        )
+        .expect("limitation JSON should parse");
+        assert_eq!(
+            limitation["limitations"][0]["code"],
+            "size_uses_byte_size_fallback"
+        );
+
+        let replacement = rank_hotspot_scores(&[scores[0].clone()]);
+        store
+            .persist_hotspots(scan_run.id, &replacement)
+            .expect("replacement hotspots should persist");
+
+        let replaced = store
+            .latest_hotspots()
+            .expect("replacement hotspots should read");
+        assert_eq!(
+            replaced
+                .iter()
+                .map(|hotspot| (hotspot.rank, hotspot.path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "src/stable.rs")]
+        );
     }
 
     #[test]

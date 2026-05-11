@@ -131,6 +131,41 @@ fn explain_reports_score_inputs_formula_contributions_and_persists_inputs() {
             .collect::<Vec<_>>(),
         vec![("src/risky.rs", 2), ("src/stable.rs", 1)]
     );
+
+    let persisted_hotspots = IndexStore::open(fixture.path())
+        .expect("index should reopen for hotspots")
+        .latest_hotspots()
+        .expect("hotspots should read");
+    assert_eq!(
+        persisted_hotspots
+            .iter()
+            .map(|hotspot| (hotspot.rank, hotspot.path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(1, "src/risky.rs"), (2, "src/stable.rs")]
+    );
+    assert!(persisted_hotspots
+        .iter()
+        .all(|hotspot| hotspot.formula_version == "hotpath.score.v1"));
+    let risky_raw_metrics = serde_json::from_str::<serde_json::Value>(
+        persisted_hotspots[0]
+            .raw_metrics_json
+            .as_deref()
+            .expect("raw metrics JSON should be stored"),
+    )
+    .expect("raw metrics JSON should parse");
+    assert_eq!(risky_raw_metrics["path"], "src/risky.rs");
+    assert_eq!(risky_raw_metrics["line_count"], 4);
+    let risky_limitations = serde_json::from_str::<serde_json::Value>(
+        persisted_hotspots[0]
+            .limitation
+            .as_deref()
+            .expect("limitation JSON should be stored"),
+    )
+    .expect("limitation JSON should parse");
+    assert!(risky_limitations["limitations"]
+        .as_array()
+        .expect("limitations should be an array")
+        .is_empty());
 }
 
 #[test]
@@ -186,6 +221,17 @@ fn explain_reports_zero_git_metrics_for_untracked_existing_file() {
             .map(|stats| stats.path.as_str())
             .collect::<Vec<_>>(),
         vec!["src/lib.rs"]
+    );
+    let persisted_hotspots = IndexStore::open(fixture.path())
+        .expect("index should reopen for hotspots")
+        .latest_hotspots()
+        .expect("hotspots should read");
+    assert_eq!(
+        persisted_hotspots
+            .iter()
+            .map(|hotspot| (hotspot.rank, hotspot.path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(1, "src/lib.rs"), (2, "notes/todo.md")]
     );
 }
 
