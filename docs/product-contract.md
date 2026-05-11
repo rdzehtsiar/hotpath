@@ -5,7 +5,8 @@ intelligence tool. Its purpose is to help engineers find parts of a repository
 that may be risky, expensive, unstable, bloated, or architecturally drifting.
 
 Hotpath is at the beginning of development. This document describes the product
-contract the project is being built toward. It does not describe a released CLI,
+contract the project is being built toward and the boundaries the current early
+scanner and local index should preserve. It does not describe a released CLI,
 stable output format, or compatibility guarantee.
 
 ## Core Promise
@@ -74,10 +75,10 @@ Hotpath may inspect repository files, Git metadata, local configuration, and
 local indexes as needed for codebase intelligence. The core workflow should keep
 that data on the user's machine.
 
-Local indexes should be treated as derived cache data. The planned index
-location and invariants are documented in [Index invariants](index.md),
-including schema versioning, path normalization, stale file deletion, corruption
-handling, and rebuild behavior.
+Local indexes should be treated as derived cache data. The current index
+location and behavior are documented in [Local index](index.md), including
+schema versioning, path normalization, stale file deletion, `hotpath doctor`,
+corruption handling, and rebuild behavior.
 
 When Hotpath produces metrics or findings, the output should make clear what was
 measured, where it was measured, which formula or rule was used, which raw

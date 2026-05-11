@@ -1,25 +1,30 @@
 # Limitations
 
 Hotpath is at the beginning of development. The repository currently contains
-early project scaffolding and documentation. There is no stable CLI, no released
-binary, no supported report format, and no compatibility promise yet.
+an early Rust CLI with scanner and index health commands. There is no released
+binary, stable CLI contract, supported report format, or compatibility promise
+yet.
 
 This page documents the limits Hotpath should make explicit as it develops.
 
 ## Current Limitations
 
-Hotpath does not currently provide a stable implementation of repository
-scanning, indexing, Git analysis, scoring, reports, CI output, architecture
-rules, or a terminal UI.
+Hotpath currently provides early repository scanning, scan persistence to a
+local index, and `hotpath doctor` index health checks. These are not stable
+interfaces.
+
+Hotpath does not currently provide a stable implementation of Git analysis,
+parser-backed symbol analysis, dependency analysis, hotspot scoring, CI output,
+architecture rules, or a terminal UI.
 
 Future commands, crate layout, data models, scoring formulas, and output formats
 may change while the product contract and first implementation milestones are
 built.
 
-The planned `.hotpath/index.db` invariants are documented separately in
-[Index invariants](index.md), but the index is not yet a stable public database
-format. During early development, incompatible local indexes may need to be
-rebuilt instead of migrated.
+The current `.hotpath/index.db` behavior is documented separately in
+[Local index](index.md), but the index is not yet a stable public database
+format. During early development, incompatible or corrupt local indexes may need
+to be deleted and rebuilt instead of migrated.
 
 ## Product Boundaries
 
@@ -81,5 +86,6 @@ default and no cloud APIs for primary analysis. Generated reports and local
 indexes may still contain sensitive derived information from the repository, so
 users should handle them according to their own security and retention rules.
 
-Hotpath should document local reads and writes clearly as implementation
-details become stable.
+Current index data is stored under `.hotpath/` without a daemon or network
+service. Hotpath should continue to document local reads and writes clearly as
+implementation details become stable.

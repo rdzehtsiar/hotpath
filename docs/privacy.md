@@ -5,8 +5,8 @@ network access, telemetry, cloud APIs, hosted services, or uploading repository
 contents.
 
 Hotpath is at the beginning of development. This document defines the privacy
-posture the project is being built toward; it does not describe a released
-binary or complete implementation.
+posture the project is being built toward and describes the local data written
+by the current early scanner and index implementation.
 
 ## Default Posture
 
@@ -37,28 +37,34 @@ Hotpath should read only what is needed for local analysis and should document
 unsupported file types, encodings, generated files, vendor directories, and
 other classification limits.
 
-## Local Data Hotpath May Write
+## Local Data Hotpath Writes Now
 
-Future implementations may write local data such as:
+Current scan commands write derived local index data at:
 
-- local indexes
-- scan metadata
-- report files requested by the user
-- cache files needed to make repeated scans faster
+```text
+.hotpath/index.db
+```
 
-Local writes should be documented, deterministic where practical, and avoid
-including host-specific absolute paths in portable output unless the user asks
-for them.
+The index stores scanner file facts, scan run metadata, scan warnings, and
+per-file warnings. It uses repository-relative paths and does not store full
+source-file contents. Reserved schema tables for future Git, parser,
+dependency, and hotspot data exist but are not populated by current scans.
 
-The planned local index is `.hotpath/index.db`. It is documented as derived
-local cache data in [Index invariants](index.md). It may contain sensitive
-repository-derived information, but creating, reading, validating, deleting, or
-rebuilding it should not require network access or telemetry.
+The index is documented as derived local cache data in [Local index](index.md).
+It may contain sensitive repository-derived information, but creating, reading,
+validating, deleting, or rebuilding it does not require network access,
+telemetry, cloud APIs, hosted services, or a daemon.
+
+Future implementations may write additional local data such as user-requested
+report files or cache files needed to make repeated scans faster. Local writes
+should be documented, deterministic where practical, and avoid including
+host-specific absolute paths in portable output unless the user asks for them.
 
 ## Network And Cloud Boundaries
 
-Primary Hotpath workflows should not make network calls. Scanning, scoring,
-indexing, and report generation should not depend on cloud APIs.
+Primary Hotpath workflows should not make network calls. Scanning, indexing,
+and report generation should not depend on cloud APIs. Future scoring behavior
+should follow the same boundary when it is implemented.
 
 If future optional features ever need network access, they should be explicit,
 documented, opt-in, and separate from the core local workflow. They should not

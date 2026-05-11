@@ -33,7 +33,9 @@ into explainable hotspot reports that help engineers decide where to investigate
 
 Hotpath is at the very beginning of development.
 
-The repository currently contains private planning material and early project scaffolding only. There is no stable CLI, no released binary, no supported report format, and no compatibility promise yet.
+The repository currently contains an early Rust CLI with `hotpath scan` and `hotpath doctor`. The scanner reports local file facts and warnings, and scan commands persist a derived local SQLite index at `.hotpath/index.db`.
+
+There is no released binary, stable CLI contract, stable index format, supported report format, Git analysis, parser-backed symbol analysis, dependency analysis, or hotspot scoring compatibility promise yet.
 
 Expect the crate layout, commands, data model, scoring formulas, output formats, and documentation to change as the product contract and first implementation milestones are built.
 
@@ -44,7 +46,7 @@ The public contract for Hotpath is documented in:
 - [Product contract](docs/product-contract.md)
 - [Privacy](docs/privacy.md)
 - [Scoring principles](docs/scoring.md)
-- [Index invariants](docs/index.md)
+- [Local index](docs/index.md)
 - [Limitations](docs/limitations.md)
 
 ## Product Principles
@@ -110,6 +112,8 @@ cargo test
 ## Privacy
 
 Hotpath is designed as a local tool. The core workflow should not require network access, telemetry, cloud APIs, hosted services, or uploading repository contents.
+
+Current scans write derived local cache data under `.hotpath/`, including `.hotpath/index.db`. The index stores scanner file facts, scan run metadata, and scan/file warnings using repository-relative paths. It does not require a daemon or network access, and it can be deleted and rebuilt with `hotpath scan`. See [Local index](docs/index.md).
 
 ## License
 
