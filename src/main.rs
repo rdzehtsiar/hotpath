@@ -20,6 +20,9 @@ enum Commands {
     /// Explain local Git history metrics for one file.
     ExplainGit(ExplainGitArgs),
 
+    /// Rank current files by advisory hotspot risk.
+    Hotspots,
+
     /// Check the local Hotpath index health.
     Doctor,
 }
@@ -51,6 +54,7 @@ fn main() -> ExitCode {
         Commands::ExplainGit(args) => {
             hotpath::explain_git_and_persist(&args.path).map_err(Into::into)
         }
+        Commands::Hotspots => hotpath::hotspots().map_err(Into::into),
         Commands::Doctor => hotpath::doctor().map_err(Into::into),
     };
 

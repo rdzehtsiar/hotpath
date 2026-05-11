@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::Serialize;
+
+use crate::git::{GitCoChange, GitFileMetrics};
+use crate::FileRecord;
 
 /// Current score formula identifier.
 ///
@@ -231,6 +236,57 @@ pub fn rank_hotspot_scores(scores: &[HotspotScore]) -> Vec<RankedHotspotScore> {
         .map(|(index, score)| RankedHotspotScore {
             rank: index as u64 + 1,
             score,
+        })
+        .collect()
+}
+
+/// Assemble score inputs for current scanned files from scanner and Git facts.
+///
+/// The scanner defines the current file set. Git metrics enrich those files
+/// when local history has observed them; files without Git metrics receive
+/// explicit zero-valued history inputs rather than being dropped.
+pub fn raw_score_metrics_from_scan_and_git(
+    files: &[FileRecord],
+    git_metrics: &[GitFileMetrics],
+    co_changes: &[GitCoChange],
+) -> Vec<RawScoreMetrics> {
+    let metrics_by_path = git_metrics
+        .iter()
+        .map(|metric| (metric.path.as_str(), metric))
+        .collect::<BTreeMap<_, _>>();
+    let co_changed_paths = co_changed_paths_by_file(co_changes);
+    let mut files = files.iter().collect::<Vec<_>>();
+
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+
+    files
+        .into_iter()
+        .map(|file| {
+            let metric = metrics_by_path.get(file.path.as_str()).copied();
+
+            RawScoreMetrics {
+                path: file.path.clone(),
+                byte_size: file.byte_size,
+                line_count: file.line_count,
+                commits_per_file: Some(metric.map_or(0, |metric| metric.commits_per_file)),
+                total_churn_lines: Some(metric.map_or(0, |metric| {
+                    metric
+                        .total_churn_added
+                        .saturating_add(metric.total_churn_deleted)
+                })),
+                recent_churn_lines: Some(metric.map_or(0, |metric| {
+                    metric
+                        .recent_churn_added
+                        .saturating_add(metric.recent_churn_deleted)
+                })),
+                author_count: Some(metric.map_or(0, |metric| metric.author_count)),
+                dominant_owner_share: metric.and_then(|metric| metric.dominant_owner_share),
+                co_changed_file_count: Some(
+                    co_changed_paths
+                        .get(file.path.as_str())
+                        .map_or(0, |paths| paths.len() as u64),
+                ),
+            }
         })
         .collect()
 }
@@ -467,6 +523,23 @@ fn compare_hotspot_scores_for_ranking(
         .value
         .total_cmp(&left.value)
         .then_with(|| left.path.cmp(&right.path))
+}
+
+fn co_changed_paths_by_file(co_changes: &[GitCoChange]) -> BTreeMap<&str, BTreeSet<&str>> {
+    let mut paths_by_file = BTreeMap::<&str, BTreeSet<&str>>::new();
+
+    for co_change in co_changes {
+        paths_by_file
+            .entry(co_change.left_path.as_str())
+            .or_default()
+            .insert(co_change.right_path.as_str());
+        paths_by_file
+            .entry(co_change.right_path.as_str())
+            .or_default()
+            .insert(co_change.left_path.as_str());
+    }
+
+    paths_by_file
 }
 
 fn saturating_author_fragmentation(author_count: u64) -> f64 {
@@ -733,6 +806,72 @@ mod tests {
     }
 
     #[test]
+    fn assembles_raw_score_metrics_for_current_scanned_files() {
+        let files = vec![
+            file_record("src/stable.rs", Some(25), Some(2)),
+            file_record("src/risky.rs", Some(200), Some(20)),
+        ];
+        let git_metrics = vec![GitFileMetrics {
+            path: "src/risky.rs".to_owned(),
+            commits_per_file: 3,
+            total_churn_added: 30,
+            total_churn_deleted: 5,
+            recent_churn_added: 10,
+            recent_churn_deleted: 1,
+            author_count: 2,
+            dominant_owner: Some("Ada Lovelace <ada@example.invalid>".to_owned()),
+            dominant_owner_share: Some(2.0 / 3.0),
+            first_commit_id: Some("a".repeat(40)),
+            first_commit_time: Some(1),
+            last_commit_id: Some("b".repeat(40)),
+            last_commit_time: Some(2),
+            file_age_days: Some(10),
+        }];
+        let co_changes = vec![
+            GitCoChange {
+                left_path: "src/risky.rs".to_owned(),
+                right_path: "src/stable.rs".to_owned(),
+                commit_count: 1,
+            },
+            GitCoChange {
+                left_path: "src/old.rs".to_owned(),
+                right_path: "src/risky.rs".to_owned(),
+                commit_count: 2,
+            },
+        ];
+
+        let raw_metrics = raw_score_metrics_from_scan_and_git(&files, &git_metrics, &co_changes);
+
+        assert_eq!(
+            raw_metrics,
+            vec![
+                RawScoreMetrics {
+                    path: "src/risky.rs".to_owned(),
+                    byte_size: Some(200),
+                    line_count: Some(20),
+                    commits_per_file: Some(3),
+                    total_churn_lines: Some(35),
+                    recent_churn_lines: Some(11),
+                    author_count: Some(2),
+                    dominant_owner_share: Some(2.0 / 3.0),
+                    co_changed_file_count: Some(2),
+                },
+                RawScoreMetrics {
+                    path: "src/stable.rs".to_owned(),
+                    byte_size: Some(25),
+                    line_count: Some(2),
+                    commits_per_file: Some(0),
+                    total_churn_lines: Some(0),
+                    recent_churn_lines: Some(0),
+                    author_count: Some(0),
+                    dominant_owner_share: None,
+                    co_changed_file_count: Some(1),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn normalization_maps_raw_metrics_to_bounded_inputs() {
         let raw_metrics = RawScoreMetrics {
             total_churn_lines: Some(1_000),
@@ -943,6 +1082,22 @@ mod tests {
         });
         score.value = value;
         score
+    }
+
+    fn file_record(path: &str, byte_size: Option<u64>, line_count: Option<u64>) -> FileRecord {
+        FileRecord {
+            path: path.to_owned(),
+            byte_size,
+            extension: None,
+            language: None,
+            line_count,
+            is_vendor: false,
+            is_generated: false,
+            content: crate::ContentKind::Text,
+            is_symlink: false,
+            classification: "implemented",
+            warnings: Vec::new(),
+        }
     }
 
     fn ranked_paths(ranked_scores: &[RankedHotspotScore]) -> Vec<String> {

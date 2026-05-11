@@ -20,6 +20,7 @@ const BINARY_SAMPLE_BYTES: usize = 8 * 1024;
 const MAX_TEXT_READ_BYTES: u64 = 8 * 1024 * 1024;
 pub const SCAN_SCHEMA_VERSION: &str = "hotpath.scan.v1";
 const SUMMARY_LABEL_WIDTH: usize = 12;
+const HOTSPOTS_REPORT_LIMIT: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NormalizedPath {
@@ -353,6 +354,56 @@ impl From<storage::index::IndexError> for ExplainGitCommandError {
     }
 }
 
+#[derive(Debug)]
+pub enum HotspotsCommandError {
+    CurrentDir(std::io::Error),
+    Git(git::GitHistoryError),
+    Scan(ScanError),
+    PersistScan(storage::index::IndexError),
+    PersistGitAnalysis(storage::index::IndexError),
+}
+
+impl fmt::Display for HotspotsCommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CurrentDir(source) => {
+                write!(f, "failed to determine the current directory: {source}")
+            }
+            Self::Git(source) => write_hotspots_git_error(f, source),
+            Self::Scan(source) => write!(f, "{source}"),
+            Self::PersistScan(source) => {
+                write_hotspots_persistence_error(f, "persist scan results", source)
+            }
+            Self::PersistGitAnalysis(source) => {
+                write_hotspots_persistence_error(f, "persist Git analysis", source)
+            }
+        }
+    }
+}
+
+impl StdError for HotspotsCommandError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::CurrentDir(source) => Some(source),
+            Self::Git(source) => Some(source),
+            Self::Scan(source) => Some(source),
+            Self::PersistScan(source) | Self::PersistGitAnalysis(source) => Some(source),
+        }
+    }
+}
+
+impl From<git::GitHistoryError> for HotspotsCommandError {
+    fn from(source: git::GitHistoryError) -> Self {
+        Self::Git(source)
+    }
+}
+
+impl From<ScanError> for HotspotsCommandError {
+    fn from(source: ScanError) -> Self {
+        Self::Scan(source)
+    }
+}
+
 pub fn scan_current_dir() -> Result<ScanReport, ScanError> {
     let root = env::current_dir().map_err(ScanError::CurrentDir)?;
 
@@ -439,6 +490,41 @@ pub fn scan_json() -> Result<String, ScanError> {
     render_json(&scan_current_dir_and_persist()?)
 }
 
+pub fn hotspots() -> Result<String, HotspotsCommandError> {
+    let root = env::current_dir().map_err(HotspotsCommandError::CurrentDir)?;
+    let analysis = git::analyze_from_head_at(&root)?;
+    let scan = scan_repository(&analysis.worktree_root)?;
+    let mut index = storage::index::IndexStore::open(&analysis.worktree_root)
+        .map_err(HotspotsCommandError::PersistScan)?;
+
+    index
+        .persist_scan(&scan)
+        .map_err(HotspotsCommandError::PersistScan)?;
+    index
+        .persist_git_analysis(
+            &analysis.worktree_root,
+            &analysis.head_commit_id,
+            analysis.head_commit_time,
+            analysis.recent_window_days as u64,
+            &analysis.file_metrics,
+            &analysis.co_changes,
+        )
+        .map_err(HotspotsCommandError::PersistGitAnalysis)?;
+
+    let raw_metrics = scoring::raw_score_metrics_from_scan_and_git(
+        &scan.files,
+        &analysis.file_metrics,
+        &analysis.co_changes,
+    );
+    let scores = raw_metrics
+        .into_iter()
+        .map(scoring::calculate_hotspot_score)
+        .collect::<Vec<_>>();
+    let ranked = scoring::rank_hotspot_scores(&scores);
+
+    Ok(render_hotspots(&ranked, analysis.recent_window_days))
+}
+
 pub fn doctor() -> Result<String, DoctorError> {
     let root = env::current_dir().map_err(DoctorError::CurrentDir)?;
 
@@ -504,10 +590,226 @@ fn render_json(scan: &ScanReport) -> Result<String, ScanError> {
     })?)
 }
 
+fn render_hotspots(
+    ranked_scores: &[scoring::RankedHotspotScore],
+    recent_window_days: i64,
+) -> String {
+    let shown = ranked_scores.len().min(HOTSPOTS_REPORT_LIMIT);
+    let mut output = format!(
+        "Hotpath hotspots\nscope: current scanned files plus local Git history reachable from HEAD\nformula: {}\nfiles ranked: {} (showing {})\n\nrank  score  path",
+        scoring::CURRENT_SCORE_FORMULA_ID,
+        ranked_scores.len(),
+        shown
+    );
+
+    if shown == 0 {
+        output.push_str("\n  none");
+    }
+
+    for ranked_score in ranked_scores.iter().take(shown) {
+        let score = &ranked_score.score;
+
+        output.push_str(&format!(
+            "\n{:>4}  {:.3}  {}",
+            ranked_score.rank, score.value, score.path
+        ));
+        output.push_str(&format!(
+            "\n      key contributors: {}",
+            render_key_contributors(score)
+        ));
+        output.push_str(&format!(
+            "\n      why: {}",
+            render_hotspot_raw_summary(&score.raw_metrics)
+        ));
+        output.push_str(&format!(
+            "\n      limitations: {}",
+            render_hotspot_limitations(score)
+        ));
+    }
+
+    output.push_str(&format!(
+        "\n\ncalculation notes\n  - Scores are advisory signals for investigation, not proof that a file is defective.\n  - Inputs come from scanner facts and local Git history reachable from HEAD only.\n  - Recent churn uses the {recent_window_days}-day window before the HEAD committer timestamp.\n  - Missing normalized inputs contribute 0.0; formula weights are not redistributed."
+    ));
+
+    output
+}
+
 fn render_doctor(index_path: &str, schema_version: &str, readable: &str, health: &str) -> String {
     format!(
         "Hotpath doctor\nindex path: {index_path}\nschema version: {schema_version}\nreadable: {readable}\nhealth: {health}"
     )
+}
+
+fn render_key_contributors(score: &scoring::HotspotScore) -> String {
+    let mut terms = score
+        .weighted_terms
+        .iter()
+        .filter(|term| term.weighted_contribution > 0.0)
+        .collect::<Vec<_>>();
+
+    terms.sort_by(|left, right| {
+        right
+            .weighted_contribution
+            .total_cmp(&left.weighted_contribution)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    if terms.is_empty() {
+        return "none observed".to_owned();
+    }
+
+    terms
+        .into_iter()
+        .take(3)
+        .map(|term| format!("{} {:.3}", term.name, term.weighted_contribution))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn render_hotspot_raw_summary(raw_metrics: &scoring::RawScoreMetrics) -> String {
+    format!(
+        "{} commits, {} churn lines, {} recent churn lines, {} authors, {} co-changed files, {}",
+        render_optional_count(raw_metrics.commits_per_file),
+        render_optional_count(raw_metrics.total_churn_lines),
+        render_optional_count(raw_metrics.recent_churn_lines),
+        render_optional_count(raw_metrics.author_count),
+        render_optional_count(raw_metrics.co_changed_file_count),
+        render_size_summary(raw_metrics)
+    )
+}
+
+fn render_hotspot_limitations(score: &scoring::HotspotScore) -> String {
+    if score.limitations.is_empty() {
+        return "uses local Git history only; advisory score".to_owned();
+    }
+
+    score
+        .limitations
+        .iter()
+        .take(2)
+        .map(|limitation| limitation.message.as_str())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn render_optional_count(value: Option<u64>) -> String {
+    value.map_or_else(|| "unavailable".to_owned(), |value| value.to_string())
+}
+
+fn render_size_summary(raw_metrics: &scoring::RawScoreMetrics) -> String {
+    match (raw_metrics.line_count, raw_metrics.byte_size) {
+        (Some(line_count), _) => format!("{line_count} lines"),
+        (None, Some(byte_size)) => format!("{byte_size} bytes"),
+        (None, None) => "size unavailable".to_owned(),
+    }
+}
+
+fn write_hotspots_git_error(
+    f: &mut fmt::Formatter<'_>,
+    source: &git::GitHistoryError,
+) -> fmt::Result {
+    match source {
+        git::GitHistoryError::NotRepository { .. } => write!(
+            f,
+            "path is not a readable Git worktree; run hotspots from inside a repository with local history"
+        ),
+        git::GitHistoryError::OpenRepository { .. } => write!(
+            f,
+            "failed to open Git repository from the current worktree; ensure local Git metadata is readable"
+        ),
+        git::GitHistoryError::MissingHead { .. } => write!(
+            f,
+            "Git repository does not have a commit at HEAD; create an initial commit before analyzing hotspots"
+        ),
+        git::GitHistoryError::ShallowRepository { .. } => write!(
+            f,
+            "Git repository has shallow history; fetch complete local history before running hotspots so metrics are not based on incomplete commits"
+        ),
+        git::GitHistoryError::BareRepository { .. } => write!(
+            f,
+            "Git repository has no worktree; hotspot analysis requires a local worktree"
+        ),
+        git::GitHistoryError::HeadNotCommit { source, .. } => {
+            write!(f, "Git HEAD does not resolve to a commit: {source}")
+        }
+        git::GitHistoryError::Git { context, source } => {
+            write!(f, "failed to traverse Git history while {context}: {source}")
+        }
+        git::GitHistoryError::UnsupportedAuthorIdentity { commit_id } => write!(
+            f,
+            "commit {commit_id} has an author name or email that is not valid UTF-8"
+        ),
+        git::GitHistoryError::UnsupportedPathEncoding { commit_id } => write!(
+            f,
+            "commit {commit_id} changed a path that is not valid UTF-8"
+        ),
+    }
+}
+
+fn write_hotspots_persistence_error(
+    f: &mut fmt::Formatter<'_>,
+    action: &str,
+    source: &storage::index::IndexError,
+) -> fmt::Result {
+    write!(
+        f,
+        "failed to {action} in local Hotpath index (.hotpath/index.db): "
+    )?;
+
+    match source {
+        storage::index::IndexError::CreateIndexDir { .. } => write!(
+            f,
+            "could not create .hotpath; ensure the repository directory is writable"
+        ),
+        storage::index::IndexError::AccessIndex { .. } => {
+            write!(f, "could not access .hotpath; ensure it is readable")
+        }
+        storage::index::IndexError::OpenDatabase { .. } => write!(
+            f,
+            "could not open .hotpath/index.db; ensure it is readable or remove it to rebuild"
+        ),
+        storage::index::IndexError::CorruptDatabase { .. } => write!(
+            f,
+            "the index is unreadable or corrupt; remove .hotpath/index.db and rerun hotspots"
+        ),
+        storage::index::IndexError::CorruptMetadata { .. } => write!(
+            f,
+            "the index schema metadata is invalid; remove .hotpath/index.db and rerun hotspots"
+        ),
+        storage::index::IndexError::UnsafeIndexDir { .. } => write!(
+            f,
+            "refusing to use unsafe .hotpath directory; replace it with a regular directory"
+        ),
+        storage::index::IndexError::IncompatibleFutureSchema {
+            found_version,
+            supported_version,
+            ..
+        } => write!(
+            f,
+            "index schema version {found_version} is newer than supported version {supported_version}; use a newer hotpath binary or remove .hotpath/index.db to rebuild"
+        ),
+        storage::index::IndexError::Migration {
+            from_version,
+            to_version,
+            ..
+        } => write!(
+            f,
+            "could not migrate index schema from version {from_version} to {to_version}; remove .hotpath/index.db to rebuild if the index can be discarded"
+        ),
+        storage::index::IndexError::PersistScan { .. }
+        | storage::index::IndexError::PersistGitAnalysis { .. } => write!(
+            f,
+            "could not update .hotpath/index.db; ensure the index is writable"
+        ),
+        storage::index::IndexError::ReadIndex { .. } => write!(
+            f,
+            "could not read .hotpath/index.db; inspect the index with `hotpath doctor`"
+        ),
+        storage::index::IndexError::InvalidScanData { message, .. }
+        | storage::index::IndexError::InvalidGitAnalysisData { message, .. } => {
+            write!(f, "{message}")
+        }
+    }
 }
 
 fn is_internal_entry(root: &Path, entry: &DirEntry) -> bool {
@@ -1044,6 +1346,58 @@ mod tests {
         serde_json::from_str(&json).expect("json should parse")
     }
 
+    fn raw_score_metrics_with_size(
+        line_count: Option<u64>,
+        byte_size: Option<u64>,
+    ) -> scoring::RawScoreMetrics {
+        scoring::RawScoreMetrics {
+            path: "src/lib.rs".to_owned(),
+            byte_size,
+            line_count,
+            commits_per_file: Some(1),
+            total_churn_lines: Some(2),
+            recent_churn_lines: Some(3),
+            author_count: Some(1),
+            dominant_owner_share: Some(1.0),
+            co_changed_file_count: Some(0),
+        }
+    }
+
+    fn git_error(message: &str) -> git2::Error {
+        git2::Error::new(
+            git2::ErrorCode::GenericError,
+            git2::ErrorClass::Repository,
+            message,
+        )
+    }
+
+    fn sqlite_error() -> rusqlite::Error {
+        rusqlite::Error::ExecuteReturnedResults
+    }
+
+    fn absolute_index_path() -> PathBuf {
+        env::current_dir()
+            .expect("test should have a current directory")
+            .join("target")
+            .join("private-repo")
+            .join(".hotpath")
+            .join("index.db")
+    }
+
+    fn assert_sanitized_actionable_hotspots_error(
+        error: HotspotsCommandError,
+        absolute_path: &Path,
+        expected: &str,
+    ) {
+        let message = error.to_string();
+
+        assert_eq!(message, expected);
+        assert!(
+            !message.contains(&absolute_path.display().to_string()),
+            "hotspots persistence error leaked absolute path: {message}"
+        );
+    }
+
     fn scan_warning_record(code: &'static str, path: Option<&str>) -> ScanWarning {
         scan_warning(
             code,
@@ -1119,6 +1473,195 @@ mod tests {
             Ok(()) => Ok(()),
             Err(error) if symlink_setup_should_skip(&error) => Err(error),
             Err(error) => panic!("unexpected symlink setup error: {error}"),
+        }
+    }
+
+    #[test]
+    fn hotspots_persistence_error_messages_are_sanitized_and_actionable() {
+        let path = absolute_index_path();
+        let cases = vec![
+            (
+                storage::index::IndexError::CreateIndexDir {
+                    path: path.clone(),
+                    source: io::Error::new(io::ErrorKind::PermissionDenied, "absolute path denied"),
+                },
+                "failed to persist scan results in local Hotpath index (.hotpath/index.db): could not create .hotpath; ensure the repository directory is writable",
+            ),
+            (
+                storage::index::IndexError::AccessIndex {
+                    path: path.clone(),
+                    source: io::Error::new(io::ErrorKind::PermissionDenied, "absolute path denied"),
+                },
+                "failed to persist scan results in local Hotpath index (.hotpath/index.db): could not access .hotpath; ensure it is readable",
+            ),
+            (
+                storage::index::IndexError::OpenDatabase {
+                    path: path.clone(),
+                    source: sqlite_error(),
+                },
+                "failed to persist scan results in local Hotpath index (.hotpath/index.db): could not open .hotpath/index.db; ensure it is readable or remove it to rebuild",
+            ),
+            (
+                storage::index::IndexError::CorruptDatabase {
+                    path: path.clone(),
+                    source: sqlite_error(),
+                },
+                "failed to persist scan results in local Hotpath index (.hotpath/index.db): the index is unreadable or corrupt; remove .hotpath/index.db and rerun hotspots",
+            ),
+            (
+                storage::index::IndexError::CorruptMetadata {
+                    path: path.clone(),
+                    message: "schema metadata row is malformed".to_owned(),
+                },
+                "failed to persist scan results in local Hotpath index (.hotpath/index.db): the index schema metadata is invalid; remove .hotpath/index.db and rerun hotspots",
+            ),
+            (
+                storage::index::IndexError::UnsafeIndexDir {
+                    path: path.clone(),
+                    message: "index path resolves to a symlink".to_owned(),
+                },
+                "failed to persist scan results in local Hotpath index (.hotpath/index.db): refusing to use unsafe .hotpath directory; replace it with a regular directory",
+            ),
+            (
+                storage::index::IndexError::IncompatibleFutureSchema {
+                    path: path.clone(),
+                    found_version: 7,
+                    supported_version: 2,
+                },
+                "failed to persist scan results in local Hotpath index (.hotpath/index.db): index schema version 7 is newer than supported version 2; use a newer hotpath binary or remove .hotpath/index.db to rebuild",
+            ),
+            (
+                storage::index::IndexError::Migration {
+                    path: path.clone(),
+                    from_version: 1,
+                    to_version: 2,
+                    source: sqlite_error(),
+                },
+                "failed to persist scan results in local Hotpath index (.hotpath/index.db): could not migrate index schema from version 1 to 2; remove .hotpath/index.db to rebuild if the index can be discarded",
+            ),
+            (
+                storage::index::IndexError::PersistScan {
+                    path: path.clone(),
+                    source: sqlite_error(),
+                },
+                "failed to persist scan results in local Hotpath index (.hotpath/index.db): could not update .hotpath/index.db; ensure the index is writable",
+            ),
+            (
+                storage::index::IndexError::PersistGitAnalysis {
+                    path: path.clone(),
+                    source: sqlite_error(),
+                },
+                "failed to persist scan results in local Hotpath index (.hotpath/index.db): could not update .hotpath/index.db; ensure the index is writable",
+            ),
+            (
+                storage::index::IndexError::ReadIndex {
+                    path: path.clone(),
+                    source: sqlite_error(),
+                },
+                "failed to persist scan results in local Hotpath index (.hotpath/index.db): could not read .hotpath/index.db; inspect the index with `hotpath doctor`",
+            ),
+            (
+                storage::index::IndexError::InvalidScanData {
+                    path: path.clone(),
+                    message: "scan file path must be repository-relative; fix the input and rerun hotspots"
+                        .to_owned(),
+                },
+                "failed to persist scan results in local Hotpath index (.hotpath/index.db): scan file path must be repository-relative; fix the input and rerun hotspots",
+            ),
+            (
+                storage::index::IndexError::InvalidGitAnalysisData {
+                    path: path.clone(),
+                    message:
+                        "Git analysis path must be repository-relative; fix the input and rerun hotspots"
+                            .to_owned(),
+                },
+                "failed to persist scan results in local Hotpath index (.hotpath/index.db): Git analysis path must be repository-relative; fix the input and rerun hotspots",
+            ),
+        ];
+
+        for (source, expected) in cases {
+            assert_sanitized_actionable_hotspots_error(
+                HotspotsCommandError::PersistScan(source),
+                &path,
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn hotspots_git_analysis_persistence_error_uses_git_analysis_action() {
+        let path = absolute_index_path();
+
+        assert_sanitized_actionable_hotspots_error(
+            HotspotsCommandError::PersistGitAnalysis(
+                storage::index::IndexError::PersistGitAnalysis {
+                    path: path.clone(),
+                    source: sqlite_error(),
+                },
+            ),
+            &path,
+            "failed to persist Git analysis in local Hotpath index (.hotpath/index.db): could not update .hotpath/index.db; ensure the index is writable",
+        );
+    }
+
+    #[test]
+    fn render_size_summary_reports_unavailable_when_line_count_and_byte_size_are_missing() {
+        let raw_metrics = raw_score_metrics_with_size(None, None);
+
+        assert_eq!(render_size_summary(&raw_metrics), "size unavailable");
+    }
+
+    #[test]
+    fn hotspots_git_error_messages_cover_non_cli_history_failures() {
+        let cases = [
+            (
+                git::GitHistoryError::OpenRepository {
+                    path: PathBuf::from("repo"),
+                    source: git_error("config is unreadable"),
+                },
+                "failed to open Git repository from the current worktree; ensure local Git metadata is readable",
+            ),
+            (
+                git::GitHistoryError::BareRepository {
+                    path: PathBuf::from("repo.git"),
+                },
+                "Git repository has no worktree; hotspot analysis requires a local worktree",
+            ),
+            (
+                git::GitHistoryError::HeadNotCommit {
+                    path: PathBuf::from("repo"),
+                    source: git_error("object is a tree"),
+                },
+                "Git HEAD does not resolve to a commit: object is a tree",
+            ),
+            (
+                git::GitHistoryError::Git {
+                    context: "walking reachable commits",
+                    source: git_error("revwalk failed"),
+                },
+                "failed to traverse Git history while walking reachable commits: revwalk failed",
+            ),
+            (
+                git::GitHistoryError::UnsupportedAuthorIdentity {
+                    commit_id: "abc123".to_owned(),
+                },
+                "commit abc123 has an author name or email that is not valid UTF-8",
+            ),
+            (
+                git::GitHistoryError::UnsupportedPathEncoding {
+                    commit_id: "def456".to_owned(),
+                },
+                "commit def456 changed a path that is not valid UTF-8",
+            ),
+        ];
+
+        for (source, expected) in cases {
+            assert!(
+                HotspotsCommandError::from(source)
+                    .to_string()
+                    .starts_with(expected),
+                "expected hotspots Git error to start with '{expected}'"
+            );
         }
     }
 
