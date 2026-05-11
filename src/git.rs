@@ -80,6 +80,17 @@ pub struct GitFileMetrics {
     pub file_age_days: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Aggregated co-change count for one unordered repository-relative path pair.
+pub struct GitCoChange {
+    /// Lexicographically smaller repository-relative path using `/` separators.
+    pub left_path: String,
+    /// Lexicographically larger repository-relative path using `/` separators.
+    pub right_path: String,
+    /// Number of distinct commits that touched both paths.
+    pub commit_count: u64,
+}
+
 #[derive(Debug)]
 /// Errors that can occur while opening or traversing local Git history.
 pub enum GitHistoryError {
@@ -290,6 +301,55 @@ pub fn file_metrics_from_changes(
         .into_values()
         .map(|accumulator| accumulator.into_metrics(head_commit_time))
         .collect()
+}
+
+/// Aggregate raw file changes into deterministic co-change counts.
+///
+/// Each commit contributes at most one count for any unordered pair of touched
+/// paths. Returned pairs are ranked by count descending, then left path
+/// ascending, then right path ascending.
+pub fn co_changes_from_changes(changes: &[GitFileChange]) -> Vec<GitCoChange> {
+    let mut paths_by_commit = BTreeMap::<&str, BTreeSet<&str>>::new();
+
+    for change in changes {
+        paths_by_commit
+            .entry(change.commit_id.as_str())
+            .or_default()
+            .insert(change.path.as_str());
+    }
+
+    let mut pair_counts = BTreeMap::<(String, String), u64>::new();
+
+    for paths in paths_by_commit.into_values() {
+        let paths = paths.into_iter().collect::<Vec<_>>();
+
+        for (left_index, left_path) in paths.iter().enumerate() {
+            for right_path in paths.iter().skip(left_index + 1) {
+                *pair_counts
+                    .entry(((*left_path).to_owned(), (*right_path).to_owned()))
+                    .or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut co_changes = pair_counts
+        .into_iter()
+        .map(|((left_path, right_path), commit_count)| GitCoChange {
+            left_path,
+            right_path,
+            commit_count,
+        })
+        .collect::<Vec<_>>();
+
+    co_changes.sort_by(|left, right| {
+        right
+            .commit_count
+            .cmp(&left.commit_count)
+            .then_with(|| left.left_path.cmp(&right.left_path))
+            .then_with(|| left.right_path.cmp(&right.right_path))
+    });
+
+    co_changes
 }
 
 fn head_commit<'repo>(

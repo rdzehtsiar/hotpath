@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hotpath::git::{
-    file_changes_from_head, file_metrics_from_changes, GitChangeKind, GitFileChange,
-    GitHistoryError,
+    co_changes_from_changes, file_changes_from_head, file_metrics_from_changes, GitChangeKind,
+    GitFileChange, GitHistoryError,
 };
 
 mod support;
@@ -26,6 +26,8 @@ type ChangeSummary<'a> = (
     u64,
     u64,
 );
+
+type CoChangeSummary<'a> = (&'a str, &'a str, u64);
 
 #[test]
 fn git_history_reports_root_modify_delete_facts() {
@@ -321,6 +323,142 @@ fn git_file_metrics_clamp_age_when_commit_time_is_after_head_time() {
 }
 
 #[test]
+fn git_co_changes_report_pair_counts_from_fixture_history() {
+    let fixture = GitFixture::new("co-change-pair-counts");
+    let author = GitIdentity::new("Pair Author", "pair@example.invalid");
+
+    fixture.write("a.txt", "a1\n");
+    fixture.write("b.txt", "b1\n");
+    fixture.commit(CommitOptions::new(
+        "Touch a and b",
+        author.clone(),
+        "2024-01-01T00:00:00 +0000",
+    ));
+
+    fixture.write("b.txt", "b1\nb2\n");
+    fixture.write("c.txt", "c1\n");
+    fixture.commit(CommitOptions::new(
+        "Touch b and c",
+        author.clone(),
+        "2024-01-02T00:00:00 +0000",
+    ));
+
+    fixture.write("a.txt", "a1\na2\n");
+    fixture.write("b.txt", "b1\nb2\nb3\n");
+    fixture.write("c.txt", "c1\nc2\n");
+    fixture.commit(CommitOptions::new(
+        "Touch a b and c",
+        author,
+        "2024-01-03T00:00:00 +0000",
+    ));
+
+    let changes = file_changes_from_head(fixture.path()).expect("history should be readable");
+    let co_changes = co_changes_from_changes(&changes);
+
+    assert_eq!(
+        co_change_summary(&co_changes),
+        vec![
+            ("a.txt", "b.txt", 2),
+            ("b.txt", "c.txt", 2),
+            ("a.txt", "c.txt", 1),
+        ]
+    );
+}
+
+#[test]
+fn git_co_changes_ignore_single_file_commits() {
+    let fixture = GitFixture::new("co-change-single-file");
+    let author = GitIdentity::new("Single Author", "single@example.invalid");
+
+    fixture.write("a.txt", "a1\n");
+    fixture.commit(CommitOptions::new(
+        "Touch only a",
+        author.clone(),
+        "2024-01-01T00:00:00 +0000",
+    ));
+
+    fixture.write("b.txt", "b1\n");
+    fixture.commit(CommitOptions::new(
+        "Touch only b",
+        author,
+        "2024-01-02T00:00:00 +0000",
+    ));
+
+    let changes = file_changes_from_head(fixture.path()).expect("history should be readable");
+    let co_changes = co_changes_from_changes(&changes);
+
+    assert!(co_changes.is_empty());
+}
+
+#[test]
+fn git_co_changes_count_duplicate_path_events_once_per_commit() {
+    let fixture = GitFixture::new("co-change-duplicate-path");
+    let author = GitIdentity::new("Duplicate Author", "duplicate@example.invalid");
+
+    fixture.write("a.txt", "a1\n");
+    fixture.write("b.txt", "b1\n");
+    let commit = fixture.commit(CommitOptions::new(
+        "Touch a and b",
+        author,
+        "2024-01-01T00:00:00 +0000",
+    ));
+
+    let mut changes = file_changes_from_head(fixture.path()).expect("history should be readable");
+    let duplicate = changes
+        .iter()
+        .find(|change| change.commit_id == commit && change.path == "a.txt")
+        .expect("fixture should include a.txt in the commit")
+        .clone();
+    changes.push(duplicate);
+
+    let co_changes = co_changes_from_changes(&changes);
+
+    assert_eq!(co_change_summary(&co_changes), vec![("a.txt", "b.txt", 1)]);
+}
+
+#[test]
+fn git_co_changes_are_deterministically_ranked() {
+    let fixture = GitFixture::new("co-change-ordering");
+    let author = GitIdentity::new("Order Author", "order@example.invalid");
+
+    fixture.write("y.txt", "y1\n");
+    fixture.write("z.txt", "z1\n");
+    fixture.commit(CommitOptions::new(
+        "Touch y and z",
+        author.clone(),
+        "2024-01-01T00:00:00 +0000",
+    ));
+
+    fixture.write("a.txt", "a1\n");
+    fixture.write("z.txt", "z1\nz2\n");
+    fixture.commit(CommitOptions::new(
+        "Touch a and z",
+        author.clone(),
+        "2024-01-02T00:00:00 +0000",
+    ));
+
+    fixture.write("a.txt", "a1\na2\n");
+    fixture.write("b.txt", "b1\n");
+    fixture.commit(CommitOptions::new(
+        "Touch a and b",
+        author,
+        "2024-01-03T00:00:00 +0000",
+    ));
+
+    let changes = file_changes_from_head(fixture.path()).expect("history should be readable");
+    let co_changes = co_changes_from_changes(&changes);
+
+    assert_eq!(
+        co_change_summary(&co_changes),
+        vec![
+            ("a.txt", "b.txt", 1),
+            ("a.txt", "z.txt", 1),
+            ("y.txt", "z.txt", 1),
+        ]
+    );
+}
+
+#[test]
 fn git_history_errors_when_path_is_not_a_git_repository() {
     let fixture = TempDir::new("not-git");
 
@@ -354,6 +492,19 @@ fn change_summary(changes: &[GitFileChange]) -> Vec<ChangeSummary<'_>> {
                 change.change_kind,
                 change.added_lines,
                 change.deleted_lines,
+            )
+        })
+        .collect()
+}
+
+fn co_change_summary(co_changes: &[hotpath::git::GitCoChange]) -> Vec<CoChangeSummary<'_>> {
+    co_changes
+        .iter()
+        .map(|co_change| {
+            (
+                co_change.left_path.as_str(),
+                co_change.right_path.as_str(),
+                co_change.commit_count,
             )
         })
         .collect()
