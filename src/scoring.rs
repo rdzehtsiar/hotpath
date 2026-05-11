@@ -177,6 +177,19 @@ pub struct HotspotScore {
     pub limitations: Vec<ScoreLimitation>,
 }
 
+/// Ranked advisory hotspot score.
+///
+/// Ranking is intentionally kept separate from score calculation so the score
+/// formula remains independent from collection-level ordering.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RankedHotspotScore {
+    /// One-based position after deterministic hotspot ranking.
+    pub rank: u64,
+    /// Score output for the ranked path.
+    #[serde(flatten)]
+    pub score: HotspotScore,
+}
+
 /// Calculate the initial advisory hotspot risk score for one path.
 ///
 /// Missing normalized inputs contribute `0.0` for their fixed-weight terms.
@@ -202,6 +215,24 @@ pub fn calculate_hotspot_score(raw_metrics: RawScoreMetrics) -> HotspotScore {
         normalized_metrics,
         limitations: normalization.limitations,
     }
+}
+
+/// Rank hotspot scores deterministically for reports or persisted output.
+///
+/// Scores are ordered by advisory score descending, then repository-relative
+/// path ascending. Ranks are ordinal and one-based after tie-breakers apply.
+pub fn rank_hotspot_scores(scores: &[HotspotScore]) -> Vec<RankedHotspotScore> {
+    let mut sorted_scores = scores.to_vec();
+    sorted_scores.sort_by(compare_hotspot_scores_for_ranking);
+
+    sorted_scores
+        .into_iter()
+        .enumerate()
+        .map(|(index, score)| RankedHotspotScore {
+            rank: index as u64 + 1,
+            score,
+        })
+        .collect()
 }
 
 /// Convert raw facts into bounded normalized score inputs.
@@ -428,6 +459,16 @@ fn normalized_metric_value(
     }
 }
 
+fn compare_hotspot_scores_for_ranking(
+    left: &HotspotScore,
+    right: &HotspotScore,
+) -> std::cmp::Ordering {
+    right
+        .value
+        .total_cmp(&left.value)
+        .then_with(|| left.path.cmp(&right.path))
+}
+
 fn saturating_author_fragmentation(author_count: u64) -> f64 {
     saturating_ratio(
         author_count.saturating_sub(1),
@@ -647,6 +688,51 @@ mod tests {
     }
 
     #[test]
+    fn ranks_hotspot_scores_by_value_descending_then_path_ascending() {
+        let scores = vec![
+            score_with_value("src/zeta.rs", 0.80),
+            score_with_value("src/top.rs", 0.95),
+            score_with_value("src/alpha.rs", 0.80),
+            score_with_value("src/bottom.rs", 0.10),
+        ];
+
+        let ranked = rank_hotspot_scores(&scores);
+
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|score| (score.rank, score.score.path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "src/top.rs"),
+                (2, "src/alpha.rs"),
+                (3, "src/zeta.rs"),
+                (4, "src/bottom.rs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn ranking_is_stable_across_reordered_equal_score_inputs() {
+        let first_run = vec![
+            score_with_value("src/b.rs", 0.50),
+            score_with_value("src/a.rs", 0.50),
+            score_with_value("src/c.rs", 0.50),
+        ];
+        let second_run = vec![
+            score_with_value("src/c.rs", 0.50),
+            score_with_value("src/b.rs", 0.50),
+            score_with_value("src/a.rs", 0.50),
+        ];
+
+        let first_paths = ranked_paths(&rank_hotspot_scores(&first_run));
+        let second_paths = ranked_paths(&rank_hotspot_scores(&second_run));
+
+        assert_eq!(first_paths, vec!["src/a.rs", "src/b.rs", "src/c.rs"]);
+        assert_eq!(second_paths, first_paths);
+    }
+
+    #[test]
     fn normalization_maps_raw_metrics_to_bounded_inputs() {
         let raw_metrics = RawScoreMetrics {
             total_churn_lines: Some(1_000),
@@ -848,6 +934,22 @@ mod tests {
             limitation_codes(&author_count_with_non_finite_owner_share.limitations),
             vec!["invalid_dominant_owner_share"]
         );
+    }
+
+    fn score_with_value(path: &str, value: f64) -> HotspotScore {
+        let mut score = calculate_hotspot_score(RawScoreMetrics {
+            path: path.to_owned(),
+            ..raw_metrics()
+        });
+        score.value = value;
+        score
+    }
+
+    fn ranked_paths(ranked_scores: &[RankedHotspotScore]) -> Vec<String> {
+        ranked_scores
+            .iter()
+            .map(|ranked_score| ranked_score.score.path.clone())
+            .collect()
     }
 
     fn raw_metrics() -> RawScoreMetrics {
