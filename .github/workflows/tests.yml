@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Tests
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Rust tests and coverage
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests with coverage
+        run: cargo llvm-cov --workspace --codecov --remap-path-prefix --output-path codecov.json
+
+      - name: Upload coverage to Codecov
+        if: env.CODECOV_TOKEN != ''
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ env.CODECOV_TOKEN }}
+          files: codecov.json
+          flags: rust
+          name: rust-coverage
+          disable_search: true
+          plugins: noop
+          fail_ci_if_error: true
