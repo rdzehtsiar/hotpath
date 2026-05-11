@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
@@ -13,7 +14,10 @@ use serde::Serialize;
 
 use crate::git::{GitCoChange, GitFileMetrics};
 use crate::scoring::{NormalizedScoreMetrics, RankedHotspotScore, ScoreLimitation, WeightedTerm};
-use crate::{ContentKind, FileRecord, FileWarning, ScanReport, ScanWarning, SCAN_SCHEMA_VERSION};
+use crate::{
+    ContentKind, FileRecord, FileWarning, ParseReport, ParseSymbolRecord, ScanReport, ScanWarning,
+    SCAN_SCHEMA_VERSION,
+};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
@@ -169,10 +173,38 @@ pub struct PersistedHotspot {
     pub limitation: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedSymbol {
+    pub id: i64,
+    pub path: String,
+    pub parent_symbol_id: Option<i64>,
+    pub name: String,
+    pub kind: String,
+    pub line_start: Option<u64>,
+    pub line_end: Option<u64>,
+    pub signature: Option<String>,
+}
+
 #[derive(Serialize)]
 struct HotspotExplanationPayload<'a> {
     normalized_metrics: &'a NormalizedScoreMetrics,
     weighted_terms: &'a [WeightedTerm],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InsertedSymbol {
+    id: i64,
+    file_path: String,
+    parent_path: Option<String>,
+    line_start: u64,
+    line_end: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SymbolLookup {
+    id: i64,
+    line_start: u64,
+    line_end: u64,
 }
 
 #[derive(Serialize)]
@@ -732,6 +764,184 @@ impl IndexStore {
         Ok(())
     }
 
+    pub fn persist_symbols(&mut self, report: &ParseReport) -> Result<(), IndexError> {
+        let index_path = self.path.clone();
+        let transaction =
+            self.connection
+                .transaction()
+                .map_err(|source| IndexError::PersistSymbols {
+                    path: index_path.clone(),
+                    source,
+                })?;
+        let repo_id = ensure_repo_for_symbols(&transaction, &index_path)?;
+        let mut file_ids = BTreeMap::new();
+
+        for file in &report.files {
+            if file_ids.contains_key(&file.path) {
+                continue;
+            }
+
+            let file_id = current_file_id_for_symbols(
+                &transaction,
+                &index_path,
+                repo_id,
+                &file.path,
+                "parse file",
+            )?;
+            file_ids.insert(file.path.clone(), file_id);
+        }
+
+        {
+            let mut delete = transaction
+                .prepare("DELETE FROM symbols WHERE file_id = ?1;")
+                .map_err(|source| IndexError::PersistSymbols {
+                    path: index_path.clone(),
+                    source,
+                })?;
+
+            for file_id in file_ids.values() {
+                delete
+                    .execute(params![file_id])
+                    .map_err(|source| IndexError::PersistSymbols {
+                        path: index_path.clone(),
+                        source,
+                    })?;
+            }
+        }
+
+        let mut sorted_symbols = report.symbols.iter().collect::<Vec<_>>();
+        sorted_symbols.sort_by(|left, right| symbol_sort_key(left).cmp(&symbol_sort_key(right)));
+
+        let mut inserted_symbols = Vec::with_capacity(sorted_symbols.len());
+        let mut symbol_paths: BTreeMap<(String, String), Vec<SymbolLookup>> = BTreeMap::new();
+
+        {
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO symbols (
+                        file_id,
+                        parent_symbol_id,
+                        name,
+                        kind,
+                        line_start,
+                        line_end,
+                        signature
+                    )
+                    VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6);",
+                )
+                .map_err(|source| IndexError::PersistSymbols {
+                    path: index_path.clone(),
+                    source,
+                })?;
+
+            for symbol in sorted_symbols {
+                let file_id = symbol_file_id(&file_ids, &index_path, symbol)?;
+                let line_start = symbol_line_to_i64(symbol.start_line, &index_path, symbol)?;
+                let line_end = symbol_line_to_i64(symbol.end_line, &index_path, symbol)?;
+
+                if symbol.end_line < symbol.start_line {
+                    return Err(IndexError::InvalidSymbolData {
+                        path: index_path.clone(),
+                        message: format!(
+                            "symbol '{}' in '{}' has end line before start line",
+                            symbol.name, symbol.path
+                        ),
+                    });
+                }
+
+                if symbol.name.is_empty() {
+                    return Err(IndexError::InvalidSymbolData {
+                        path: index_path.clone(),
+                        message: format!("symbol in '{}' has an empty name", symbol.path),
+                    });
+                }
+
+                if symbol.kind.is_empty() {
+                    return Err(IndexError::InvalidSymbolData {
+                        path: index_path.clone(),
+                        message: format!(
+                            "symbol '{}' in '{}' has an empty kind",
+                            symbol.name, symbol.path
+                        ),
+                    });
+                }
+
+                insert
+                    .execute(params![
+                        file_id,
+                        &symbol.name,
+                        &symbol.kind,
+                        line_start,
+                        line_end,
+                        symbol.signature.as_deref(),
+                    ])
+                    .map_err(|source| IndexError::PersistSymbols {
+                        path: index_path.clone(),
+                        source,
+                    })?;
+                let id = transaction.last_insert_rowid();
+                let symbol_path = persisted_symbol_path(symbol);
+
+                symbol_paths
+                    .entry((symbol.path.clone(), symbol_path))
+                    .or_default()
+                    .push(SymbolLookup {
+                        id,
+                        line_start: symbol.start_line,
+                        line_end: symbol.end_line,
+                    });
+                inserted_symbols.push(InsertedSymbol {
+                    id,
+                    file_path: symbol.path.clone(),
+                    parent_path: symbol.parent.clone(),
+                    line_start: symbol.start_line,
+                    line_end: symbol.end_line,
+                });
+            }
+        }
+
+        {
+            let mut update = transaction
+                .prepare("UPDATE symbols SET parent_symbol_id = ?1 WHERE id = ?2;")
+                .map_err(|source| IndexError::PersistSymbols {
+                    path: index_path.clone(),
+                    source,
+                })?;
+
+            for symbol in &inserted_symbols {
+                let Some(parent_path) = &symbol.parent_path else {
+                    continue;
+                };
+                let Some(parent_id) = resolved_parent_symbol_id(
+                    &symbol_paths,
+                    &symbol.file_path,
+                    parent_path,
+                    symbol.id,
+                    symbol.line_start,
+                    symbol.line_end,
+                ) else {
+                    continue;
+                };
+
+                update
+                    .execute(params![parent_id, symbol.id])
+                    .map_err(|source| IndexError::PersistSymbols {
+                        path: index_path.clone(),
+                        source,
+                    })?;
+            }
+        }
+
+        transaction
+            .commit()
+            .map_err(|source| IndexError::PersistSymbols {
+                path: index_path,
+                source,
+            })?;
+
+        Ok(())
+    }
+
     pub fn latest_scan(&self) -> Result<Option<PersistedScan>, IndexError> {
         let Some(run) = self
             .connection
@@ -882,6 +1092,65 @@ impl IndexStore {
                 source,
             })
     }
+
+    pub fn latest_symbols(&self) -> Result<Vec<PersistedSymbol>, IndexError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT
+                    symbols.id,
+                    files.path,
+                    symbols.parent_symbol_id,
+                    symbols.name,
+                    symbols.kind,
+                    symbols.line_start,
+                    symbols.line_end,
+                    symbols.signature
+                 FROM symbols
+                 INNER JOIN files ON files.id = symbols.file_id
+                 INNER JOIN repos ON repos.id = files.repo_id
+                 WHERE repos.root_key = '.'
+                 ORDER BY files.path, symbols.line_start, symbols.line_end, symbols.kind, symbols.name, symbols.id;",
+            )
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })?;
+        let rows = statement
+            .query_map([], read_persisted_symbol)
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub fn dependency_count(&self) -> Result<u64, IndexError> {
+        let count = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM dependencies
+                 INNER JOIN repos ON repos.id = dependencies.repo_id
+                 WHERE repos.root_key = '.';",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        i64_to_u64(count, 0).map_err(|source| IndexError::ReadIndex {
+            path: self.path.clone(),
+            source,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -929,6 +1198,10 @@ pub enum IndexError {
         path: PathBuf,
         source: rusqlite::Error,
     },
+    PersistSymbols {
+        path: PathBuf,
+        source: rusqlite::Error,
+    },
     PersistHotspots {
         path: PathBuf,
         source: rusqlite::Error,
@@ -942,6 +1215,10 @@ pub enum IndexError {
         message: String,
     },
     InvalidGitAnalysisData {
+        path: PathBuf,
+        message: String,
+    },
+    InvalidSymbolData {
         path: PathBuf,
         message: String,
     },
@@ -1009,6 +1286,11 @@ impl fmt::Display for IndexError {
                 "failed to persist Git analysis to Hotpath index '{}': {source}",
                 path.display()
             ),
+            Self::PersistSymbols { path, source } => write!(
+                f,
+                "failed to persist parser symbols to Hotpath index '{}': {source}",
+                path.display()
+            ),
             Self::PersistHotspots { path, source } => write!(
                 f,
                 "failed to persist hotspot scores to Hotpath index '{}': {source}",
@@ -1027,6 +1309,11 @@ impl fmt::Display for IndexError {
             Self::InvalidGitAnalysisData { path, message } => write!(
                 f,
                 "Git analysis cannot be persisted to Hotpath index '{}': {message}",
+                path.display()
+            ),
+            Self::InvalidSymbolData { path, message } => write!(
+                f,
+                "parser symbols cannot be persisted to Hotpath index '{}': {message}",
                 path.display()
             ),
             Self::InvalidHotspotData { path, message } => write!(
@@ -1048,6 +1335,7 @@ impl StdError for IndexError {
             | Self::Migration { source, .. }
             | Self::PersistScan { source, .. }
             | Self::PersistGitAnalysis { source, .. }
+            | Self::PersistSymbols { source, .. }
             | Self::PersistHotspots { source, .. }
             | Self::ReadIndex { source, .. } => Some(source),
             Self::CorruptMetadata { .. }
@@ -1055,6 +1343,7 @@ impl StdError for IndexError {
             | Self::IncompatibleFutureSchema { .. }
             | Self::InvalidScanData { .. }
             | Self::InvalidGitAnalysisData { .. }
+            | Self::InvalidSymbolData { .. }
             | Self::InvalidHotspotData { .. } => None,
         }
     }
@@ -1130,6 +1419,28 @@ fn ensure_repo_for_hotspots(transaction: &Transaction<'_>, path: &Path) -> Resul
         })
 }
 
+fn ensure_repo_for_symbols(transaction: &Transaction<'_>, path: &Path) -> Result<i64, IndexError> {
+    transaction
+        .execute(
+            "INSERT INTO repos (root_key)
+             VALUES ('.')
+             ON CONFLICT(root_key) DO NOTHING;",
+            [],
+        )
+        .map_err(|source| IndexError::PersistSymbols {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    transaction
+        .query_row("SELECT id FROM repos WHERE root_key = '.';", [], |row| {
+            row.get(0)
+        })
+        .map_err(|source| IndexError::PersistSymbols {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
 fn ensure_git_path_file(
     transaction: &Transaction<'_>,
     index_path: &Path,
@@ -1166,6 +1477,122 @@ fn ensure_git_path_file(
     file_ids.insert(file_path.to_owned(), file_id);
 
     Ok(())
+}
+
+fn current_file_id_for_symbols(
+    transaction: &Transaction<'_>,
+    index_path: &Path,
+    repo_id: i64,
+    file_path: &str,
+    label: &str,
+) -> Result<i64, IndexError> {
+    transaction
+        .query_row(
+            "SELECT id
+             FROM files
+             WHERE repo_id = ?1
+               AND path = ?2
+               AND scan_run_id IS NOT NULL;",
+            params![repo_id, file_path],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|source| IndexError::PersistSymbols {
+            path: index_path.to_path_buf(),
+            source,
+        })?
+        .ok_or_else(|| IndexError::InvalidSymbolData {
+            path: index_path.to_path_buf(),
+            message: format!(
+                "{label} '{file_path}' is not present in the current scan index; persist the scan before persisting parser symbols"
+            ),
+        })
+}
+
+fn symbol_file_id(
+    file_ids: &BTreeMap<String, i64>,
+    index_path: &Path,
+    symbol: &ParseSymbolRecord,
+) -> Result<i64, IndexError> {
+    file_ids
+        .get(&symbol.path)
+        .copied()
+        .ok_or_else(|| IndexError::InvalidSymbolData {
+            path: index_path.to_path_buf(),
+            message: format!(
+                "symbol '{}' refers to '{}', which is not in the current parse file scope",
+                symbol.name, symbol.path
+            ),
+        })
+}
+
+fn symbol_line_to_i64(
+    value: u64,
+    index_path: &Path,
+    symbol: &ParseSymbolRecord,
+) -> Result<i64, IndexError> {
+    if value == 0 {
+        return Err(IndexError::InvalidSymbolData {
+            path: index_path.to_path_buf(),
+            message: format!(
+                "symbol '{}' in '{}' has line 0; parser symbol lines must be 1-based",
+                symbol.name, symbol.path
+            ),
+        });
+    }
+
+    u64_to_i64_for_symbol(value, index_path, "symbol line")
+}
+
+fn symbol_sort_key(symbol: &ParseSymbolRecord) -> (&str, u64, u64, &str, &str) {
+    (
+        symbol.path.as_str(),
+        symbol.start_line,
+        symbol.end_line,
+        symbol.kind.as_str(),
+        symbol.name.as_str(),
+    )
+}
+
+fn persisted_symbol_path(symbol: &ParseSymbolRecord) -> String {
+    symbol.parent.as_ref().map_or_else(
+        || symbol.name.clone(),
+        |parent| format!("{parent}::{}", symbol.name),
+    )
+}
+
+fn resolved_parent_symbol_id(
+    symbol_paths: &BTreeMap<(String, String), Vec<SymbolLookup>>,
+    file_path: &str,
+    parent_path: &str,
+    child_id: i64,
+    child_start_line: u64,
+    child_end_line: u64,
+) -> Option<i64> {
+    let candidates = symbol_paths
+        .get(&(file_path.to_owned(), parent_path.to_owned()))?
+        .iter()
+        .copied()
+        .filter(|candidate| candidate.id != child_id)
+        .collect::<Vec<_>>();
+
+    if candidates.len() == 1 {
+        return Some(candidates[0].id);
+    }
+
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            candidate.line_start <= child_start_line && candidate.line_end >= child_end_line
+        })
+        .min_by_key(|candidate| {
+            (
+                candidate.line_end.saturating_sub(candidate.line_start),
+                candidate.line_start,
+                candidate.id,
+            )
+        })
+        .map(|candidate| candidate.id)
 }
 
 fn persist_hotspot(
@@ -1623,6 +2050,19 @@ fn read_persisted_hotspot(row: &Row<'_>) -> rusqlite::Result<PersistedHotspot> {
     })
 }
 
+fn read_persisted_symbol(row: &Row<'_>) -> rusqlite::Result<PersistedSymbol> {
+    Ok(PersistedSymbol {
+        id: row.get(0)?,
+        path: row.get(1)?,
+        parent_symbol_id: row.get(2)?,
+        name: row.get(3)?,
+        kind: row.get(4)?,
+        line_start: optional_i64_to_u64(row.get(5)?, 5)?,
+        line_end: optional_i64_to_u64(row.get(6)?, 6)?,
+        signature: row.get(7)?,
+    })
+}
+
 fn read_persisted_scan_warning(row: &Row<'_>) -> rusqlite::Result<PersistedScanWarning> {
     Ok(PersistedScanWarning {
         code: row.get(0)?,
@@ -1671,6 +2111,17 @@ fn u64_to_i64_for_git(
     field_name: &'static str,
 ) -> Result<i64, IndexError> {
     i64::try_from(value).map_err(|_| IndexError::InvalidGitAnalysisData {
+        path: path.to_path_buf(),
+        message: format!("{field_name} value {value} exceeds SQLite INTEGER range"),
+    })
+}
+
+fn u64_to_i64_for_symbol(
+    value: u64,
+    path: &Path,
+    field_name: &'static str,
+) -> Result<i64, IndexError> {
+    i64::try_from(value).map_err(|_| IndexError::InvalidSymbolData {
         path: path.to_path_buf(),
         message: format!("{field_name} value {value} exceeds SQLite INTEGER range"),
     })
@@ -3516,7 +3967,9 @@ mod tests {
     use super::*;
 
     use crate::scoring::{calculate_hotspot_score, rank_hotspot_scores, RawScoreMetrics};
-    use crate::{FileWarning, ScanWarning};
+    use crate::{
+        FileWarning, ParseFileRecord, ParseFileStatus, ParseReport, ParseSymbolRecord, ScanWarning,
+    };
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3737,6 +4190,49 @@ mod tests {
             is_symlink: false,
             classification: "implemented",
             warnings: Vec::new(),
+        }
+    }
+
+    fn parse_report(files: Vec<ParseFileRecord>, symbols: Vec<ParseSymbolRecord>) -> ParseReport {
+        ParseReport {
+            warnings: Vec::new(),
+            files,
+            symbols,
+            imports: Vec::new(),
+        }
+    }
+
+    fn parse_file(path: &str) -> ParseFileRecord {
+        ParseFileRecord {
+            path: path.to_owned(),
+            language: Some("Rust"),
+            content: ContentKind::Text,
+            status: ParseFileStatus::Parsed,
+            reason: None,
+            symbol_count: 0,
+            import_count: 0,
+        }
+    }
+
+    fn parse_symbol(
+        path: &str,
+        name: &str,
+        kind: &str,
+        start_line: u64,
+        end_line: u64,
+        parent: Option<&str>,
+    ) -> ParseSymbolRecord {
+        ParseSymbolRecord {
+            path: path.to_owned(),
+            name: name.to_owned(),
+            kind: kind.to_owned(),
+            start_line,
+            end_line,
+            signature: Some(format!("{kind} {name}")),
+            nesting_depth: u64::from(parent.is_some()),
+            parent: parent.map(ToOwned::to_owned),
+            cyclomatic_complexity: Some(1),
+            max_control_flow_nesting: Some(0),
         }
     }
 
@@ -4139,6 +4635,194 @@ mod tests {
         assert_eq!(table_count(&connection, "dependencies"), 1);
         assert_eq!(surviving_dependency, 1);
         assert_eq!(table_count(&connection, "hotspots"), 0);
+    }
+
+    #[test]
+    fn persist_symbols_records_parent_relationships_and_reads_back_sorted_rows() {
+        let fixture = Fixture::new("persist-symbols");
+        let mut store = IndexStore::open(&fixture.path).expect("index should open");
+        store
+            .persist_scan(&scan_report(vec![
+                scan_file("src/b.rs", Some(20), Some("Rust"), ContentKind::Text),
+                scan_file("src/a.rs", Some(10), Some("Rust"), ContentKind::Text),
+            ]))
+            .expect("scan should persist");
+
+        let report = parse_report(
+            vec![parse_file("src/b.rs"), parse_file("src/a.rs")],
+            vec![
+                parse_symbol("src/b.rs", "child", "function", 12, 12, Some("missing")),
+                parse_symbol("src/a.rs", "child", "method", 4, 5, Some("Parent")),
+                parse_symbol("src/a.rs", "Parent", "impl", 2, 7, None),
+                parse_symbol("src/a.rs", "top", "function", 9, 9, None),
+            ],
+        );
+
+        store
+            .persist_symbols(&report)
+            .expect("symbols should persist");
+
+        let symbols = store.latest_symbols().expect("symbols should read");
+        assert_eq!(
+            symbols
+                .iter()
+                .map(|symbol| (
+                    symbol.path.as_str(),
+                    symbol.name.as_str(),
+                    symbol.kind.as_str(),
+                    symbol.line_start,
+                    symbol.line_end,
+                    symbol.signature.as_deref(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "src/a.rs",
+                    "Parent",
+                    "impl",
+                    Some(2),
+                    Some(7),
+                    Some("impl Parent"),
+                ),
+                (
+                    "src/a.rs",
+                    "child",
+                    "method",
+                    Some(4),
+                    Some(5),
+                    Some("method child"),
+                ),
+                (
+                    "src/a.rs",
+                    "top",
+                    "function",
+                    Some(9),
+                    Some(9),
+                    Some("function top"),
+                ),
+                (
+                    "src/b.rs",
+                    "child",
+                    "function",
+                    Some(12),
+                    Some(12),
+                    Some("function child"),
+                ),
+            ]
+        );
+
+        let parent = symbols
+            .iter()
+            .find(|symbol| symbol.name == "Parent")
+            .expect("parent symbol should exist");
+        let child = symbols
+            .iter()
+            .find(|symbol| symbol.name == "child" && symbol.path == "src/a.rs")
+            .expect("child symbol should exist");
+        let unresolved = symbols
+            .iter()
+            .find(|symbol| symbol.path == "src/b.rs")
+            .expect("unresolved child should exist");
+
+        assert_eq!(child.parent_symbol_id, Some(parent.id));
+        assert_eq!(unresolved.parent_symbol_id, None);
+        assert_eq!(
+            store.dependency_count().expect("dependencies should count"),
+            0
+        );
+    }
+
+    #[test]
+    fn persist_symbols_resolves_duplicate_parent_names_by_line_containment() {
+        let fixture = Fixture::new("persist-symbol-duplicate-parents");
+        let mut store = IndexStore::open(&fixture.path).expect("index should open");
+        store
+            .persist_scan(&scan_report(vec![scan_file(
+                "src/lib.rs",
+                Some(40),
+                Some("Rust"),
+                ContentKind::Text,
+            )]))
+            .expect("scan should persist");
+
+        let report = parse_report(
+            vec![parse_file("src/lib.rs")],
+            vec![
+                parse_symbol("src/lib.rs", "impl Widget", "impl", 1, 5, None),
+                parse_symbol("src/lib.rs", "first", "method", 2, 4, Some("impl Widget")),
+                parse_symbol("src/lib.rs", "impl Widget", "impl", 7, 11, None),
+                parse_symbol("src/lib.rs", "second", "method", 8, 10, Some("impl Widget")),
+            ],
+        );
+
+        store
+            .persist_symbols(&report)
+            .expect("symbols should persist");
+
+        let symbols = store.latest_symbols().expect("symbols should read");
+        let first_parent = symbols
+            .iter()
+            .find(|symbol| symbol.name == "impl Widget" && symbol.line_start == Some(1))
+            .expect("first impl parent should exist");
+        let second_parent = symbols
+            .iter()
+            .find(|symbol| symbol.name == "impl Widget" && symbol.line_start == Some(7))
+            .expect("second impl parent should exist");
+        let first_method = symbols
+            .iter()
+            .find(|symbol| symbol.name == "first")
+            .expect("first method should exist");
+        let second_method = symbols
+            .iter()
+            .find(|symbol| symbol.name == "second")
+            .expect("second method should exist");
+
+        assert_eq!(first_method.parent_symbol_id, Some(first_parent.id));
+        assert_eq!(second_method.parent_symbol_id, Some(second_parent.id));
+    }
+
+    #[test]
+    fn persist_symbols_replaces_rows_for_current_parse_scope() {
+        let fixture = Fixture::new("persist-symbol-replacement");
+        let mut store = IndexStore::open(&fixture.path).expect("index should open");
+        store
+            .persist_scan(&scan_report(vec![
+                scan_file("src/a.rs", Some(10), Some("Rust"), ContentKind::Text),
+                scan_file("src/b.rs", Some(20), Some("Rust"), ContentKind::Text),
+            ]))
+            .expect("scan should persist");
+
+        let first = parse_report(
+            vec![parse_file("src/a.rs"), parse_file("src/b.rs")],
+            vec![
+                parse_symbol("src/a.rs", "stale", "function", 1, 1, None),
+                parse_symbol("src/b.rs", "old", "function", 1, 1, None),
+            ],
+        );
+        store
+            .persist_symbols(&first)
+            .expect("first symbols should persist");
+
+        let second = parse_report(
+            vec![parse_file("src/a.rs"), parse_file("src/b.rs")],
+            vec![parse_symbol("src/b.rs", "new", "function", 3, 3, None)],
+        );
+        store
+            .persist_symbols(&second)
+            .expect("replacement symbols should persist");
+
+        let symbols = store.latest_symbols().expect("symbols should read");
+        assert_eq!(
+            symbols
+                .iter()
+                .map(|symbol| (symbol.path.as_str(), symbol.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("src/b.rs", "new")]
+        );
+        assert_eq!(
+            store.dependency_count().expect("dependencies should count"),
+            0
+        );
     }
 
     #[test]

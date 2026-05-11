@@ -261,6 +261,7 @@ pub enum ScanError {
         path: PathBuf,
     },
     Index(storage::index::IndexError),
+    PersistSymbols(storage::index::IndexError),
     Json(serde_json::Error),
 }
 
@@ -287,6 +288,9 @@ impl fmt::Display for ScanError {
                 root.display()
             ),
             Self::Index(source) => write!(f, "failed to persist scan results: {source}"),
+            Self::PersistSymbols(source) => {
+                write_persistence_error(f, "persist parser symbols", source, "parse")
+            }
             Self::Json(source) => write!(f, "failed to render scan JSON: {source}"),
         }
     }
@@ -297,7 +301,7 @@ impl StdError for ScanError {
         match self {
             Self::CurrentDir(source) | Self::Root { source, .. } => Some(source),
             Self::RootNotDirectory { .. } | Self::RelativePath { .. } => None,
-            Self::Index(source) => Some(source),
+            Self::Index(source) | Self::PersistSymbols(source) => Some(source),
             Self::Json(source) => Some(source),
         }
     }
@@ -782,8 +786,12 @@ fn parse_current_dir_and_persist() -> Result<ParseReport, ScanError> {
     let scan = scan_repository(&root)?;
     let mut index = storage::index::IndexStore::open(&root)?;
     index.persist_scan(&scan)?;
+    let report = parse::report_from_scan(&root, &scan);
+    index
+        .persist_symbols(&report)
+        .map_err(ScanError::PersistSymbols)?;
 
-    Ok(parse::report_from_scan(&root, &scan))
+    Ok(report)
 }
 
 fn ranked_hotspot_scores_from_scan_and_git(
@@ -1359,6 +1367,7 @@ fn write_persistence_error(
         ),
         storage::index::IndexError::PersistScan { .. }
         | storage::index::IndexError::PersistGitAnalysis { .. }
+        | storage::index::IndexError::PersistSymbols { .. }
         | storage::index::IndexError::PersistHotspots { .. } => write!(
             f,
             "could not update .hotpath/index.db; ensure the index is writable"
@@ -1369,6 +1378,7 @@ fn write_persistence_error(
         ),
         storage::index::IndexError::InvalidScanData { message, .. }
         | storage::index::IndexError::InvalidGitAnalysisData { message, .. }
+        | storage::index::IndexError::InvalidSymbolData { message, .. }
         | storage::index::IndexError::InvalidHotspotData { message, .. } => {
             write!(f, "{message}")
         }
@@ -2012,6 +2022,20 @@ mod tests {
         );
     }
 
+    fn assert_sanitized_actionable_scan_error(
+        error: ScanError,
+        absolute_path: &Path,
+        expected: &str,
+    ) {
+        let message = error.to_string();
+
+        assert_eq!(message, expected);
+        assert!(
+            !message.contains(&absolute_path.display().to_string()),
+            "scan persistence error leaked absolute path: {message}"
+        );
+    }
+
     fn scan_warning_record(code: &'static str, path: Option<&str>) -> ScanWarning {
         scan_warning(
             code,
@@ -2231,6 +2255,29 @@ mod tests {
             ),
             &path,
             "failed to persist Git analysis in local Hotpath index (.hotpath/index.db): could not update .hotpath/index.db; ensure the index is writable",
+        );
+    }
+
+    #[test]
+    fn parse_symbol_persistence_error_uses_symbol_action() {
+        let path = absolute_index_path();
+
+        assert_sanitized_actionable_scan_error(
+            ScanError::PersistSymbols(storage::index::IndexError::PersistSymbols {
+                path: path.clone(),
+                source: sqlite_error(),
+            }),
+            &path,
+            "failed to persist parser symbols in local Hotpath index (.hotpath/index.db): could not update .hotpath/index.db; ensure the index is writable",
+        );
+        assert_sanitized_actionable_scan_error(
+            ScanError::PersistSymbols(storage::index::IndexError::InvalidSymbolData {
+                path: path.clone(),
+                message: "symbol path must be repository-relative; fix the input and rerun parse"
+                    .to_owned(),
+            }),
+            &path,
+            "failed to persist parser symbols in local Hotpath index (.hotpath/index.db): symbol path must be repository-relative; fix the input and rerun parse",
         );
     }
 

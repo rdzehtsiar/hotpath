@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use hotpath::storage::index::IndexStore;
 use serde_json::{json, Value};
 
 static NEXT_FIXTURE_ID: AtomicUsize = AtomicUsize::new(0);
@@ -178,6 +179,68 @@ fn comparable_path_string(value: &str) -> String {
 #[cfg(not(windows))]
 fn comparable_path_string(value: &str) -> String {
     value.to_owned()
+}
+
+#[test]
+fn parse_summary_persists_parser_symbols() {
+    let fixture = Fixture::new("parse-summary-symbols");
+    fixture.write("src/lib.rs", "pub fn lib() {}\n");
+
+    let stdout = successful_stdout(&["parse"], &fixture.path);
+
+    assert!(stdout.contains("symbols       1"));
+    let store = IndexStore::open(&fixture.path).expect("index should open");
+    let symbols = store.latest_symbols().expect("symbols should read");
+    assert_eq!(
+        symbols
+            .iter()
+            .map(|symbol| (
+                symbol.path.as_str(),
+                symbol.name.as_str(),
+                symbol.kind.as_str(),
+                symbol.line_start,
+                symbol.line_end,
+                symbol.parent_symbol_id,
+            ))
+            .collect::<Vec<_>>(),
+        vec![("src/lib.rs", "lib", "function", Some(1), Some(1), None)]
+    );
+}
+
+#[test]
+fn parse_json_persists_symbols_without_dependency_edges() {
+    let fixture = Fixture::new("parse-json-symbols");
+    fixture.write(
+        "src/lib.rs",
+        concat!(
+            "use std::fmt;\n",
+            "\n",
+            "impl Widget {\n",
+            "    pub fn render(&self) {}\n",
+            "}\n",
+        ),
+    );
+
+    let (_, value) = parse_json(&fixture.path);
+
+    assert_eq!(value["summary"]["symbol_count"], 2);
+    assert_eq!(value["summary"]["import_count"], 1);
+    let store = IndexStore::open(&fixture.path).expect("index should open");
+    let symbols = store.latest_symbols().expect("symbols should read");
+    let parent = symbols
+        .iter()
+        .find(|symbol| symbol.name == "impl Widget")
+        .expect("parent symbol should persist");
+    let child = symbols
+        .iter()
+        .find(|symbol| symbol.name == "render")
+        .expect("child symbol should persist");
+
+    assert_eq!(child.parent_symbol_id, Some(parent.id));
+    assert_eq!(
+        store.dependency_count().expect("dependencies should count"),
+        0
+    );
 }
 
 #[test]
