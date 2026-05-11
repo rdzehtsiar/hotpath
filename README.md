@@ -46,6 +46,7 @@ The public contract for Hotpath is documented in:
 - [Product contract](docs/product-contract.md)
 - [Privacy](docs/privacy.md)
 - [Scoring principles](docs/scoring.md)
+- [Git metric semantics](docs/git-metrics.md)
 - [Local index](docs/index.md)
 - [Limitations](docs/limitations.md)
 
