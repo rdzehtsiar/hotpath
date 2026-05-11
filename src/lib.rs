@@ -11,6 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use ignore::{DirEntry, Error as IgnoreError, WalkBuilder};
 use serde::Serialize;
 
+pub mod git;
 pub mod storage;
 
 #[cfg(test)]
