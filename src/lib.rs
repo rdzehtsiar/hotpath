@@ -11,6 +11,8 @@ use std::path::{Component, Path, PathBuf};
 use ignore::{DirEntry, Error as IgnoreError, WalkBuilder};
 use serde::Serialize;
 
+pub mod storage;
+
 #[cfg(test)]
 const BINARY_SAMPLE_BYTES: usize = 8 * 1024;
 const MAX_TEXT_READ_BYTES: u64 = 8 * 1024 * 1024;
