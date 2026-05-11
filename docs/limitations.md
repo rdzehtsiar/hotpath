@@ -16,6 +16,11 @@ Future commands, crate layout, data models, scoring formulas, and output formats
 may change while the product contract and first implementation milestones are
 built.
 
+The planned `.hotpath/index.db` invariants are documented separately in
+[Index invariants](index.md), but the index is not yet a stable public database
+format. During early development, incompatible local indexes may need to be
+rebuilt instead of migrated.
+
 ## Product Boundaries
 
 Hotpath is not intended to be:

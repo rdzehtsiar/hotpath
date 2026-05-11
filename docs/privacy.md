@@ -50,6 +50,11 @@ Local writes should be documented, deterministic where practical, and avoid
 including host-specific absolute paths in portable output unless the user asks
 for them.
 
+The planned local index is `.hotpath/index.db`. It is documented as derived
+local cache data in [Index invariants](index.md). It may contain sensitive
+repository-derived information, but creating, reading, validating, deleting, or
+rebuilding it should not require network access or telemetry.
+
 ## Network And Cloud Boundaries
 
 Primary Hotpath workflows should not make network calls. Scanning, scoring,

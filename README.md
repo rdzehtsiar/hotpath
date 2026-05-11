@@ -44,6 +44,7 @@ The public contract for Hotpath is documented in:
 - [Product contract](docs/product-contract.md)
 - [Privacy](docs/privacy.md)
 - [Scoring principles](docs/scoring.md)
+- [Index invariants](docs/index.md)
 - [Limitations](docs/limitations.md)
 
 ## Product Principles

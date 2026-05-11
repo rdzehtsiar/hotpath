@@ -74,6 +74,11 @@ Hotpath may inspect repository files, Git metadata, local configuration, and
 local indexes as needed for codebase intelligence. The core workflow should keep
 that data on the user's machine.
 
+Local indexes should be treated as derived cache data. The planned index
+location and invariants are documented in [Index invariants](index.md),
+including schema versioning, path normalization, stale file deletion, corruption
+handling, and rebuild behavior.
+
 When Hotpath produces metrics or findings, the output should make clear what was
 measured, where it was measured, which formula or rule was used, which raw
 metrics contributed, why the result may matter, and what limitations apply.
