@@ -10,7 +10,7 @@ use git2::{
     Delta, Diff, DiffFindOptions, DiffOptions, ErrorClass, ErrorCode, Oid, Patch, Repository, Sort,
 };
 
-const RECENT_CHURN_WINDOW_DAYS: i64 = 90;
+pub const RECENT_CHURN_WINDOW_DAYS: i64 = 90;
 const SECONDS_PER_DAY: i64 = 86_400;
 const RECENT_CHURN_WINDOW_SECONDS: i64 = RECENT_CHURN_WINDOW_DAYS * SECONDS_PER_DAY;
 
@@ -92,6 +92,25 @@ pub struct GitCoChange {
     pub commit_count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+/// Full local Git analysis for a worktree at `HEAD`.
+pub struct GitAnalysis {
+    /// Canonical Git worktree root used for index persistence.
+    pub worktree_root: PathBuf,
+    /// Full hexadecimal object id for `HEAD`.
+    pub head_commit_id: String,
+    /// `HEAD` committer timestamp as seconds since the Unix epoch.
+    pub head_commit_time: i64,
+    /// Recent churn window in days.
+    pub recent_window_days: i64,
+    /// Deterministic raw file change events.
+    pub changes: Vec<GitFileChange>,
+    /// Aggregated file metrics sorted by path.
+    pub file_metrics: Vec<GitFileMetrics>,
+    /// Aggregated co-change pairs ranked by count, then paths.
+    pub co_changes: Vec<GitCoChange>,
+}
+
 #[derive(Debug)]
 /// Errors that can occur while opening or traversing local Git history.
 pub enum GitHistoryError {
@@ -104,6 +123,9 @@ pub enum GitHistoryError {
         source: git2::Error,
     },
     MissingHead {
+        path: PathBuf,
+    },
+    BareRepository {
         path: PathBuf,
     },
     HeadNotCommit {
@@ -151,6 +173,11 @@ impl fmt::Display for GitHistoryError {
                 "Git repository at '{}' does not have a commit at HEAD; create an initial commit before analyzing history",
                 path.display()
             ),
+            Self::BareRepository { path } => write!(
+                f,
+                "Git repository at '{}' has no worktree; Git analysis requires a local worktree",
+                path.display()
+            ),
             Self::HeadNotCommit { path, source } => write!(
                 f,
                 "Git HEAD for '{}' does not resolve to a commit: {source}",
@@ -179,6 +206,7 @@ impl StdError for GitHistoryError {
             | Self::HeadNotCommit { source, .. }
             | Self::Git { source, .. } => Some(source),
             Self::MissingHead { .. }
+            | Self::BareRepository { .. }
             | Self::UnsupportedAuthorIdentity { .. }
             | Self::UnsupportedPathEncoding { .. } => None,
         }
@@ -236,7 +264,45 @@ pub fn file_changes_from_head(
     let worktree_path = worktree_path.as_ref();
     let repository = open_repository(worktree_path)?;
     let head_commit = head_commit(&repository, worktree_path)?;
-    let commits = reachable_commits(&repository, head_commit.id())?;
+
+    file_changes_from_repository(&repository, head_commit.id())
+}
+
+/// Analyze deterministic local Git history reachable from `HEAD`.
+pub fn analyze_from_head_at(
+    worktree_path: impl AsRef<Path>,
+) -> Result<GitAnalysis, GitHistoryError> {
+    let worktree_path = worktree_path.as_ref();
+    let repository = open_repository(worktree_path)?;
+    let head_commit = head_commit(&repository, worktree_path)?;
+    let head_commit_id = head_commit.id();
+    let head_commit_time = head_commit.time().seconds();
+    let worktree_root = repository
+        .workdir()
+        .ok_or_else(|| GitHistoryError::BareRepository {
+            path: worktree_path.to_path_buf(),
+        })?
+        .to_path_buf();
+    let changes = file_changes_from_repository(&repository, head_commit_id)?;
+    let file_metrics = file_metrics_from_changes(&changes, head_commit_time);
+    let co_changes = co_changes_from_changes(&changes);
+
+    Ok(GitAnalysis {
+        worktree_root,
+        head_commit_id: head_commit_id.to_string(),
+        head_commit_time,
+        recent_window_days: RECENT_CHURN_WINDOW_DAYS,
+        changes,
+        file_metrics,
+        co_changes,
+    })
+}
+
+fn file_changes_from_repository(
+    repository: &Repository,
+    head_commit_id: Oid,
+) -> Result<Vec<GitFileChange>, GitHistoryError> {
+    let commits = reachable_commits(repository, head_commit_id)?;
     let mut changes = Vec::new();
 
     for commit_id in commits {
@@ -329,32 +395,44 @@ pub fn explain_file_from_head_at(
     requested_path: impl AsRef<Path>,
 ) -> Result<String, GitExplainError> {
     let worktree_path = worktree_path.as_ref();
+    let analysis = analyze_from_head_at(worktree_path)?;
+
+    explain_file_from_analysis_at(&analysis, worktree_path, requested_path)
+}
+
+/// Render an explanation from an already-computed repository Git analysis.
+pub fn explain_file_from_analysis_at(
+    analysis: &GitAnalysis,
+    worktree_path: impl AsRef<Path>,
+    requested_path: impl AsRef<Path>,
+) -> Result<String, GitExplainError> {
+    let worktree_path = worktree_path.as_ref();
     let requested_path = requested_path.as_ref();
-    let repository = open_repository(worktree_path)?;
-    let head_commit = head_commit(&repository, worktree_path)?;
-    let head_commit_time = head_commit.time().seconds();
-    let workdir = repository
-        .workdir()
-        .ok_or(GitExplainError::BareRepository)?
-        .to_path_buf();
-    let changes = file_changes_from_head(worktree_path)?;
-    let metrics = file_metrics_from_changes(&changes, head_commit_time);
-    let metric_paths = metrics
+    let metric_paths = analysis
+        .file_metrics
         .iter()
         .map(|metric| metric.path.as_str())
         .collect::<BTreeSet<_>>();
-    let path =
-        normalize_requested_file_path(worktree_path, &workdir, requested_path, &metric_paths)?;
-    let metric = metrics.iter().find(|metric| metric.path == path);
-    let file_changes = changes
+    let path = normalize_requested_file_path(
+        worktree_path,
+        &analysis.worktree_root,
+        requested_path,
+        &metric_paths,
+    )?;
+    let metric = analysis
+        .file_metrics
+        .iter()
+        .find(|metric| metric.path == path);
+    let file_changes = analysis
+        .changes
         .iter()
         .filter(|change| change.path == path)
         .collect::<Vec<_>>();
-    let co_changes = co_changes_for_path(&path, &co_changes_from_changes(&changes));
+    let co_changes = co_changes_for_path(&path, &analysis.co_changes);
 
     Ok(render_file_explanation(
         &path,
-        head_commit_time,
+        analysis.head_commit_time,
         metric,
         &file_changes,
         &co_changes,
@@ -529,6 +607,9 @@ fn diff_file_changes(
             continue;
         };
         let path = delta_path(&commit_id, delta)?;
+        if is_internal_analysis_path(&path) {
+            continue;
+        }
         let (_context, added_lines, deleted_lines) = Patch::from_diff(diff, index)
             .map_err(|source| GitHistoryError::Git {
                 context: "loading a file diff patch",
@@ -570,6 +651,10 @@ fn diff_file_changes(
     });
 
     Ok(changes)
+}
+
+fn is_internal_analysis_path(path: &str) -> bool {
+    path == ".hotpath" || path.starts_with(".hotpath/")
 }
 
 fn author_identity(
@@ -742,7 +827,7 @@ fn render_file_explanation(
         "\n\ncalculation notes\n  - Uses local Git history reachable from HEAD only.\n  - Root commits are diffed against the empty tree; merge commits are diffed against their first parent.\n  - Recent churn uses the 90-day window before the HEAD committer timestamp.\n  - A commit counts once per file for commit counts, authorship, ownership, and co-change pairs.\n  - Co-change rows count commits that touched the requested path and the listed path.",
     );
     output.push_str(
-        "\n\nlimitations\n  - Rename handling is conservative: the rename commit counts for the destination path, but earlier history remains under the old path.\n  - Binary changes or unavailable line statistics contribute 0 line churn.\n  - Author identity is the exact commit author string; .mailmap, bot detection, and identity merging are not applied.\n  - File age is clamped to 0 days if commit timestamps place the first observed file touch after HEAD.\n  - Results are advisory and are not persisted to the Hotpath index.",
+        "\n\nlimitations\n  - Rename handling is conservative: the rename commit counts for the destination path, but earlier history remains under the old path.\n  - Binary changes or unavailable line statistics contribute 0 line churn.\n  - Author identity is the exact commit author string; .mailmap, bot detection, and identity merging are not applied.\n  - File age is clamped to 0 days if commit timestamps place the first observed file touch after HEAD.\n  - Results are advisory and should be treated as local derived cache data when persisted.",
     );
 
     output

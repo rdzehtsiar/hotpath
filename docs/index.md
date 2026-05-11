@@ -25,8 +25,8 @@ format. Users should not commit it, share it, or edit it by hand.
 
 ## Current Schema
 
-The current SQLite schema version is `1`. The index also stores the schema
-identifier `hotpath.index.v1` in metadata. Hotpath rejects indexes with missing,
+The current SQLite schema version is `2`. The index also stores the schema
+identifier `hotpath.index.v2` in metadata. Hotpath rejects indexes with missing,
 unknown, malformed, corrupt, or future schema metadata instead of reading them
 best-effort.
 
@@ -46,16 +46,25 @@ Currently populated by `hotpath scan`:
   flag, and classification
 - per-file warnings, including warning code and message
 
+Currently populated by `hotpath explain-git` after successful local history
+analysis:
+
+- Git analysis metadata, including analyzer version, `HEAD` commit id, `HEAD`
+  committer timestamp, recent churn window, and observed row counts
+- per-file Git metrics such as commit count, total churn, recent churn, author
+  count, dominant owner/share, first/last observed commits, and file age
+- co-change pairs with deterministic left/right repository-relative paths and
+  commit counts
+
 Reserved as schema extension points but not populated by current scans:
 
 - `symbols` for future parser output
-- `git_file_stats` for future Git history metrics
 - `dependencies` for future coupling or dependency analysis
 - `hotspots` for future scoring output
 
-Current scans do not populate Git metrics, parser symbols, dependency edges, or
-hotspot scores. Documentation and reports should not imply those analyses are
-available until implementation and tests exist.
+Current scans do not populate parser symbols, dependency edges, or hotspot
+scores. Documentation and reports should not imply those analyses are available
+until implementation and tests exist.
 
 ## Path Storage
 
@@ -112,7 +121,7 @@ succeeds and reports a healthy index:
 ```text
 Hotpath doctor
 index path: .hotpath/index.db
-schema version: 1
+schema version: 2
 readable: yes
 health: healthy
 ```

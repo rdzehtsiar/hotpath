@@ -10,15 +10,18 @@ use rusqlite::{
     params, types::Type, Connection, OpenFlags, OptionalExtension, Row, Statement, Transaction,
 };
 
+use crate::git::{GitCoChange, GitFileMetrics};
 use crate::{ContentKind, FileRecord, FileWarning, ScanReport, ScanWarning, SCAN_SCHEMA_VERSION};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 const HOTPATH_DIR: &str = ".hotpath";
 const INDEX_FILE: &str = "index.db";
-const SCHEMA_IDENTIFIER: &str = "hotpath.index.v1";
+const SCHEMA_IDENTIFIER_V1: &str = "hotpath.index.v1";
+const SCHEMA_IDENTIFIER: &str = "hotpath.index.v2";
 const SCHEMA_IDENTIFIER_KEY: &str = "schema_identifier";
 const SCHEMA_VERSION_KEY: &str = "schema_version";
+const GIT_ANALYSIS_KEY: &str = "git-analysis-current";
 const REQUIRED_SCHEMA_TABLES: &[&str] = &[
     "hotpath_metadata",
     "repos",
@@ -27,7 +30,9 @@ const REQUIRED_SCHEMA_TABLES: &[&str] = &[
     "files",
     "file_warnings",
     "symbols",
+    "git_analysis_runs",
     "git_file_stats",
+    "git_co_changes",
     "dependencies",
     "hotspots",
 ];
@@ -104,6 +109,51 @@ pub struct PersistedScanWarning {
 pub struct PersistedFileWarning {
     pub code: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedGitAnalysis {
+    pub run: PersistedGitAnalysisRun,
+    pub file_stats: Vec<PersistedGitFileStats>,
+    pub co_changes: Vec<PersistedGitCoChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedGitAnalysisRun {
+    pub id: i64,
+    pub analysis_key: String,
+    pub status: String,
+    pub analyzer_version: Option<String>,
+    pub git_head: String,
+    pub head_commit_time: i64,
+    pub recent_window_days: u64,
+    pub metrics_observed: u64,
+    pub co_changes_observed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedGitFileStats {
+    pub path: String,
+    pub commits_per_file: u64,
+    pub total_churn_added: u64,
+    pub total_churn_deleted: u64,
+    pub recent_churn_added: u64,
+    pub recent_churn_deleted: u64,
+    pub author_count: u64,
+    pub dominant_owner: Option<String>,
+    pub dominant_owner_share: Option<f64>,
+    pub first_commit_id: Option<String>,
+    pub first_commit_time: Option<i64>,
+    pub last_commit_id: Option<String>,
+    pub last_commit_time: Option<i64>,
+    pub file_age_days: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedGitCoChange {
+    pub left_path: String,
+    pub right_path: String,
+    pub commit_count: u64,
 }
 
 impl IndexStore {
@@ -358,6 +408,235 @@ impl IndexStore {
         })
     }
 
+    pub fn persist_git_analysis(
+        &mut self,
+        _repo_root: impl AsRef<Path>,
+        git_head: &str,
+        head_commit_time: i64,
+        recent_window_days: u64,
+        metrics: &[GitFileMetrics],
+        co_changes: &[GitCoChange],
+    ) -> Result<PersistedGitAnalysisRun, IndexError> {
+        let index_path = self.path.clone();
+        let transaction =
+            self.connection
+                .transaction()
+                .map_err(|source| IndexError::PersistGitAnalysis {
+                    path: index_path.clone(),
+                    source,
+                })?;
+        let repo_id = ensure_repo_for_git(&transaction, &index_path)?;
+        let recent_window_days =
+            u64_to_i64_for_git(recent_window_days, &index_path, "recent_window_days")?;
+        let metrics_observed =
+            usize_to_i64_for_git(metrics.len(), &index_path, "metrics_observed")?;
+        let co_changes_observed =
+            usize_to_i64_for_git(co_changes.len(), &index_path, "co_changes_observed")?;
+
+        transaction
+            .execute(
+                "DELETE FROM git_analysis_runs WHERE repo_id = ?1;",
+                params![repo_id],
+            )
+            .map_err(|source| IndexError::PersistGitAnalysis {
+                path: index_path.clone(),
+                source,
+            })?;
+        transaction
+            .execute(
+                "INSERT INTO git_analysis_runs (
+                    repo_id,
+                    analysis_key,
+                    status,
+                    analyzer_version,
+                    git_head,
+                    head_commit_time,
+                    recent_window_days,
+                    metrics_observed,
+                    co_changes_observed
+                )
+                VALUES (?1, ?2, 'completed', ?3, ?4, ?5, ?6, ?7, ?8);",
+                params![
+                    repo_id,
+                    GIT_ANALYSIS_KEY,
+                    env!("CARGO_PKG_VERSION"),
+                    git_head,
+                    head_commit_time,
+                    recent_window_days,
+                    metrics_observed,
+                    co_changes_observed,
+                ],
+            )
+            .map_err(|source| IndexError::PersistGitAnalysis {
+                path: index_path.clone(),
+                source,
+            })?;
+        let analysis_run_id = transaction.last_insert_rowid();
+
+        let mut file_ids = std::collections::BTreeMap::new();
+        for metric in metrics {
+            ensure_git_path_file(
+                &transaction,
+                &index_path,
+                repo_id,
+                &metric.path,
+                &mut file_ids,
+            )?;
+        }
+        for co_change in co_changes {
+            ensure_git_path_file(
+                &transaction,
+                &index_path,
+                repo_id,
+                &co_change.left_path,
+                &mut file_ids,
+            )?;
+            ensure_git_path_file(
+                &transaction,
+                &index_path,
+                repo_id,
+                &co_change.right_path,
+                &mut file_ids,
+            )?;
+        }
+
+        {
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO git_file_stats (
+                        file_id,
+                        repo_id,
+                        analysis_run_id,
+                        commits_per_file,
+                        total_churn_added,
+                        total_churn_deleted,
+                        recent_churn_added,
+                        recent_churn_deleted,
+                        author_count,
+                        dominant_owner,
+                        dominant_owner_share,
+                        first_commit_id,
+                        first_commit_time,
+                        last_commit_id,
+                        last_commit_time,
+                        file_age_days
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16);",
+                )
+                .map_err(|source| IndexError::PersistGitAnalysis {
+                    path: index_path.clone(),
+                    source,
+                })?;
+
+            for metric in metrics {
+                let file_id = file_ids[&metric.path];
+                insert
+                    .execute(params![
+                        file_id,
+                        repo_id,
+                        analysis_run_id,
+                        u64_to_i64_for_git(
+                            metric.commits_per_file,
+                            &index_path,
+                            "commits_per_file"
+                        )?,
+                        u64_to_i64_for_git(
+                            metric.total_churn_added,
+                            &index_path,
+                            "total_churn_added"
+                        )?,
+                        u64_to_i64_for_git(
+                            metric.total_churn_deleted,
+                            &index_path,
+                            "total_churn_deleted"
+                        )?,
+                        u64_to_i64_for_git(
+                            metric.recent_churn_added,
+                            &index_path,
+                            "recent_churn_added"
+                        )?,
+                        u64_to_i64_for_git(
+                            metric.recent_churn_deleted,
+                            &index_path,
+                            "recent_churn_deleted"
+                        )?,
+                        u64_to_i64_for_git(metric.author_count, &index_path, "author_count")?,
+                        metric.dominant_owner.as_deref(),
+                        metric.dominant_owner_share,
+                        metric.first_commit_id.as_deref(),
+                        metric.first_commit_time,
+                        metric.last_commit_id.as_deref(),
+                        metric.last_commit_time,
+                        optional_u64_to_i64_for_git(
+                            metric.file_age_days,
+                            &index_path,
+                            "file_age_days"
+                        )?,
+                    ])
+                    .map_err(|source| IndexError::PersistGitAnalysis {
+                        path: index_path.clone(),
+                        source,
+                    })?;
+            }
+        }
+
+        {
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO git_co_changes (
+                        repo_id,
+                        analysis_run_id,
+                        left_file_id,
+                        right_file_id,
+                        left_path,
+                        right_path,
+                        commit_count
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
+                )
+                .map_err(|source| IndexError::PersistGitAnalysis {
+                    path: index_path.clone(),
+                    source,
+                })?;
+
+            for co_change in co_changes {
+                insert
+                    .execute(params![
+                        repo_id,
+                        analysis_run_id,
+                        file_ids[&co_change.left_path],
+                        file_ids[&co_change.right_path],
+                        &co_change.left_path,
+                        &co_change.right_path,
+                        u64_to_i64_for_git(co_change.commit_count, &index_path, "commit_count")?,
+                    ])
+                    .map_err(|source| IndexError::PersistGitAnalysis {
+                        path: index_path.clone(),
+                        source,
+                    })?;
+            }
+        }
+
+        transaction
+            .commit()
+            .map_err(|source| IndexError::PersistGitAnalysis {
+                path: index_path,
+                source,
+            })?;
+
+        Ok(PersistedGitAnalysisRun {
+            id: analysis_run_id,
+            analysis_key: GIT_ANALYSIS_KEY.to_owned(),
+            status: "completed".to_owned(),
+            analyzer_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            git_head: git_head.to_owned(),
+            head_commit_time,
+            recent_window_days: recent_window_days as u64,
+            metrics_observed: metrics_observed as u64,
+            co_changes_observed: co_changes_observed as u64,
+        })
+    }
+
     pub fn latest_scan(&self) -> Result<Option<PersistedScan>, IndexError> {
         let Some(run) = self
             .connection
@@ -433,6 +712,45 @@ impl IndexStore {
             files,
         }))
     }
+
+    pub fn latest_git_analysis(&self) -> Result<Option<PersistedGitAnalysis>, IndexError> {
+        let Some(run) = self
+            .connection
+            .query_row(
+                "SELECT
+                    id,
+                    analysis_key,
+                    status,
+                    analyzer_version,
+                    git_head,
+                    head_commit_time,
+                    recent_window_days,
+                    metrics_observed,
+                    co_changes_observed
+                 FROM git_analysis_runs
+                 ORDER BY id DESC
+                 LIMIT 1;",
+                [],
+                read_persisted_git_analysis_run,
+            )
+            .optional()
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })?
+        else {
+            return Ok(None);
+        };
+
+        let file_stats = read_git_file_stats(&self.connection, &self.path, run.id)?;
+        let co_changes = read_git_co_changes(&self.connection, &self.path, run.id)?;
+
+        Ok(Some(PersistedGitAnalysis {
+            run,
+            file_stats,
+            co_changes,
+        }))
+    }
 }
 
 #[derive(Debug)]
@@ -476,11 +794,19 @@ pub enum IndexError {
         path: PathBuf,
         source: rusqlite::Error,
     },
+    PersistGitAnalysis {
+        path: PathBuf,
+        source: rusqlite::Error,
+    },
     ReadIndex {
         path: PathBuf,
         source: rusqlite::Error,
     },
     InvalidScanData {
+        path: PathBuf,
+        message: String,
+    },
+    InvalidGitAnalysisData {
         path: PathBuf,
         message: String,
     },
@@ -539,6 +865,11 @@ impl fmt::Display for IndexError {
                 "failed to persist scan results to Hotpath index '{}': {source}",
                 path.display()
             ),
+            Self::PersistGitAnalysis { path, source } => write!(
+                f,
+                "failed to persist Git analysis to Hotpath index '{}': {source}",
+                path.display()
+            ),
             Self::ReadIndex { path, source } => write!(
                 f,
                 "failed to read Hotpath index '{}': {source}",
@@ -547,6 +878,11 @@ impl fmt::Display for IndexError {
             Self::InvalidScanData { path, message } => write!(
                 f,
                 "scan results cannot be persisted to Hotpath index '{}': {message}",
+                path.display()
+            ),
+            Self::InvalidGitAnalysisData { path, message } => write!(
+                f,
+                "Git analysis cannot be persisted to Hotpath index '{}': {message}",
                 path.display()
             ),
         }
@@ -562,11 +898,13 @@ impl StdError for IndexError {
             | Self::CorruptDatabase { source, .. }
             | Self::Migration { source, .. }
             | Self::PersistScan { source, .. }
+            | Self::PersistGitAnalysis { source, .. }
             | Self::ReadIndex { source, .. } => Some(source),
             Self::CorruptMetadata { .. }
             | Self::UnsafeIndexDir { .. }
             | Self::IncompatibleFutureSchema { .. }
-            | Self::InvalidScanData { .. } => None,
+            | Self::InvalidScanData { .. }
+            | Self::InvalidGitAnalysisData { .. } => None,
         }
     }
 }
@@ -595,6 +933,66 @@ fn ensure_repo(transaction: &Transaction<'_>, path: &Path) -> Result<i64, IndexE
             path: path.to_path_buf(),
             source,
         })
+}
+
+fn ensure_repo_for_git(transaction: &Transaction<'_>, path: &Path) -> Result<i64, IndexError> {
+    transaction
+        .execute(
+            "INSERT INTO repos (root_key)
+             VALUES ('.')
+             ON CONFLICT(root_key) DO NOTHING;",
+            [],
+        )
+        .map_err(|source| IndexError::PersistGitAnalysis {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    transaction
+        .query_row("SELECT id FROM repos WHERE root_key = '.';", [], |row| {
+            row.get(0)
+        })
+        .map_err(|source| IndexError::PersistGitAnalysis {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+fn ensure_git_path_file(
+    transaction: &Transaction<'_>,
+    index_path: &Path,
+    repo_id: i64,
+    file_path: &str,
+    file_ids: &mut std::collections::BTreeMap<String, i64>,
+) -> Result<(), IndexError> {
+    if file_ids.contains_key(file_path) {
+        return Ok(());
+    }
+
+    transaction
+        .execute(
+            "INSERT INTO files (repo_id, path)
+             VALUES (?1, ?2)
+             ON CONFLICT(repo_id, path) DO NOTHING;",
+            params![repo_id, file_path],
+        )
+        .map_err(|source| IndexError::PersistGitAnalysis {
+            path: index_path.to_path_buf(),
+            source,
+        })?;
+
+    let file_id = transaction
+        .query_row(
+            "SELECT id FROM files WHERE repo_id = ?1 AND path = ?2;",
+            params![repo_id, file_path],
+            |row| row.get(0),
+        )
+        .map_err(|source| IndexError::PersistGitAnalysis {
+            path: index_path.to_path_buf(),
+            source,
+        })?;
+    file_ids.insert(file_path.to_owned(), file_id);
+
+    Ok(())
 }
 
 fn next_run_key(
@@ -860,6 +1258,122 @@ fn read_file_warnings(
     Ok(warnings)
 }
 
+fn read_persisted_git_analysis_run(row: &Row<'_>) -> rusqlite::Result<PersistedGitAnalysisRun> {
+    Ok(PersistedGitAnalysisRun {
+        id: row.get(0)?,
+        analysis_key: row.get(1)?,
+        status: row.get(2)?,
+        analyzer_version: row.get(3)?,
+        git_head: row.get(4)?,
+        head_commit_time: row.get(5)?,
+        recent_window_days: i64_to_u64(row.get(6)?, 6)?,
+        metrics_observed: i64_to_u64(row.get(7)?, 7)?,
+        co_changes_observed: i64_to_u64(row.get(8)?, 8)?,
+    })
+}
+
+fn read_git_file_stats(
+    connection: &Connection,
+    index_path: &Path,
+    analysis_run_id: i64,
+) -> Result<Vec<PersistedGitFileStats>, IndexError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT
+                files.path,
+                git_file_stats.commits_per_file,
+                git_file_stats.total_churn_added,
+                git_file_stats.total_churn_deleted,
+                git_file_stats.recent_churn_added,
+                git_file_stats.recent_churn_deleted,
+                git_file_stats.author_count,
+                git_file_stats.dominant_owner,
+                git_file_stats.dominant_owner_share,
+                git_file_stats.first_commit_id,
+                git_file_stats.first_commit_time,
+                git_file_stats.last_commit_id,
+                git_file_stats.last_commit_time,
+                git_file_stats.file_age_days
+             FROM git_file_stats
+             INNER JOIN files ON files.id = git_file_stats.file_id
+             WHERE git_file_stats.analysis_run_id = ?1
+             ORDER BY files.path;",
+        )
+        .map_err(|source| IndexError::ReadIndex {
+            path: index_path.to_path_buf(),
+            source,
+        })?;
+    let rows = statement
+        .query_map(params![analysis_run_id], read_persisted_git_file_stats)
+        .map_err(|source| IndexError::ReadIndex {
+            path: index_path.to_path_buf(),
+            source,
+        })?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|source| IndexError::ReadIndex {
+            path: index_path.to_path_buf(),
+            source,
+        })
+}
+
+fn read_persisted_git_file_stats(row: &Row<'_>) -> rusqlite::Result<PersistedGitFileStats> {
+    Ok(PersistedGitFileStats {
+        path: row.get(0)?,
+        commits_per_file: i64_to_u64(row.get(1)?, 1)?,
+        total_churn_added: i64_to_u64(row.get(2)?, 2)?,
+        total_churn_deleted: i64_to_u64(row.get(3)?, 3)?,
+        recent_churn_added: i64_to_u64(row.get(4)?, 4)?,
+        recent_churn_deleted: i64_to_u64(row.get(5)?, 5)?,
+        author_count: i64_to_u64(row.get(6)?, 6)?,
+        dominant_owner: row.get(7)?,
+        dominant_owner_share: row.get(8)?,
+        first_commit_id: row.get(9)?,
+        first_commit_time: row.get(10)?,
+        last_commit_id: row.get(11)?,
+        last_commit_time: row.get(12)?,
+        file_age_days: optional_i64_to_u64(row.get(13)?, 13)?,
+    })
+}
+
+fn read_git_co_changes(
+    connection: &Connection,
+    index_path: &Path,
+    analysis_run_id: i64,
+) -> Result<Vec<PersistedGitCoChange>, IndexError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT left_path, right_path, commit_count
+             FROM git_co_changes
+             WHERE analysis_run_id = ?1
+             ORDER BY commit_count DESC, left_path, right_path;",
+        )
+        .map_err(|source| IndexError::ReadIndex {
+            path: index_path.to_path_buf(),
+            source,
+        })?;
+    let rows = statement
+        .query_map(params![analysis_run_id], read_persisted_git_co_change)
+        .map_err(|source| IndexError::ReadIndex {
+            path: index_path.to_path_buf(),
+            source,
+        })?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|source| IndexError::ReadIndex {
+            path: index_path.to_path_buf(),
+            source,
+        })
+}
+
+fn read_persisted_git_co_change(row: &Row<'_>) -> rusqlite::Result<PersistedGitCoChange> {
+    Ok(PersistedGitCoChange {
+        left_path: row.get(0)?,
+        right_path: row.get(1)?,
+        commit_count: i64_to_u64(row.get(2)?, 2)?,
+    })
+}
+
 fn read_persisted_scan_warning(row: &Row<'_>) -> rusqlite::Result<PersistedScanWarning> {
     Ok(PersistedScanWarning {
         code: row.get(0)?,
@@ -887,6 +1401,38 @@ fn optional_u64_to_i64(
 
 fn u64_to_i64(value: u64, path: &Path, field_name: &'static str) -> Result<i64, IndexError> {
     i64::try_from(value).map_err(|_| IndexError::InvalidScanData {
+        path: path.to_path_buf(),
+        message: format!("{field_name} value {value} exceeds SQLite INTEGER range"),
+    })
+}
+
+fn optional_u64_to_i64_for_git(
+    value: Option<u64>,
+    path: &Path,
+    field_name: &'static str,
+) -> Result<Option<i64>, IndexError> {
+    value
+        .map(|value| u64_to_i64_for_git(value, path, field_name))
+        .transpose()
+}
+
+fn u64_to_i64_for_git(
+    value: u64,
+    path: &Path,
+    field_name: &'static str,
+) -> Result<i64, IndexError> {
+    i64::try_from(value).map_err(|_| IndexError::InvalidGitAnalysisData {
+        path: path.to_path_buf(),
+        message: format!("{field_name} value {value} exceeds SQLite INTEGER range"),
+    })
+}
+
+fn usize_to_i64_for_git(
+    value: usize,
+    path: &Path,
+    field_name: &'static str,
+) -> Result<i64, IndexError> {
+    i64::try_from(value).map_err(|_| IndexError::InvalidGitAnalysisData {
         path: path.to_path_buf(),
         message: format!("{field_name} value {value} exceeds SQLite INTEGER range"),
     })
@@ -1050,6 +1596,10 @@ fn migrate_to_current(
                 migrate_0_to_1(connection, path)?;
                 version = 1;
             }
+            1 => {
+                migrate_1_to_2(connection, path)?;
+                version = 2;
+            }
             _ => {
                 return Err(IndexError::CorruptMetadata {
                     path: path.to_path_buf(),
@@ -1081,15 +1631,14 @@ fn migrate_0_to_1(connection: &mut Connection, path: &Path) -> Result<(), IndexE
             .map_err(|source| migration_error(path, 0, 1, source))?;
     }
 
-    create_core_schema(&transaction, path)?;
-    verify_schema_objects(&transaction, path)?;
+    create_core_schema_v1(&transaction, path)?;
 
     transaction
         .execute(
             "INSERT INTO hotpath_metadata (key, value)
              VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
-            params![SCHEMA_VERSION_KEY, CURRENT_SCHEMA_VERSION.to_string()],
+            params![SCHEMA_VERSION_KEY, "1"],
         )
         .map_err(|source| migration_error(path, 0, 1, source))?;
     transaction
@@ -1097,7 +1646,7 @@ fn migrate_0_to_1(connection: &mut Connection, path: &Path) -> Result<(), IndexE
             "INSERT INTO hotpath_metadata (key, value)
              VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
-            params![SCHEMA_IDENTIFIER_KEY, SCHEMA_IDENTIFIER],
+            params![SCHEMA_IDENTIFIER_KEY, SCHEMA_IDENTIFIER_V1],
         )
         .map_err(|source| migration_error(path, 0, 1, source))?;
     transaction
@@ -1110,7 +1659,41 @@ fn migrate_0_to_1(connection: &mut Connection, path: &Path) -> Result<(), IndexE
     Ok(())
 }
 
-fn create_core_schema(connection: &Connection, path: &Path) -> Result<(), IndexError> {
+fn migrate_1_to_2(connection: &mut Connection, path: &Path) -> Result<(), IndexError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|source| migration_error(path, 1, 2, source))?;
+
+    create_git_schema_v2(&transaction, path)?;
+    verify_schema_objects(&transaction, path)?;
+
+    transaction
+        .execute(
+            "INSERT INTO hotpath_metadata (key, value)
+             VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+            params![SCHEMA_VERSION_KEY, CURRENT_SCHEMA_VERSION.to_string()],
+        )
+        .map_err(|source| migration_error(path, 1, 2, source))?;
+    transaction
+        .execute(
+            "INSERT INTO hotpath_metadata (key, value)
+             VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+            params![SCHEMA_IDENTIFIER_KEY, SCHEMA_IDENTIFIER],
+        )
+        .map_err(|source| migration_error(path, 1, 2, source))?;
+    transaction
+        .execute_batch("PRAGMA user_version = 2;")
+        .map_err(|source| migration_error(path, 1, 2, source))?;
+    transaction
+        .commit()
+        .map_err(|source| migration_error(path, 1, 2, source))?;
+
+    Ok(())
+}
+
+fn create_core_schema_v1(connection: &Connection, path: &Path) -> Result<(), IndexError> {
     connection
         .execute_batch(
             "
@@ -1159,6 +1742,8 @@ fn create_core_schema(connection: &Connection, path: &Path) -> Result<(), IndexE
                 CHECK (path IS NULL OR path NOT LIKE '../%'),
                 CHECK (path IS NULL OR path NOT LIKE '%/../%'),
                 CHECK (path IS NULL OR path NOT LIKE '%/..'),
+                CHECK (path IS NULL OR path NOT LIKE '~%'),
+                CHECK (path IS NULL OR path NOT GLOB '[A-Za-z]:*'),
                 CHECK (path IS NULL OR instr(path, '\\') = 0),
                 CHECK (path IS NULL OR instr(path, char(0)) = 0),
                 CHECK (length(message) > 0),
@@ -1187,6 +1772,8 @@ fn create_core_schema(connection: &Connection, path: &Path) -> Result<(), IndexE
                 CHECK (path NOT LIKE '../%'),
                 CHECK (path NOT LIKE '%/../%'),
                 CHECK (path NOT LIKE '%/..'),
+                CHECK (path NOT LIKE '~%'),
+                CHECK (path NOT GLOB '[A-Za-z]:*'),
                 CHECK (instr(path, '\\') = 0),
                 CHECK (instr(path, char(0)) = 0),
                 CHECK (byte_size IS NULL OR byte_size >= 0),
@@ -1264,6 +1851,8 @@ fn create_core_schema(connection: &Connection, path: &Path) -> Result<(), IndexE
                 CHECK (target_path NOT LIKE '../%'),
                 CHECK (target_path NOT LIKE '%/../%'),
                 CHECK (target_path NOT LIKE '%/..'),
+                CHECK (target_path NOT LIKE '~%'),
+                CHECK (target_path NOT GLOB '[A-Za-z]:*'),
                 CHECK (instr(target_path, '\\') = 0),
                 CHECK (instr(target_path, char(0)) = 0),
                 CHECK (length(kind) > 0),
@@ -1312,6 +1901,114 @@ fn create_core_schema(connection: &Connection, path: &Path) -> Result<(), IndexE
             ",
         )
         .map_err(|source| migration_error(path, 0, 1, source))
+}
+
+fn create_git_schema_v2(connection: &Connection, path: &Path) -> Result<(), IndexError> {
+    connection
+        .execute_batch(
+            "
+            DROP TABLE IF EXISTS git_file_stats;
+
+            CREATE TABLE IF NOT EXISTS git_analysis_runs (
+                id INTEGER PRIMARY KEY,
+                repo_id INTEGER NOT NULL,
+                analysis_key TEXT NOT NULL,
+                status TEXT NOT NULL,
+                analyzer_version TEXT,
+                git_head TEXT NOT NULL,
+                head_commit_time INTEGER NOT NULL,
+                recent_window_days INTEGER NOT NULL,
+                metrics_observed INTEGER NOT NULL,
+                co_changes_observed INTEGER NOT NULL,
+                UNIQUE (repo_id, analysis_key),
+                CHECK (length(analysis_key) > 0),
+                CHECK (status IN ('completed')),
+                CHECK (length(git_head) > 0),
+                CHECK (recent_window_days >= 0),
+                CHECK (metrics_observed >= 0),
+                CHECK (co_changes_observed >= 0),
+                FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS git_file_stats (
+                file_id INTEGER PRIMARY KEY,
+                repo_id INTEGER NOT NULL,
+                analysis_run_id INTEGER NOT NULL,
+                commits_per_file INTEGER NOT NULL DEFAULT 0,
+                total_churn_added INTEGER NOT NULL DEFAULT 0,
+                total_churn_deleted INTEGER NOT NULL DEFAULT 0,
+                recent_churn_added INTEGER NOT NULL DEFAULT 0,
+                recent_churn_deleted INTEGER NOT NULL DEFAULT 0,
+                author_count INTEGER NOT NULL DEFAULT 0,
+                dominant_owner TEXT,
+                dominant_owner_share REAL,
+                first_commit_id TEXT,
+                first_commit_time INTEGER,
+                last_commit_id TEXT,
+                last_commit_time INTEGER,
+                file_age_days INTEGER,
+                CHECK (commits_per_file >= 0),
+                CHECK (total_churn_added >= 0),
+                CHECK (total_churn_deleted >= 0),
+                CHECK (recent_churn_added >= 0),
+                CHECK (recent_churn_deleted >= 0),
+                CHECK (author_count >= 0),
+                CHECK (dominant_owner_share IS NULL OR (dominant_owner_share >= 0.0 AND dominant_owner_share <= 1.0)),
+                CHECK (file_age_days IS NULL OR file_age_days >= 0),
+                FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+                FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE,
+                FOREIGN KEY (analysis_run_id) REFERENCES git_analysis_runs(id) ON DELETE CASCADE
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS git_co_changes (
+                id INTEGER PRIMARY KEY,
+                repo_id INTEGER NOT NULL,
+                analysis_run_id INTEGER NOT NULL,
+                left_file_id INTEGER NOT NULL,
+                right_file_id INTEGER NOT NULL,
+                left_path TEXT NOT NULL,
+                right_path TEXT NOT NULL,
+                commit_count INTEGER NOT NULL,
+                UNIQUE (repo_id, left_path, right_path),
+                CHECK (length(left_path) > 0),
+                CHECK (left_path != '..'),
+                CHECK (left_path NOT LIKE '/%'),
+                CHECK (left_path NOT LIKE './%'),
+                CHECK (left_path NOT LIKE '../%'),
+                CHECK (left_path NOT LIKE '%/../%'),
+                CHECK (left_path NOT LIKE '%/..'),
+                CHECK (left_path NOT LIKE '~%'),
+                CHECK (left_path NOT GLOB '[A-Za-z]:*'),
+                CHECK (instr(left_path, '\\') = 0),
+                CHECK (instr(left_path, char(0)) = 0),
+                CHECK (length(right_path) > 0),
+                CHECK (right_path != '..'),
+                CHECK (right_path NOT LIKE '/%'),
+                CHECK (right_path NOT LIKE './%'),
+                CHECK (right_path NOT LIKE '../%'),
+                CHECK (right_path NOT LIKE '%/../%'),
+                CHECK (right_path NOT LIKE '%/..'),
+                CHECK (right_path NOT LIKE '~%'),
+                CHECK (right_path NOT GLOB '[A-Za-z]:*'),
+                CHECK (instr(right_path, '\\') = 0),
+                CHECK (instr(right_path, char(0)) = 0),
+                CHECK (left_path < right_path),
+                CHECK (commit_count >= 0),
+                FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE,
+                FOREIGN KEY (analysis_run_id) REFERENCES git_analysis_runs(id) ON DELETE CASCADE,
+                FOREIGN KEY (left_file_id) REFERENCES files(id) ON DELETE CASCADE,
+                FOREIGN KEY (right_file_id) REFERENCES files(id) ON DELETE CASCADE
+            ) STRICT;
+
+            CREATE INDEX IF NOT EXISTS git_analysis_runs_by_repo_key
+                ON git_analysis_runs (repo_id, analysis_key);
+            CREATE INDEX IF NOT EXISTS git_file_stats_by_repo_analysis
+                ON git_file_stats (repo_id, analysis_run_id, file_id);
+            CREATE INDEX IF NOT EXISTS git_co_changes_by_repo_rank
+                ON git_co_changes (repo_id, commit_count DESC, left_path, right_path);
+            ",
+        )
+        .map_err(|source| migration_error(path, 1, 2, source))
 }
 
 fn migration_error(
@@ -1452,11 +2149,11 @@ fn verify_existing_metadata_before_initial_migration(
         });
     }
 
-    if metadata_identifier != SCHEMA_IDENTIFIER {
+    if metadata_identifier != SCHEMA_IDENTIFIER_V1 && metadata_identifier != SCHEMA_IDENTIFIER {
         return Err(IndexError::CorruptMetadata {
             path: path.to_path_buf(),
             message: format!(
-                "metadata schema identifier '{metadata_identifier}' does not match expected {SCHEMA_IDENTIFIER}"
+                "metadata schema identifier '{metadata_identifier}' does not match expected {SCHEMA_IDENTIFIER_V1}"
             ),
         });
     }
@@ -1606,14 +2303,47 @@ const SYMBOLS_COLUMNS: &[ExpectedColumn] = &[
     expected_column("signature", "TEXT", false, None, 0),
 ];
 
+const GIT_ANALYSIS_RUNS_COLUMNS: &[ExpectedColumn] = &[
+    expected_column("id", "INTEGER", false, None, 1),
+    expected_column("repo_id", "INTEGER", true, None, 0),
+    expected_column("analysis_key", "TEXT", true, None, 0),
+    expected_column("status", "TEXT", true, None, 0),
+    expected_column("analyzer_version", "TEXT", false, None, 0),
+    expected_column("git_head", "TEXT", true, None, 0),
+    expected_column("head_commit_time", "INTEGER", true, None, 0),
+    expected_column("recent_window_days", "INTEGER", true, None, 0),
+    expected_column("metrics_observed", "INTEGER", true, None, 0),
+    expected_column("co_changes_observed", "INTEGER", true, None, 0),
+];
+
 const GIT_FILE_STATS_COLUMNS: &[ExpectedColumn] = &[
     expected_column("file_id", "INTEGER", false, None, 1),
-    expected_column("commit_count", "INTEGER", true, Some("0"), 0),
-    expected_column("churn_added", "INTEGER", true, Some("0"), 0),
-    expected_column("churn_deleted", "INTEGER", true, Some("0"), 0),
+    expected_column("repo_id", "INTEGER", true, None, 0),
+    expected_column("analysis_run_id", "INTEGER", true, None, 0),
+    expected_column("commits_per_file", "INTEGER", true, Some("0"), 0),
+    expected_column("total_churn_added", "INTEGER", true, Some("0"), 0),
+    expected_column("total_churn_deleted", "INTEGER", true, Some("0"), 0),
+    expected_column("recent_churn_added", "INTEGER", true, Some("0"), 0),
+    expected_column("recent_churn_deleted", "INTEGER", true, Some("0"), 0),
     expected_column("author_count", "INTEGER", true, Some("0"), 0),
-    expected_column("primary_author", "TEXT", false, None, 0),
-    expected_column("last_commit", "TEXT", false, None, 0),
+    expected_column("dominant_owner", "TEXT", false, None, 0),
+    expected_column("dominant_owner_share", "REAL", false, None, 0),
+    expected_column("first_commit_id", "TEXT", false, None, 0),
+    expected_column("first_commit_time", "INTEGER", false, None, 0),
+    expected_column("last_commit_id", "TEXT", false, None, 0),
+    expected_column("last_commit_time", "INTEGER", false, None, 0),
+    expected_column("file_age_days", "INTEGER", false, None, 0),
+];
+
+const GIT_CO_CHANGES_COLUMNS: &[ExpectedColumn] = &[
+    expected_column("id", "INTEGER", false, None, 1),
+    expected_column("repo_id", "INTEGER", true, None, 0),
+    expected_column("analysis_run_id", "INTEGER", true, None, 0),
+    expected_column("left_file_id", "INTEGER", true, None, 0),
+    expected_column("right_file_id", "INTEGER", true, None, 0),
+    expected_column("left_path", "TEXT", true, None, 0),
+    expected_column("right_path", "TEXT", true, None, 0),
+    expected_column("commit_count", "INTEGER", true, None, 0),
 ];
 
 const DEPENDENCIES_COLUMNS: &[ExpectedColumn] = &[
@@ -1666,8 +2396,21 @@ const SYMBOLS_FOREIGN_KEYS: &[ExpectedForeignKey] = &[
     expected_foreign_key("parent_symbol_id", "symbols", "id", "CASCADE"),
 ];
 
-const GIT_FILE_STATS_FOREIGN_KEYS: &[ExpectedForeignKey] =
-    &[expected_foreign_key("file_id", "files", "id", "CASCADE")];
+const GIT_ANALYSIS_RUNS_FOREIGN_KEYS: &[ExpectedForeignKey] =
+    &[expected_foreign_key("repo_id", "repos", "id", "CASCADE")];
+
+const GIT_FILE_STATS_FOREIGN_KEYS: &[ExpectedForeignKey] = &[
+    expected_foreign_key("file_id", "files", "id", "CASCADE"),
+    expected_foreign_key("repo_id", "repos", "id", "CASCADE"),
+    expected_foreign_key("analysis_run_id", "git_analysis_runs", "id", "CASCADE"),
+];
+
+const GIT_CO_CHANGES_FOREIGN_KEYS: &[ExpectedForeignKey] = &[
+    expected_foreign_key("repo_id", "repos", "id", "CASCADE"),
+    expected_foreign_key("analysis_run_id", "git_analysis_runs", "id", "CASCADE"),
+    expected_foreign_key("left_file_id", "files", "id", "CASCADE"),
+    expected_foreign_key("right_file_id", "files", "id", "CASCADE"),
+];
 
 const DEPENDENCIES_FOREIGN_KEYS: &[ExpectedForeignKey] = &[
     expected_foreign_key("repo_id", "repos", "id", "CASCADE"),
@@ -1700,6 +2443,11 @@ const SYMBOLS_UNIQUE_CONSTRAINTS: &[ExpectedUniqueConstraint] = &[expected_uniqu
     "line_start",
     "line_end",
 ])];
+const GIT_ANALYSIS_RUNS_UNIQUE_CONSTRAINTS: &[ExpectedUniqueConstraint] =
+    &[expected_unique_constraint(&["repo_id", "analysis_key"])];
+const GIT_CO_CHANGES_UNIQUE_CONSTRAINTS: &[ExpectedUniqueConstraint] = &[
+    expected_unique_constraint(&["repo_id", "left_path", "right_path"]),
+];
 const DEPENDENCIES_UNIQUE_CONSTRAINTS: &[ExpectedUniqueConstraint] =
     &[expected_unique_constraint(&[
         "source_file_id",
@@ -1725,6 +2473,8 @@ const SCAN_WARNINGS_CHECK_CONSTRAINTS: &[&str] = &[
     "CHECK (path IS NULL OR path NOT LIKE '../%')",
     "CHECK (path IS NULL OR path NOT LIKE '%/../%')",
     "CHECK (path IS NULL OR path NOT LIKE '%/..')",
+    "CHECK (path IS NULL OR path NOT LIKE '~%')",
+    "CHECK (path IS NULL OR path NOT GLOB '[A-Za-z]:*')",
     "CHECK (path IS NULL OR instr(path, '\\') = 0)",
     "CHECK (path IS NULL OR instr(path, char(0)) = 0)",
     "CHECK (length(message) > 0)",
@@ -1737,6 +2487,8 @@ const FILES_CHECK_CONSTRAINTS: &[&str] = &[
     "CHECK (path NOT LIKE '../%')",
     "CHECK (path NOT LIKE '%/../%')",
     "CHECK (path NOT LIKE '%/..')",
+    "CHECK (path NOT LIKE '~%')",
+    "CHECK (path NOT GLOB '[A-Za-z]:*')",
     "CHECK (instr(path, '\\') = 0)",
     "CHECK (instr(path, char(0)) = 0)",
     "CHECK (byte_size IS NULL OR byte_size >= 0)",
@@ -1757,11 +2509,49 @@ const SYMBOLS_CHECK_CONSTRAINTS: &[&str] = &[
     "CHECK (line_start IS NULL OR line_start >= 1)",
     "CHECK (line_end IS NULL OR line_end >= line_start)",
 ];
+const GIT_ANALYSIS_RUNS_CHECK_CONSTRAINTS: &[&str] = &[
+    "CHECK (length(analysis_key) > 0)",
+    "CHECK (status IN ('completed'))",
+    "CHECK (length(git_head) > 0)",
+    "CHECK (recent_window_days >= 0)",
+    "CHECK (metrics_observed >= 0)",
+    "CHECK (co_changes_observed >= 0)",
+];
 const GIT_FILE_STATS_CHECK_CONSTRAINTS: &[&str] = &[
-    "CHECK (commit_count >= 0)",
-    "CHECK (churn_added >= 0)",
-    "CHECK (churn_deleted >= 0)",
+    "CHECK (commits_per_file >= 0)",
+    "CHECK (total_churn_added >= 0)",
+    "CHECK (total_churn_deleted >= 0)",
+    "CHECK (recent_churn_added >= 0)",
+    "CHECK (recent_churn_deleted >= 0)",
     "CHECK (author_count >= 0)",
+    "CHECK (dominant_owner_share IS NULL OR (dominant_owner_share >= 0.0 AND dominant_owner_share <= 1.0))",
+    "CHECK (file_age_days IS NULL OR file_age_days >= 0)",
+];
+const GIT_CO_CHANGES_CHECK_CONSTRAINTS: &[&str] = &[
+    "CHECK (length(left_path) > 0)",
+    "CHECK (left_path != '..')",
+    "CHECK (left_path NOT LIKE '/%')",
+    "CHECK (left_path NOT LIKE './%')",
+    "CHECK (left_path NOT LIKE '../%')",
+    "CHECK (left_path NOT LIKE '%/../%')",
+    "CHECK (left_path NOT LIKE '%/..')",
+    "CHECK (left_path NOT LIKE '~%')",
+    "CHECK (left_path NOT GLOB '[A-Za-z]:*')",
+    "CHECK (instr(left_path, '\\') = 0)",
+    "CHECK (instr(left_path, char(0)) = 0)",
+    "CHECK (length(right_path) > 0)",
+    "CHECK (right_path != '..')",
+    "CHECK (right_path NOT LIKE '/%')",
+    "CHECK (right_path NOT LIKE './%')",
+    "CHECK (right_path NOT LIKE '../%')",
+    "CHECK (right_path NOT LIKE '%/../%')",
+    "CHECK (right_path NOT LIKE '%/..')",
+    "CHECK (right_path NOT LIKE '~%')",
+    "CHECK (right_path NOT GLOB '[A-Za-z]:*')",
+    "CHECK (instr(right_path, '\\') = 0)",
+    "CHECK (instr(right_path, char(0)) = 0)",
+    "CHECK (left_path < right_path)",
+    "CHECK (commit_count >= 0)",
 ];
 const DEPENDENCIES_CHECK_CONSTRAINTS: &[&str] = &[
     "CHECK (length(target_path) > 0)",
@@ -1771,6 +2561,8 @@ const DEPENDENCIES_CHECK_CONSTRAINTS: &[&str] = &[
     "CHECK (target_path NOT LIKE '../%')",
     "CHECK (target_path NOT LIKE '%/../%')",
     "CHECK (target_path NOT LIKE '%/..')",
+    "CHECK (target_path NOT LIKE '~%')",
+    "CHECK (target_path NOT GLOB '[A-Za-z]:*')",
     "CHECK (instr(target_path, '\\') = 0)",
     "CHECK (instr(target_path, char(0)) = 0)",
     "CHECK (length(kind) > 0)",
@@ -1803,6 +2595,21 @@ const REQUIRED_INDEXES: &[ExpectedIndex] = &[
         "symbols_by_file_order",
         "symbols",
         &["file_id", "line_start", "line_end", "kind", "name"],
+    ),
+    expected_index(
+        "git_analysis_runs_by_repo_key",
+        "git_analysis_runs",
+        &["repo_id", "analysis_key"],
+    ),
+    expected_index(
+        "git_file_stats_by_repo_analysis",
+        "git_file_stats",
+        &["repo_id", "analysis_run_id", "file_id"],
+    ),
+    expected_index(
+        "git_co_changes_by_repo_rank",
+        "git_co_changes",
+        &["repo_id", "commit_count", "left_path", "right_path"],
     ),
     expected_index(
         "dependencies_by_source",
@@ -1970,7 +2777,9 @@ fn expected_columns(table_name: &str) -> &'static [ExpectedColumn] {
         "files" => FILES_COLUMNS,
         "file_warnings" => FILE_WARNINGS_COLUMNS,
         "symbols" => SYMBOLS_COLUMNS,
+        "git_analysis_runs" => GIT_ANALYSIS_RUNS_COLUMNS,
         "git_file_stats" => GIT_FILE_STATS_COLUMNS,
+        "git_co_changes" => GIT_CO_CHANGES_COLUMNS,
         "dependencies" => DEPENDENCIES_COLUMNS,
         "hotspots" => HOTSPOTS_COLUMNS,
         _ => &[],
@@ -1985,7 +2794,9 @@ fn expected_foreign_keys(table_name: &str) -> &'static [ExpectedForeignKey] {
         "files" => FILES_FOREIGN_KEYS,
         "file_warnings" => FILE_WARNINGS_FOREIGN_KEYS,
         "symbols" => SYMBOLS_FOREIGN_KEYS,
+        "git_analysis_runs" => GIT_ANALYSIS_RUNS_FOREIGN_KEYS,
         "git_file_stats" => GIT_FILE_STATS_FOREIGN_KEYS,
+        "git_co_changes" => GIT_CO_CHANGES_FOREIGN_KEYS,
         "dependencies" => DEPENDENCIES_FOREIGN_KEYS,
         "hotspots" => HOTSPOTS_FOREIGN_KEYS,
         _ => NO_FOREIGN_KEYS,
@@ -2000,6 +2811,8 @@ fn expected_unique_constraints(table_name: &str) -> &'static [ExpectedUniqueCons
         "files" => FILES_UNIQUE_CONSTRAINTS,
         "file_warnings" => FILE_WARNINGS_UNIQUE_CONSTRAINTS,
         "symbols" => SYMBOLS_UNIQUE_CONSTRAINTS,
+        "git_analysis_runs" => GIT_ANALYSIS_RUNS_UNIQUE_CONSTRAINTS,
+        "git_co_changes" => GIT_CO_CHANGES_UNIQUE_CONSTRAINTS,
         "dependencies" => DEPENDENCIES_UNIQUE_CONSTRAINTS,
         _ => NO_UNIQUE_CONSTRAINTS,
     }
@@ -2013,7 +2826,9 @@ fn expected_check_constraints(table_name: &str) -> &'static [&'static str] {
         "files" => FILES_CHECK_CONSTRAINTS,
         "file_warnings" => FILE_WARNINGS_CHECK_CONSTRAINTS,
         "symbols" => SYMBOLS_CHECK_CONSTRAINTS,
+        "git_analysis_runs" => GIT_ANALYSIS_RUNS_CHECK_CONSTRAINTS,
         "git_file_stats" => GIT_FILE_STATS_CHECK_CONSTRAINTS,
+        "git_co_changes" => GIT_CO_CHANGES_CHECK_CONSTRAINTS,
         "dependencies" => DEPENDENCIES_CHECK_CONSTRAINTS,
         "hotspots" => HOTSPOTS_CHECK_CONSTRAINTS,
         _ => NO_CHECK_CONSTRAINTS,
@@ -2568,6 +3383,34 @@ mod tests {
             .expect("table count should read")
     }
 
+    fn assert_sqlite_check_constraint(error: rusqlite::Error) {
+        assert!(matches!(
+            error,
+            rusqlite::Error::SqliteFailure(error, _)
+                if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_CHECK
+        ));
+    }
+
+    fn assert_scan_persist_check_constraint(error: IndexError) {
+        match error {
+            IndexError::PersistScan { source, .. } => assert_sqlite_check_constraint(source),
+            other => panic!("expected scan persistence CHECK constraint failure, got {other:?}"),
+        }
+    }
+
+    fn assert_git_persist_check_constraint(error: IndexError) {
+        match error {
+            IndexError::PersistGitAnalysis { source, .. } => {
+                assert_sqlite_check_constraint(source);
+            }
+            other => panic!("expected Git persistence CHECK constraint failure, got {other:?}"),
+        }
+    }
+
+    fn unsafe_path_values() -> [&'static str; 3] {
+        ["~/repo/file.rs", "C:/repo/file.rs", r"C:\repo\file.rs"]
+    }
+
     fn create_legacy_metadata_only_index(index_path: &Path, metadata_rows: &[(&str, &str)]) {
         fs::create_dir_all(index_path.parent().expect("index path should have parent"))
             .expect("index directory should be created");
@@ -2649,6 +3492,8 @@ mod tests {
                 CHECK (path NOT LIKE '../%'),
                 CHECK (path NOT LIKE '%/../%'),
                 CHECK (path NOT LIKE '%/..'),
+                CHECK (path NOT LIKE '~%'),
+                CHECK (path NOT GLOB '[A-Za-z]:*'),
                 CHECK (instr(path, '\\') = 0),
                 CHECK (instr(path, char(0)) = 0),
                 CHECK (byte_size IS NULL OR byte_size >= 0),
@@ -2718,6 +3563,8 @@ mod tests {
                     CHECK (target_path NOT LIKE '../%'),
                     CHECK (target_path NOT LIKE '%/../%'),
                     CHECK (target_path NOT LIKE '%/..'),
+                    CHECK (target_path NOT LIKE '~%'),
+                    CHECK (target_path NOT GLOB '[A-Za-z]:*'),
                     CHECK (instr(target_path, '\\') = 0),
                     CHECK (instr(target_path, char(0)) = 0),
                     CHECK (length(kind) > 0),
@@ -2918,9 +3765,34 @@ mod tests {
             .expect("symbol should insert");
         connection
             .execute(
-                "INSERT INTO git_file_stats (file_id, commit_count, churn_added, churn_deleted, author_count)
-                 VALUES (?1, 1, 2, 3, 1);",
-                params![stale_id],
+                "INSERT INTO git_analysis_runs (
+                    repo_id,
+                    analysis_key,
+                    status,
+                    git_head,
+                    head_commit_time,
+                    recent_window_days,
+                    metrics_observed,
+                    co_changes_observed
+                )
+                VALUES (1, 'test', 'completed', 'abc123', 1, 90, 1, 0);",
+                [],
+            )
+            .expect("Git analysis run should insert");
+        let git_analysis_run_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO git_file_stats (
+                    file_id,
+                    repo_id,
+                    analysis_run_id,
+                    commits_per_file,
+                    total_churn_added,
+                    total_churn_deleted,
+                    author_count
+                )
+                 VALUES (?1, 1, ?2, 1, 2, 3, 1);",
+                params![stale_id, git_analysis_run_id],
             )
             .expect("git stats should insert");
         connection
@@ -2995,6 +3867,100 @@ mod tests {
         assert_eq!(table_count(&connection, "dependencies"), 1);
         assert_eq!(surviving_dependency, 1);
         assert_eq!(table_count(&connection, "hotspots"), 0);
+    }
+
+    #[test]
+    fn persist_git_analysis_records_metadata_file_stats_and_co_changes() {
+        let fixture = Fixture::new("persist-git-analysis");
+        let mut store = IndexStore::open(&fixture.path).expect("index should open");
+        let metrics = vec![
+            GitFileMetrics {
+                path: "src/a.rs".to_owned(),
+                commits_per_file: 2,
+                total_churn_added: 10,
+                total_churn_deleted: 3,
+                recent_churn_added: 4,
+                recent_churn_deleted: 1,
+                author_count: 2,
+                dominant_owner: Some("Ada <ada@example.invalid>".to_owned()),
+                dominant_owner_share: Some(0.5),
+                first_commit_id: Some("1111111111111111111111111111111111111111".to_owned()),
+                first_commit_time: Some(1_700_000_000),
+                last_commit_id: Some("2222222222222222222222222222222222222222".to_owned()),
+                last_commit_time: Some(1_700_086_400),
+                file_age_days: Some(1),
+            },
+            GitFileMetrics {
+                path: "src/b.rs".to_owned(),
+                commits_per_file: 1,
+                total_churn_added: 5,
+                total_churn_deleted: 0,
+                recent_churn_added: 5,
+                recent_churn_deleted: 0,
+                author_count: 1,
+                dominant_owner: Some("Ben <ben@example.invalid>".to_owned()),
+                dominant_owner_share: Some(1.0),
+                first_commit_id: Some("3333333333333333333333333333333333333333".to_owned()),
+                first_commit_time: Some(1_700_086_400),
+                last_commit_id: Some("3333333333333333333333333333333333333333".to_owned()),
+                last_commit_time: Some(1_700_086_400),
+                file_age_days: Some(0),
+            },
+        ];
+        let co_changes = vec![GitCoChange {
+            left_path: "src/a.rs".to_owned(),
+            right_path: "src/b.rs".to_owned(),
+            commit_count: 1,
+        }];
+
+        let run = store
+            .persist_git_analysis(
+                &fixture.path,
+                "2222222222222222222222222222222222222222",
+                1_700_086_400,
+                90,
+                &metrics,
+                &co_changes,
+            )
+            .expect("Git analysis should persist");
+        let persisted = store
+            .latest_git_analysis()
+            .expect("Git analysis should read")
+            .expect("Git analysis should exist");
+
+        assert_eq!(run.analysis_key, "git-analysis-current");
+        assert_eq!(run.status, "completed");
+        assert_eq!(run.git_head, "2222222222222222222222222222222222222222");
+        assert_eq!(run.head_commit_time, 1_700_086_400);
+        assert_eq!(run.recent_window_days, 90);
+        assert_eq!(run.metrics_observed, 2);
+        assert_eq!(run.co_changes_observed, 1);
+        assert_eq!(persisted.run, run);
+        assert_eq!(
+            persisted
+                .file_stats
+                .iter()
+                .map(|stats| (
+                    stats.path.as_str(),
+                    stats.commits_per_file,
+                    stats.author_count
+                ))
+                .collect::<Vec<_>>(),
+            vec![("src/a.rs", 2, 2), ("src/b.rs", 1, 1)]
+        );
+        assert_eq!(persisted.file_stats[0].dominant_owner_share, Some(0.5));
+        assert_eq!(
+            persisted.co_changes,
+            vec![PersistedGitCoChange {
+                left_path: "src/a.rs".to_owned(),
+                right_path: "src/b.rs".to_owned(),
+                commit_count: 1,
+            }]
+        );
+        assert!(persisted
+            .file_stats
+            .iter()
+            .all(|stats| !stats.path.contains(&fixture.path.display().to_string())));
     }
 
     #[test]
@@ -3140,6 +4106,55 @@ mod tests {
             ]
         );
         assert_eq!(
+            table_columns(&connection, "git_analysis_runs"),
+            [
+                "id",
+                "repo_id",
+                "analysis_key",
+                "status",
+                "analyzer_version",
+                "git_head",
+                "head_commit_time",
+                "recent_window_days",
+                "metrics_observed",
+                "co_changes_observed",
+            ]
+        );
+        assert_eq!(
+            table_columns(&connection, "git_file_stats"),
+            [
+                "file_id",
+                "repo_id",
+                "analysis_run_id",
+                "commits_per_file",
+                "total_churn_added",
+                "total_churn_deleted",
+                "recent_churn_added",
+                "recent_churn_deleted",
+                "author_count",
+                "dominant_owner",
+                "dominant_owner_share",
+                "first_commit_id",
+                "first_commit_time",
+                "last_commit_id",
+                "last_commit_time",
+                "file_age_days",
+            ]
+        );
+        assert_eq!(
+            table_columns(&connection, "git_co_changes"),
+            [
+                "id",
+                "repo_id",
+                "analysis_run_id",
+                "left_file_id",
+                "right_file_id",
+                "left_path",
+                "right_path",
+                "commit_count",
+            ]
+        );
+        assert_eq!(
             table_columns(&connection, "hotspots"),
             [
                 "file_id",
@@ -3157,6 +4172,9 @@ mod tests {
         assert!(is_strict_table(&connection, "scan_warnings"));
         assert!(is_strict_table(&connection, "files"));
         assert!(is_strict_table(&connection, "file_warnings"));
+        assert!(is_strict_table(&connection, "git_analysis_runs"));
+        assert!(is_strict_table(&connection, "git_file_stats"));
+        assert!(is_strict_table(&connection, "git_co_changes"));
         assert!(is_strict_table(&connection, "hotspots"));
         assert!(table_has_foreign_key(&connection, "files", "repos"));
         assert!(table_has_foreign_key(
@@ -3171,6 +4189,31 @@ mod tests {
             "scan_runs"
         ));
         assert!(table_has_foreign_key(&connection, "symbols", "files"));
+        assert!(table_has_foreign_key(
+            &connection,
+            "git_analysis_runs",
+            "repos"
+        ));
+        assert!(table_has_foreign_key(
+            &connection,
+            "git_file_stats",
+            "files"
+        ));
+        assert!(table_has_foreign_key(
+            &connection,
+            "git_file_stats",
+            "git_analysis_runs"
+        ));
+        assert!(table_has_foreign_key(
+            &connection,
+            "git_co_changes",
+            "files"
+        ));
+        assert!(table_has_foreign_key(
+            &connection,
+            "git_co_changes",
+            "git_analysis_runs"
+        ));
         assert!(table_has_foreign_key(&connection, "dependencies", "files"));
         assert!(table_has_foreign_key(&connection, "hotspots", "files"));
     }
@@ -3226,6 +4269,195 @@ mod tests {
             rusqlite::Error::SqliteFailure(error, _)
                 if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_CHECK
         ));
+    }
+
+    #[test]
+    fn persist_scan_rejects_unsafe_file_paths() {
+        for (index, unsafe_path) in unsafe_path_values().iter().enumerate() {
+            let fixture = Fixture::new(&format!("reject-scan-file-path-{index}"));
+            let mut store = IndexStore::open(&fixture.path).expect("index should open");
+            let scan = scan_report(vec![scan_file(
+                unsafe_path,
+                Some(1),
+                Some("Rust"),
+                ContentKind::Text,
+            )]);
+
+            let error = store
+                .persist_scan(&scan)
+                .expect_err("unsafe file path should be rejected");
+
+            assert_scan_persist_check_constraint(error);
+        }
+    }
+
+    #[test]
+    fn persist_scan_rejects_unsafe_scan_warning_paths() {
+        for (index, unsafe_path) in unsafe_path_values().iter().enumerate() {
+            let fixture = Fixture::new(&format!("reject-scan-warning-path-{index}"));
+            let mut store = IndexStore::open(&fixture.path).expect("index should open");
+            let mut scan = scan_report(Vec::new());
+            scan.warnings.push(ScanWarning {
+                code: "walk_error",
+                path: Some((*unsafe_path).to_owned()),
+                message: "test warning".to_owned(),
+            });
+
+            let error = store
+                .persist_scan(&scan)
+                .expect_err("unsafe scan warning path should be rejected");
+
+            assert_scan_persist_check_constraint(error);
+        }
+    }
+
+    #[test]
+    fn persist_git_analysis_rejects_unsafe_paths() {
+        for (index, unsafe_path) in unsafe_path_values().iter().enumerate() {
+            let fixture = Fixture::new(&format!("reject-git-analysis-path-{index}"));
+            let mut store = IndexStore::open(&fixture.path).expect("index should open");
+            let co_changes = vec![GitCoChange {
+                left_path: "src/a.rs".to_owned(),
+                right_path: (*unsafe_path).to_owned(),
+                commit_count: 1,
+            }];
+
+            let error = store
+                .persist_git_analysis(
+                    &fixture.path,
+                    "2222222222222222222222222222222222222222",
+                    1_700_086_400,
+                    90,
+                    &[],
+                    &co_changes,
+                )
+                .expect_err("unsafe Git analysis path should be rejected");
+
+            assert_git_persist_check_constraint(error);
+        }
+    }
+
+    #[test]
+    fn schema_rejects_unsafe_dependency_target_paths() {
+        let fixture = Fixture::new("reject-dependency-unsafe-paths");
+        let store = IndexStore::open(&fixture.path).expect("index should open");
+        let connection = Connection::open(store.path()).expect("index should reopen");
+        connection
+            .execute("INSERT INTO repos (root_key) VALUES (?1);", params!["repo"])
+            .expect("repo should insert");
+        connection
+            .execute(
+                "INSERT INTO files (repo_id, path) VALUES (?1, ?2);",
+                params![1, "src/lib.rs"],
+            )
+            .expect("source file should insert");
+
+        for unsafe_path in unsafe_path_values() {
+            let error = connection
+                .execute(
+                    "INSERT INTO dependencies (repo_id, source_file_id, target_path, kind)
+                     VALUES (?1, ?2, ?3, ?4);",
+                    params![1, 1, unsafe_path, "import"],
+                )
+                .expect_err("unsafe dependency target path should be rejected");
+
+            assert_sqlite_check_constraint(error);
+        }
+    }
+
+    #[test]
+    fn schema_rejects_unsafe_git_co_change_paths() {
+        let fixture = Fixture::new("reject-git-co-change-unsafe-paths");
+        let store = IndexStore::open(&fixture.path).expect("index should open");
+        let connection = Connection::open(store.path()).expect("index should reopen");
+        connection
+            .execute("INSERT INTO repos (root_key) VALUES (?1);", params!["repo"])
+            .expect("repo should insert");
+        connection
+            .execute(
+                "INSERT INTO files (repo_id, path) VALUES (?1, ?2);",
+                params![1, "src/left.rs"],
+            )
+            .expect("left file should insert");
+        let left_file_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO files (repo_id, path) VALUES (?1, ?2);",
+                params![1, "src/right.rs"],
+            )
+            .expect("right file should insert");
+        let right_file_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO git_analysis_runs (
+                    repo_id,
+                    analysis_key,
+                    status,
+                    git_head,
+                    head_commit_time,
+                    recent_window_days,
+                    metrics_observed,
+                    co_changes_observed
+                )
+                VALUES (1, 'test', 'completed', 'abc123', 1, 90, 0, 1);",
+                [],
+            )
+            .expect("Git analysis run should insert");
+        let analysis_run_id = connection.last_insert_rowid();
+
+        for unsafe_path in unsafe_path_values() {
+            let error = connection
+                .execute(
+                    "INSERT INTO git_co_changes (
+                        repo_id,
+                        analysis_run_id,
+                        left_file_id,
+                        right_file_id,
+                        left_path,
+                        right_path,
+                        commit_count
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
+                    params![
+                        1,
+                        analysis_run_id,
+                        left_file_id,
+                        right_file_id,
+                        "0.rs",
+                        unsafe_path,
+                        1
+                    ],
+                )
+                .expect_err("unsafe git co-change right path should be rejected");
+
+            assert_sqlite_check_constraint(error);
+        }
+
+        let error = connection
+            .execute(
+                "INSERT INTO git_co_changes (
+                    repo_id,
+                    analysis_run_id,
+                    left_file_id,
+                    right_file_id,
+                    left_path,
+                    right_path,
+                    commit_count
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
+                params![
+                    1,
+                    analysis_run_id,
+                    left_file_id,
+                    right_file_id,
+                    "C:/repo/left.rs",
+                    "zz.rs",
+                    1
+                ],
+            )
+            .expect_err("unsafe git co-change left path should be rejected");
+
+        assert_sqlite_check_constraint(error);
     }
 
     #[test]
@@ -3294,7 +4526,7 @@ mod tests {
             .expect("index directory should be created");
         let connection = Connection::open(&index_path).expect("test database should open");
         connection
-            .execute_batch("PRAGMA user_version = 2;")
+            .execute_batch("PRAGMA user_version = 3;")
             .expect("test schema version should be set");
         drop(connection);
 
@@ -3303,7 +4535,7 @@ mod tests {
         assert!(matches!(
             error,
             IndexError::IncompatibleFutureSchema {
-                found_version: 2,
+                found_version: 3,
                 supported_version: CURRENT_SCHEMA_VERSION,
                 ..
             }
@@ -3426,7 +4658,7 @@ mod tests {
                     value TEXT NOT NULL
                 ) STRICT;
                 INSERT INTO hotpath_metadata (key, value)
-                VALUES ('schema_version', '2'), ('schema_identifier', 'hotpath.index.v1');",
+                VALUES ('schema_version', '3'), ('schema_identifier', 'hotpath.index.v2');",
             )
             .expect("future metadata should be created");
         drop(connection);
@@ -3437,7 +4669,7 @@ mod tests {
         assert!(matches!(
             error,
             IndexError::IncompatibleFutureSchema {
-                found_version: 2,
+                found_version: 3,
                 supported_version: CURRENT_SCHEMA_VERSION,
                 ..
             }
@@ -3535,7 +4767,7 @@ mod tests {
         let connection = Connection::open(&index_path).expect("test database should reopen");
         connection
             .execute(
-                "UPDATE hotpath_metadata SET value = '2' WHERE key = ?1;",
+                "UPDATE hotpath_metadata SET value = '3' WHERE key = ?1;",
                 params![SCHEMA_VERSION_KEY],
             )
             .expect("metadata schema version should be updated");
@@ -3547,14 +4779,14 @@ mod tests {
         assert!(matches!(
             error,
             IndexError::IncompatibleFutureSchema {
-                found_version: 2,
+                found_version: 3,
                 supported_version: CURRENT_SCHEMA_VERSION,
                 ..
             }
         ));
         let message = error.to_string();
         assert!(message.contains(index_path.to_string_lossy().as_ref()));
-        assert!(message.contains("supports up to version 1"));
+        assert!(message.contains("supports up to version 2"));
     }
 
     #[test]
@@ -3572,8 +4804,8 @@ mod tests {
                     extra TEXT
                 ) STRICT;
                 INSERT INTO hotpath_metadata (key, value)
-                VALUES ('schema_version', '1');
-                PRAGMA user_version = 1;",
+                VALUES ('schema_version', '2');
+                PRAGMA user_version = 2;",
             )
             .expect("malformed current metadata should be created");
         drop(connection);

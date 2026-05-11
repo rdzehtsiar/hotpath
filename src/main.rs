@@ -49,7 +49,7 @@ fn main() -> ExitCode {
         Commands::Scan(args) if args.summary => hotpath::scan_summary().map_err(Into::into),
         Commands::Scan(_) => hotpath::scan_summary().map_err(Into::into),
         Commands::ExplainGit(args) => {
-            hotpath::git::explain_file_from_head(&args.path).map_err(Into::into)
+            hotpath::explain_git_and_persist(&args.path).map_err(Into::into)
         }
         Commands::Doctor => hotpath::doctor().map_err(Into::into),
     };

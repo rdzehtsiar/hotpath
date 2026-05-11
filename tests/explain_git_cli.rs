@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use hotpath::storage::index::IndexStore;
+
 mod support;
 
 use support::git::{CommitOptions, GitFixture, GitIdentity};
@@ -84,12 +86,85 @@ fn explain_git_reports_file_metrics_and_ranked_co_changes() {
         stdout.contains("Recent churn uses the 90-day window before the HEAD committer timestamp.")
     );
     assert!(stdout.contains("\nlimitations\n"));
-    assert!(stdout.contains("Results are advisory and are not persisted to the Hotpath index."));
+    assert!(stdout.contains(
+        "Results are advisory and should be treated as local derived cache data when persisted."
+    ));
     assert!(!contains_path(&stdout, fixture.path()));
-    assert!(
-        !fixture.path().join(".hotpath").exists(),
-        "explain-git must not persist to the Hotpath index"
+
+    let persisted = IndexStore::open(fixture.path())
+        .expect("index should open")
+        .latest_git_analysis()
+        .expect("Git analysis should read")
+        .expect("Git analysis should exist");
+    assert_eq!(persisted.run.git_head.len(), 40);
+    assert_eq!(persisted.run.head_commit_time, 1712707200);
+    assert_eq!(persisted.run.recent_window_days, 90);
+    assert_eq!(persisted.run.metrics_observed, 3);
+    assert_eq!(persisted.run.co_changes_observed, 3);
+    assert_eq!(
+        persisted
+            .file_stats
+            .iter()
+            .map(|stats| (stats.path.as_str(), stats.commits_per_file))
+            .collect::<Vec<_>>(),
+        vec![("src/alpha.rs", 2), ("src/beta.rs", 2), ("src/lib.rs", 3)]
     );
+    assert_eq!(
+        persisted
+            .co_changes
+            .iter()
+            .map(|co_change| {
+                (
+                    co_change.left_path.as_str(),
+                    co_change.right_path.as_str(),
+                    co_change.commit_count,
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            ("src/alpha.rs", "src/lib.rs", 2),
+            ("src/beta.rs", "src/lib.rs", 2),
+            ("src/alpha.rs", "src/beta.rs", 1),
+        ]
+    );
+    assert!(!persisted_git_analysis_contains_path(
+        &persisted,
+        fixture.path()
+    ));
+
+    fixture.write("src/lib.rs", "one\nthree\nfour\nfive\nsix\n");
+    let latest_commit = fixture.commit(CommitOptions::new(
+        "Update library alone",
+        GitIdentity::new("Cara Compiler", "cara@example.invalid"),
+        "2024-04-20T00:00:00 +0000",
+    ));
+
+    successful_stdout(&["explain-git", "src/lib.rs"], fixture.path());
+
+    let updated = IndexStore::open(fixture.path())
+        .expect("index should reopen")
+        .latest_git_analysis()
+        .expect("updated Git analysis should read")
+        .expect("updated Git analysis should exist");
+    let lib_stats = updated
+        .file_stats
+        .iter()
+        .find(|stats| stats.path == "src/lib.rs")
+        .expect("library stats should persist");
+
+    assert_eq!(updated.run.git_head, latest_commit);
+    assert_eq!(updated.run.head_commit_time, 1713571200);
+    assert_eq!(updated.run.metrics_observed, 3);
+    assert_eq!(updated.run.co_changes_observed, 3);
+    assert_eq!(lib_stats.commits_per_file, 4);
+    assert_eq!(
+        lib_stats.recent_churn_added + lib_stats.recent_churn_deleted,
+        2
+    );
+    assert!(!persisted_git_analysis_contains_path(
+        &updated,
+        fixture.path()
+    ));
 }
 
 #[test]
@@ -164,4 +239,28 @@ fn contains_path(output: &str, path: &Path) -> bool {
         .iter()
         .filter(|candidate| !candidate.is_empty())
         .any(|candidate| output.contains(candidate))
+}
+
+fn persisted_git_analysis_contains_path(
+    analysis: &hotpath::storage::index::PersistedGitAnalysis,
+    path: &Path,
+) -> bool {
+    let strings =
+        analysis
+            .file_stats
+            .iter()
+            .flat_map(|stats| {
+                [
+                    stats.path.as_str(),
+                    stats.dominant_owner.as_deref().unwrap_or_default(),
+                    stats.first_commit_id.as_deref().unwrap_or_default(),
+                    stats.last_commit_id.as_deref().unwrap_or_default(),
+                ]
+            })
+            .chain(analysis.co_changes.iter().flat_map(|co_change| {
+                [co_change.left_path.as_str(), co_change.right_path.as_str()]
+            }))
+            .collect::<Vec<_>>();
+
+    strings.iter().any(|value| contains_path(value, path))
 }

@@ -84,7 +84,7 @@ fn expected_doctor_stdout() -> &'static str {
     concat!(
         "Hotpath doctor\n",
         "index path: .hotpath/index.db\n",
-        "schema version: 1\n",
+        "schema version: 2\n",
         "readable: yes\n",
         "health: healthy\n",
     )

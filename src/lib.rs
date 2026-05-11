@@ -299,6 +299,47 @@ impl From<serde_json::Error> for ScanError {
     }
 }
 
+#[derive(Debug)]
+pub enum ExplainGitCommandError {
+    CurrentDir(std::io::Error),
+    Git(git::GitExplainError),
+    Index(storage::index::IndexError),
+}
+
+impl fmt::Display for ExplainGitCommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CurrentDir(source) => {
+                write!(f, "failed to determine the current directory: {source}")
+            }
+            Self::Git(source) => write!(f, "{source}"),
+            Self::Index(source) => write!(f, "failed to persist Git analysis: {source}"),
+        }
+    }
+}
+
+impl StdError for ExplainGitCommandError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::CurrentDir(source) => Some(source),
+            Self::Git(source) => Some(source),
+            Self::Index(source) => Some(source),
+        }
+    }
+}
+
+impl From<git::GitExplainError> for ExplainGitCommandError {
+    fn from(source: git::GitExplainError) -> Self {
+        Self::Git(source)
+    }
+}
+
+impl From<storage::index::IndexError> for ExplainGitCommandError {
+    fn from(source: storage::index::IndexError) -> Self {
+        Self::Index(source)
+    }
+}
+
 pub fn scan_current_dir() -> Result<ScanReport, ScanError> {
     let root = env::current_dir().map_err(ScanError::CurrentDir)?;
 
@@ -389,6 +430,26 @@ pub fn doctor() -> Result<String, DoctorError> {
     let root = env::current_dir().map_err(DoctorError::CurrentDir)?;
 
     doctor_repository(root)
+}
+
+pub fn explain_git_and_persist(
+    requested_path: impl AsRef<Path>,
+) -> Result<String, ExplainGitCommandError> {
+    let root = env::current_dir().map_err(ExplainGitCommandError::CurrentDir)?;
+    let analysis = git::analyze_from_head_at(&root).map_err(git::GitExplainError::from)?;
+    let output = git::explain_file_from_analysis_at(&analysis, &root, requested_path)?;
+    let mut index = storage::index::IndexStore::open(&analysis.worktree_root)?;
+
+    index.persist_git_analysis(
+        &analysis.worktree_root,
+        &analysis.head_commit_id,
+        analysis.head_commit_time,
+        analysis.recent_window_days as u64,
+        &analysis.file_metrics,
+        &analysis.co_changes,
+    )?;
+
+    Ok(output)
 }
 
 pub fn doctor_repository(root: impl AsRef<Path>) -> Result<String, DoctorError> {

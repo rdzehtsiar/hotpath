@@ -1,9 +1,9 @@
 # Git Metric Semantics
 
-Hotpath Git analysis is planned but not yet implemented as a stable command or
-report format. This page defines the default semantics the implementation should
-follow so future fixture repositories, indexes, and explain output can be tested
-against a public contract.
+Hotpath Git analysis is early and not yet a stable report format. This page
+defines the default semantics the implementation follows so fixture
+repositories, indexes, and explain output can be tested against a public
+contract.
 
 Git metrics are advisory signals. They can point to files that may be volatile,
 recently active, or ownership-fragmented, but they do not prove that a file is
@@ -217,7 +217,9 @@ skew as a limitation where the age is explained.
 
 These semantics define the target behavior for Git metrics. `hotpath
 explain-git` is an early, non-stable command that computes local `HEAD` Git
-history. Current Hotpath scans do not persist Git metrics to the index yet.
+history and persists the resulting full-repository file metrics and co-change
+pairs to the local Hotpath index as derived cache data after successful
+analysis. Current Hotpath scans do not compute Git metrics.
 
 Future implementation work should add deterministic fixture repositories and
 focused tests that cover commit counting, recent churn windows, exact author
