@@ -186,6 +186,8 @@ impl IndexStore {
             )?;
         }
 
+        delete_stale_files(&transaction, &index_path, repo_id, scan_run_id)?;
+
         transaction
             .commit()
             .map_err(|source| IndexError::PersistScan {
@@ -591,6 +593,43 @@ fn persist_file_warnings(
                 source,
             })?;
     }
+
+    Ok(())
+}
+
+fn delete_stale_files(
+    transaction: &Transaction<'_>,
+    index_path: &Path,
+    repo_id: i64,
+    scan_run_id: i64,
+) -> Result<(), IndexError> {
+    transaction
+        .execute(
+            "DELETE FROM dependencies
+             WHERE repo_id = ?1
+               AND target_file_id IN (
+                SELECT id
+                FROM files
+                WHERE repo_id = ?1
+                  AND (scan_run_id IS NULL OR scan_run_id <> ?2)
+             );",
+            params![repo_id, scan_run_id],
+        )
+        .map_err(|source| IndexError::PersistScan {
+            path: index_path.to_path_buf(),
+            source,
+        })?;
+    transaction
+        .execute(
+            "DELETE FROM files
+             WHERE repo_id = ?1
+               AND (scan_run_id IS NULL OR scan_run_id <> ?2);",
+            params![repo_id, scan_run_id],
+        )
+        .map_err(|source| IndexError::PersistScan {
+            path: index_path.to_path_buf(),
+            source,
+        })?;
 
     Ok(())
 }
@@ -2359,6 +2398,24 @@ mod tests {
             .expect("metadata rows should read")
     }
 
+    fn indexed_file_id(connection: &Connection, path: &str) -> i64 {
+        connection
+            .query_row(
+                "SELECT id FROM files WHERE path = ?1;",
+                params![path],
+                |row| row.get(0),
+            )
+            .expect("indexed file id should read")
+    }
+
+    fn table_count(connection: &Connection, table_name: &str) -> i64 {
+        connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table_name};"), [], |row| {
+                row.get(0)
+            })
+            .expect("table count should read")
+    }
+
     fn scan_report(files: Vec<FileRecord>) -> ScanReport {
         ScanReport {
             status: "ok",
@@ -2649,6 +2706,160 @@ mod tests {
                 .map(|file| file.path.as_str())
                 .collect::<Vec<_>>(),
             vec!["b.rs"]
+        );
+    }
+
+    #[test]
+    fn persist_scan_deletes_stale_files_and_dependent_rows() {
+        let fixture = Fixture::new("persist-stale-files");
+        let mut store = IndexStore::open(&fixture.path).expect("index should open");
+        let mut stale = scan_file("src/stale.rs", Some(8), Some("Rust"), ContentKind::Text);
+        stale.warnings.push(FileWarning {
+            code: "unsupported_encoding",
+            message: "test warning".to_owned(),
+        });
+        let first = scan_report(vec![
+            scan_file("src/keep.rs", Some(3), Some("Rust"), ContentKind::Text),
+            stale,
+        ]);
+
+        store
+            .persist_scan(&first)
+            .expect("first scan should persist");
+
+        let index_path = store.path().to_path_buf();
+        let connection = Connection::open(&index_path).expect("index should reopen");
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .expect("foreign keys should enable");
+        let keep_id = indexed_file_id(&connection, "src/keep.rs");
+        let stale_id = indexed_file_id(&connection, "src/stale.rs");
+        connection
+            .execute(
+                "INSERT INTO symbols (file_id, name, kind, line_start, line_end)
+                 VALUES (?1, 'stale_symbol', 'function', 1, 1);",
+                params![stale_id],
+            )
+            .expect("symbol should insert");
+        connection
+            .execute(
+                "INSERT INTO git_file_stats (file_id, commit_count, churn_added, churn_deleted, author_count)
+                 VALUES (?1, 1, 2, 3, 1);",
+                params![stale_id],
+            )
+            .expect("git stats should insert");
+        connection
+            .execute(
+                "INSERT INTO dependencies (repo_id, source_file_id, target_file_id, target_path, kind)
+                 VALUES (1, ?1, ?2, 'src/stale.rs', 'import');",
+                params![keep_id, stale_id],
+            )
+            .expect("dependency should insert");
+        connection
+            .execute("INSERT INTO repos (root_key) VALUES ('other-repo');", [])
+            .expect("second repo should insert");
+        let other_repo_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO files (repo_id, path) VALUES (?1, 'src/other.rs');",
+                params![other_repo_id],
+            )
+            .expect("second repo file should insert");
+        let other_file_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO dependencies (repo_id, source_file_id, target_file_id, target_path, kind)
+                 VALUES (?1, ?2, ?3, 'src/stale.rs', 'import');",
+                params![other_repo_id, other_file_id, stale_id],
+            )
+            .expect("cross-repo dependency should insert");
+        connection
+            .execute(
+                "INSERT INTO hotspots (file_id, repo_id, scan_run_id, score, rank, formula_version)
+                 VALUES (?1, 1, 1, 1.0, 1, 'test');",
+                params![stale_id],
+            )
+            .expect("hotspot should insert");
+        drop(connection);
+
+        let mut keep = scan_file("src/keep.rs", Some(12), Some("Rust"), ContentKind::Text);
+        keep.line_count = Some(2);
+        let second = scan_report(vec![keep]);
+
+        store
+            .persist_scan(&second)
+            .expect("second scan should persist");
+
+        let latest = store
+            .latest_scan()
+            .expect("latest scan should read")
+            .expect("latest scan should exist");
+        assert_eq!(latest.files.len(), 1);
+        assert_eq!(latest.files[0].path, "src/keep.rs");
+        assert_eq!(latest.files[0].byte_size, Some(12));
+        assert_eq!(latest.files[0].line_count, Some(2));
+
+        let connection = Connection::open(&index_path).expect("index should reopen");
+        let surviving_dependency = connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM dependencies
+                 WHERE repo_id = ?1
+                   AND source_file_id = ?2
+                   AND target_file_id IS NULL
+                   AND target_path = 'src/stale.rs';",
+                params![other_repo_id, other_file_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("surviving dependency should count");
+
+        assert_eq!(table_count(&connection, "files"), 2);
+        assert_eq!(table_count(&connection, "file_warnings"), 0);
+        assert_eq!(table_count(&connection, "symbols"), 0);
+        assert_eq!(table_count(&connection, "git_file_stats"), 0);
+        assert_eq!(table_count(&connection, "dependencies"), 1);
+        assert_eq!(surviving_dependency, 1);
+        assert_eq!(table_count(&connection, "hotspots"), 0);
+    }
+
+    #[test]
+    fn failed_persist_does_not_delete_previous_file_rows() {
+        let fixture = Fixture::new("failed-persist-keeps-files");
+        let mut store = IndexStore::open(&fixture.path).expect("index should open");
+        let first = scan_report(vec![
+            scan_file("src/a.rs", Some(1), Some("Rust"), ContentKind::Text),
+            scan_file("src/b.rs", Some(2), Some("Rust"), ContentKind::Text),
+        ]);
+
+        store
+            .persist_scan(&first)
+            .expect("first scan should persist");
+
+        let invalid_second = scan_report(vec![
+            scan_file("src/a.rs", Some(10), Some("Rust"), ContentKind::Text),
+            scan_file("../invalid.rs", Some(1), Some("Rust"), ContentKind::Text),
+        ]);
+        let error = store
+            .persist_scan(&invalid_second)
+            .expect_err("invalid second scan should fail");
+
+        assert!(matches!(
+            error,
+            IndexError::PersistScan { .. } | IndexError::InvalidScanData { .. }
+        ));
+
+        let latest = store
+            .latest_scan()
+            .expect("latest scan should read")
+            .expect("latest scan should exist");
+        assert_eq!(latest.run.run_key, "scan-0000000000000001");
+        assert_eq!(
+            latest
+                .files
+                .iter()
+                .map(|file| (file.path.as_str(), file.byte_size))
+                .collect::<Vec<_>>(),
+            vec![("src/a.rs", Some(1)), ("src/b.rs", Some(2))]
         );
     }
 

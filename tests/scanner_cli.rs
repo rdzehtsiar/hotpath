@@ -446,6 +446,45 @@ fn scan_json_output_is_stable_across_runs() {
 }
 
 #[test]
+fn scan_json_removes_deleted_files_from_persisted_index() {
+    let fixture = Fixture::new("delete-between-scans");
+    fixture.write("src/keep.rs", "fn keep() {}\n");
+    fixture.write("src/delete.rs", "fn delete() {}\n");
+
+    let (_, first_value) = scan_json(&fixture.path);
+    assert_persisted_files_match_scan_json(&fixture.path, &first_value);
+    fs::remove_file(fixture.path.join("src").join("delete.rs"))
+        .expect("fixture file should be deleted");
+    fixture.write("src/keep.rs", "fn keep() {}\nfn current() {}\n");
+
+    let (_, second_value) = scan_json(&fixture.path);
+    assert_persisted_files_match_scan_json(&fixture.path, &second_value);
+    let paths = second_value["files"]
+        .as_array()
+        .expect("files should be an array")
+        .iter()
+        .map(|file| file["path"].as_str().expect("path should be a string"))
+        .collect::<Vec<_>>();
+    let store = IndexStore::open(&fixture.path).expect("index should open");
+    let persisted = store
+        .latest_scan()
+        .expect("latest scan should read")
+        .expect("latest scan should exist");
+
+    assert_eq!(paths, vec!["src/keep.rs"]);
+    assert_eq!(file_by_path(&second_value, "src/keep.rs")["line_count"], 2);
+    assert!(paths.iter().all(|path| !path.starts_with(".hotpath/")));
+    assert_eq!(
+        persisted
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file.line_count))
+            .collect::<Vec<_>>(),
+        vec![("src/keep.rs", Some(2))]
+    );
+}
+
+#[test]
 fn scan_json_reports_scan_warning_fields_end_to_end() {
     let fixture = Fixture::new("json-scan-warning");
     fixture.write(".gitignore", "{foo\n");
