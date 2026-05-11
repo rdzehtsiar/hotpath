@@ -17,9 +17,9 @@ fn git_fixture_creates_reproducible_commits_with_fixed_identities_and_dates() {
         first.audit_log,
         concat!(
             "Ada Lovelace <ada@example.invalid>|Ada Lovelace <ada@example.invalid>|",
-            "2024-01-01T00:00:00+00:00|2024-01-01T00:00:00+00:00|Add library\n",
+            "1704067200|1704067200|Add library\n",
             "Grace Hopper <grace@example.invalid>|Release Bot <release@example.invalid>|",
-            "2024-01-02T03:04:05+00:00|2024-01-02T04:04:05+00:00|Update library\n",
+            "1704164645|1704168245|Update library\n",
         )
     );
 }
@@ -138,7 +138,7 @@ fn author_history(name: &str) -> AuthorHistory {
         audit_log: fixture.git_stdout([
             "log",
             "--reverse",
-            "--format=%an <%ae>|%cn <%ce>|%aI|%cI|%s",
+            "--format=%an <%ae>|%cn <%ce>|%at|%ct|%s",
         ]),
     }
 }
