@@ -187,6 +187,127 @@ fn hotspots_ranks_current_files_and_persists_scan_and_git_inputs() {
 }
 
 #[test]
+fn hotspots_default_output_remains_top_ten() {
+    let fixture = GitFixture::new("hotspots-default-top-ten");
+    let author = GitIdentity::new("Default Author", "default@example.invalid");
+
+    for index in 0..12 {
+        fixture.write(
+            format!("src/file{index:02}.rs"),
+            &numbered_lines(&format!("file{index:02}"), 1),
+        );
+    }
+    fixture.commit(CommitOptions::new(
+        "Add twelve files",
+        author,
+        "2024-01-01T00:00:00 +0000",
+    ));
+
+    let stdout = successful_stdout(&["hotspots"], fixture.path());
+
+    assert!(stdout.contains("files ranked: 12 (showing 10)"));
+    assert_eq!(ranked_paths(&stdout).len(), 10);
+    assert!(!stdout.contains("output filters:"));
+    assert!(!contains_path(&stdout, fixture.path()));
+
+    assert_eq!(hotspot_row_count(fixture.path()), 12);
+}
+
+#[test]
+fn hotspots_limit_truncates_displayed_rows_only() {
+    let fixture = GitFixture::new("hotspots-limit");
+    let author = GitIdentity::new("Limit Author", "limit@example.invalid");
+
+    for index in 0..12 {
+        fixture.write(
+            format!("src/file{index:02}.rs"),
+            &numbered_lines(&format!("file{index:02}"), 1),
+        );
+    }
+    fixture.commit(CommitOptions::new(
+        "Add twelve files",
+        author,
+        "2024-01-01T00:00:00 +0000",
+    ));
+
+    let stdout = successful_stdout(&["hotspots", "--limit", "3"], fixture.path());
+
+    assert!(stdout.contains("files ranked: 12 (showing 3)"));
+    assert!(stdout.contains("output filters: limit 3"));
+    assert_eq!(ranked_paths(&stdout).len(), 3);
+    assert!(!contains_path(&stdout, fixture.path()));
+
+    assert_eq!(hotspot_row_count(fixture.path()), 12);
+}
+
+#[test]
+fn hotspots_excludes_generated_and_vendor_from_output_only() {
+    let fixture = GitFixture::new("hotspots-exclude-generated-vendor");
+    let author = GitIdentity::new("Filter Author", "filter@example.invalid");
+
+    fixture.write("dist/generated.rs", &numbered_lines("generated", 1000));
+    fixture.write("vendor/pkg.rs", &numbered_lines("vendor", 800));
+    fixture.write("src/app.rs", "pub fn app() {}\n");
+    fixture.commit(CommitOptions::new(
+        "Add generated vendor and app files",
+        author,
+        "2024-01-01T00:00:00 +0000",
+    ));
+
+    let stdout = successful_stdout(
+        &["hotspots", "--exclude-generated", "--exclude-vendor"],
+        fixture.path(),
+    );
+    let rows = ranked_rows(&stdout);
+
+    assert!(stdout.contains("files ranked: 3 (showing 1)"));
+    assert!(stdout.contains("output filters: exclude generated files, exclude vendor files"));
+    assert!(stdout.contains("Output filters affect displayed rows only"));
+    assert!(!stdout.contains("dist/generated.rs"));
+    assert!(!stdout.contains("vendor/pkg.rs"));
+    assert_eq!(rows, vec![(3, "src/app.rs")]);
+    assert!(!contains_path(&stdout, fixture.path()));
+
+    let persisted_hotspots = IndexStore::open(fixture.path())
+        .expect("index should reopen for hotspots")
+        .latest_hotspots()
+        .expect("hotspots should read");
+    assert_eq!(
+        persisted_hotspots
+            .iter()
+            .map(|hotspot| (hotspot.rank, hotspot.path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, "dist/generated.rs"),
+            (2, "vendor/pkg.rs"),
+            (3, "src/app.rs"),
+        ]
+    );
+}
+
+#[test]
+fn hotspots_rejects_zero_limit_before_analysis_or_persistence() {
+    let fixture = GitFixture::new("hotspots-zero-limit");
+    fixture.write("src/lib.rs", "pub fn lib() {}\n");
+
+    let stderr = failed_stderr(&["hotspots", "--limit", "0"], fixture.path());
+
+    assert!(stderr.contains("--limit"));
+    assert!(stderr.contains("limit must be greater than 0"));
+    assert!(!stderr.contains("Hotpath hotspots"));
+    assert!(!contains_path(&stderr, fixture.path()));
+    assert!(!fixture.path().join(".hotpath").exists());
+
+    let negative_stderr = failed_stderr(&["hotspots", "--limit", "-1"], fixture.path());
+
+    assert!(negative_stderr.contains("--limit"));
+    assert!(negative_stderr.contains("limit must be greater than 0"));
+    assert!(!negative_stderr.contains("Hotpath hotspots"));
+    assert!(!contains_path(&negative_stderr, fixture.path()));
+    assert!(!fixture.path().join(".hotpath").exists());
+}
+
+#[test]
 fn hotspots_uses_repository_root_from_subdirectories_without_path_leaks() {
     let fixture = GitFixture::new("hotspots-subdir");
     let author = GitIdentity::new("Path Author", "path@example.invalid");
@@ -424,6 +545,13 @@ fn numbered_lines(prefix: &str, count: usize) -> String {
 }
 
 fn ranked_paths(stdout: &str) -> Vec<&str> {
+    ranked_rows(stdout)
+        .into_iter()
+        .map(|(_rank, path)| path)
+        .collect()
+}
+
+fn ranked_rows(stdout: &str) -> Vec<(u64, &str)> {
     stdout
         .lines()
         .filter_map(|line| {
@@ -433,7 +561,10 @@ fn ranked_paths(stdout: &str) -> Vec<&str> {
                 && parts[0].parse::<u64>().is_ok()
                 && parts[1].parse::<f64>().is_ok()
             {
-                Some(parts[2])
+                Some((
+                    parts[0].parse::<u64>().expect("rank should parse"),
+                    parts[2],
+                ))
             } else {
                 None
             }

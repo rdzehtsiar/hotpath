@@ -19,8 +19,25 @@ pub mod storage;
 const BINARY_SAMPLE_BYTES: usize = 8 * 1024;
 const MAX_TEXT_READ_BYTES: u64 = 8 * 1024 * 1024;
 pub const SCAN_SCHEMA_VERSION: &str = "hotpath.scan.v1";
+pub const DEFAULT_HOTSPOTS_LIMIT: usize = 10;
 const SUMMARY_LABEL_WIDTH: usize = 12;
-const HOTSPOTS_REPORT_LIMIT: usize = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HotspotsOptions {
+    pub limit: usize,
+    pub exclude_generated: bool,
+    pub exclude_vendor: bool,
+}
+
+impl Default for HotspotsOptions {
+    fn default() -> Self {
+        Self {
+            limit: DEFAULT_HOTSPOTS_LIMIT,
+            exclude_generated: false,
+            exclude_vendor: false,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NormalizedPath {
@@ -590,7 +607,7 @@ pub fn scan_json() -> Result<String, ScanError> {
     render_json(&scan_current_dir_and_persist()?)
 }
 
-pub fn hotspots() -> Result<String, HotspotsCommandError> {
+pub fn hotspots(options: HotspotsOptions) -> Result<String, HotspotsCommandError> {
     let root = env::current_dir().map_err(HotspotsCommandError::CurrentDir)?;
     let analysis = git::analyze_from_head_at(&root)?;
     let scan = scan_repository(&analysis.worktree_root)?;
@@ -620,7 +637,14 @@ pub fn hotspots() -> Result<String, HotspotsCommandError> {
         .persist_hotspots(scan_run.id, &ranked)
         .map_err(HotspotsCommandError::PersistHotspots)?;
 
-    Ok(render_hotspots(&ranked, analysis.recent_window_days))
+    let displayed = select_hotspots_for_output(&ranked, &scan.files, options);
+
+    Ok(render_hotspots(
+        &ranked,
+        &displayed,
+        options,
+        analysis.recent_window_days,
+    ))
 }
 
 pub fn explain(requested_path: impl AsRef<Path>) -> Result<String, ExplainCommandError> {
@@ -738,6 +762,52 @@ fn ranked_hotspot_scores_from_scan_and_git(
     scoring::rank_hotspot_scores(&scores)
 }
 
+fn select_hotspots_for_output<'a>(
+    ranked_scores: &'a [scoring::RankedHotspotScore],
+    files: &[FileRecord],
+    options: HotspotsOptions,
+) -> Vec<&'a scoring::RankedHotspotScore> {
+    let file_flags = files
+        .iter()
+        .map(|file| (file.path.as_str(), (file.is_generated, file.is_vendor)))
+        .collect::<BTreeMap<_, _>>();
+
+    ranked_scores
+        .iter()
+        .filter(|ranked_score| {
+            let (is_generated, is_vendor) = file_flags
+                .get(ranked_score.score.path.as_str())
+                .copied()
+                .unwrap_or((false, false));
+
+            (!options.exclude_generated || !is_generated) && (!options.exclude_vendor || !is_vendor)
+        })
+        .take(options.limit)
+        .collect()
+}
+
+fn has_active_hotspot_output_filter(options: HotspotsOptions) -> bool {
+    options.limit != DEFAULT_HOTSPOTS_LIMIT || options.exclude_generated || options.exclude_vendor
+}
+
+fn render_hotspot_output_filters(options: HotspotsOptions) -> String {
+    let mut filters = Vec::new();
+
+    if options.limit != DEFAULT_HOTSPOTS_LIMIT {
+        filters.push(format!("limit {}", options.limit));
+    }
+
+    if options.exclude_generated {
+        filters.push("exclude generated files".to_owned());
+    }
+
+    if options.exclude_vendor {
+        filters.push("exclude vendor files".to_owned());
+    }
+
+    filters.join(", ")
+}
+
 fn render_json(scan: &ScanReport) -> Result<String, ScanError> {
     Ok(serde_json::to_string_pretty(&ScanJsonReport {
         schema_version: SCAN_SCHEMA_VERSION,
@@ -749,21 +819,31 @@ fn render_json(scan: &ScanReport) -> Result<String, ScanError> {
 
 fn render_hotspots(
     ranked_scores: &[scoring::RankedHotspotScore],
+    displayed_scores: &[&scoring::RankedHotspotScore],
+    options: HotspotsOptions,
     recent_window_days: i64,
 ) -> String {
-    let shown = ranked_scores.len().min(HOTSPOTS_REPORT_LIMIT);
     let mut output = format!(
-        "Hotpath hotspots\nscope: current scanned files plus local Git history reachable from HEAD\nformula: {}\nfiles ranked: {} (showing {})\n\nrank  score  path",
+        "Hotpath hotspots\nscope: current scanned files plus local Git history reachable from HEAD\nformula: {}\nfiles ranked: {} (showing {})",
         scoring::CURRENT_SCORE_FORMULA_ID,
         ranked_scores.len(),
-        shown
+        displayed_scores.len()
     );
 
-    if shown == 0 {
+    if has_active_hotspot_output_filter(options) {
+        output.push_str(&format!(
+            "\noutput filters: {}",
+            render_hotspot_output_filters(options)
+        ));
+    }
+
+    output.push_str("\n\nrank  score  path");
+
+    if displayed_scores.is_empty() {
         output.push_str("\n  none");
     }
 
-    for ranked_score in ranked_scores.iter().take(shown) {
+    for ranked_score in displayed_scores {
         let score = &ranked_score.score;
 
         output.push_str(&format!(
@@ -787,6 +867,11 @@ fn render_hotspots(
     output.push_str(&format!(
         "\n\ncalculation notes\n  - Scores are advisory signals for investigation, not proof that a file is defective.\n  - Inputs come from scanner facts and local Git history reachable from HEAD only.\n  - Recent churn uses the {recent_window_days}-day window before the HEAD committer timestamp.\n  - Missing normalized inputs contribute 0.0; formula weights are not redistributed."
     ));
+    if has_active_hotspot_output_filter(options) {
+        output.push_str(
+            "\n  - Output filters affect displayed rows only; persisted hotspot scores keep the full ranked set and original ranks.",
+        );
+    }
 
     output
 }

@@ -24,7 +24,7 @@ enum Commands {
     ExplainGit(ExplainGitArgs),
 
     /// Rank current files by advisory hotspot risk.
-    Hotspots,
+    Hotspots(HotspotsArgs),
 
     /// Check the local Hotpath index health.
     Doctor,
@@ -40,6 +40,21 @@ struct ExplainGitArgs {
 struct ExplainArgs {
     /// Repository-relative or worktree-relative file path to explain.
     path: std::path::PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct HotspotsArgs {
+    /// Maximum number of ranked rows to display.
+    #[arg(long, default_value_t = hotpath::DEFAULT_HOTSPOTS_LIMIT, value_parser = parse_positive_limit, allow_hyphen_values = true)]
+    limit: usize,
+
+    /// Hide generated files from the displayed rows.
+    #[arg(long)]
+    exclude_generated: bool,
+
+    /// Hide vendor files from the displayed rows.
+    #[arg(long)]
+    exclude_vendor: bool,
 }
 
 #[derive(Debug, Args)]
@@ -64,7 +79,12 @@ fn main() -> ExitCode {
         Commands::ExplainGit(args) => {
             hotpath::explain_git_and_persist(&args.path).map_err(Into::into)
         }
-        Commands::Hotspots => hotpath::hotspots().map_err(Into::into),
+        Commands::Hotspots(args) => hotpath::hotspots(hotpath::HotspotsOptions {
+            limit: args.limit,
+            exclude_generated: args.exclude_generated,
+            exclude_vendor: args.exclude_vendor,
+        })
+        .map_err(Into::into),
         Commands::Doctor => hotpath::doctor().map_err(Into::into),
     };
 
@@ -77,5 +97,17 @@ fn main() -> ExitCode {
             eprintln!("hotpath: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn parse_positive_limit(value: &str) -> Result<usize, String> {
+    let limit = value
+        .parse::<i128>()
+        .map_err(|_| "limit must be a positive integer".to_owned())?;
+
+    if limit <= 0 {
+        Err("limit must be greater than 0".to_owned())
+    } else {
+        usize::try_from(limit).map_err(|_| "limit is too large".to_owned())
     }
 }
