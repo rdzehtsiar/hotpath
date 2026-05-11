@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use hotpath::storage::index::IndexStore;
+use hotpath::ContentKind;
 use serde_json::Value;
 
 static NEXT_FIXTURE_ID: AtomicUsize = AtomicUsize::new(0);
@@ -85,6 +87,154 @@ fn file_by_path<'a>(value: &'a Value, path: &str) -> &'a Value {
         .iter()
         .find(|file| file["path"] == path)
         .unwrap_or_else(|| panic!("expected scan record for {path}"))
+}
+
+fn assert_persisted_files_match_scan_json(current_dir: &Path, value: &Value) {
+    let store = IndexStore::open(current_dir).expect("index should open");
+    let persisted = store
+        .latest_scan()
+        .expect("latest scan should read")
+        .expect("latest scan should exist");
+    let json_files = value["files"].as_array().expect("files should be an array");
+
+    assert_eq!(persisted.run.files_observed, Some(json_files.len() as u64));
+    assert_eq!(
+        persisted.run.warnings_observed,
+        value["summary"]["warnings"]["total_warnings"].as_u64()
+    );
+    assert_eq!(
+        persisted
+            .warnings
+            .iter()
+            .map(|warning| (
+                warning.code.as_str(),
+                warning.path.as_deref(),
+                warning.message.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        value["warnings"]
+            .as_array()
+            .expect("warnings should be an array")
+            .iter()
+            .map(|warning| (
+                warning["code"]
+                    .as_str()
+                    .expect("warning code should be a string"),
+                warning["path"].as_str(),
+                warning["message"]
+                    .as_str()
+                    .expect("warning message should be a string")
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        persisted
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        json_files
+            .iter()
+            .map(|file| file["path"].as_str().expect("path should be a string"))
+            .collect::<Vec<_>>()
+    );
+
+    for persisted_file in persisted.files {
+        let json_file = file_by_path(value, &persisted_file.path);
+
+        assert_eq!(
+            persisted_file.byte_size,
+            json_file["byte_size"].as_u64(),
+            "byte_size mismatch for {}",
+            persisted_file.path
+        );
+        assert_eq!(
+            persisted_file.extension.as_deref(),
+            json_file["extension"].as_str(),
+            "extension mismatch for {}",
+            persisted_file.path
+        );
+        assert_eq!(
+            persisted_file.language.as_deref(),
+            json_file["language"].as_str(),
+            "language mismatch for {}",
+            persisted_file.path
+        );
+        assert_eq!(
+            persisted_file.line_count,
+            json_file["line_count"].as_u64(),
+            "line_count mismatch for {}",
+            persisted_file.path
+        );
+        assert_eq!(
+            persisted_file.is_vendor,
+            json_file["is_vendor"]
+                .as_bool()
+                .expect("is_vendor should be bool"),
+            "is_vendor mismatch for {}",
+            persisted_file.path
+        );
+        assert_eq!(
+            persisted_file.is_generated,
+            json_file["is_generated"]
+                .as_bool()
+                .expect("is_generated should be bool"),
+            "is_generated mismatch for {}",
+            persisted_file.path
+        );
+        assert_eq!(
+            content_kind_name(persisted_file.content),
+            json_file["content"]
+                .as_str()
+                .expect("content should be a string"),
+            "content mismatch for {}",
+            persisted_file.path
+        );
+        assert_eq!(
+            persisted_file.is_symlink,
+            json_file["is_symlink"]
+                .as_bool()
+                .expect("is_symlink should be bool"),
+            "is_symlink mismatch for {}",
+            persisted_file.path
+        );
+        assert_eq!(
+            persisted_file.classification.as_deref(),
+            json_file["classification"].as_str(),
+            "classification mismatch for {}",
+            persisted_file.path
+        );
+        assert_eq!(
+            persisted_file
+                .warnings
+                .iter()
+                .map(|warning| (warning.code.as_str(), warning.message.as_str()))
+                .collect::<Vec<_>>(),
+            json_file["warnings"]
+                .as_array()
+                .expect("file warnings should be an array")
+                .iter()
+                .map(|warning| (
+                    warning["code"]
+                        .as_str()
+                        .expect("file warning code should be a string"),
+                    warning["message"]
+                        .as_str()
+                        .expect("file warning message should be a string")
+                ))
+                .collect::<Vec<_>>(),
+            "warnings mismatch for {}",
+            persisted_file.path
+        );
+    }
+}
+
+fn content_kind_name(content: ContentKind) -> &'static str {
+    match content {
+        ContentKind::Text => "text",
+        ContentKind::Binary => "binary",
+        ContentKind::Unknown => "unknown",
+    }
 }
 
 fn assert_json_strings_do_not_contain_path(value: &Value, path: &Path) {
@@ -207,6 +357,7 @@ fn scan_json_classifies_generated_fixture_end_to_end() {
     fixture.write_bytes("assets/logo.bin", &[0x89, b'P', b'N', b'G', 0, 1, 2, 3]);
 
     let (_, value) = scan_json(&fixture.path);
+    assert_persisted_files_match_scan_json(&fixture.path, &value);
     let paths = value["files"]
         .as_array()
         .expect("files should be an array")
@@ -271,10 +422,13 @@ fn scan_json_output_is_stable_across_runs() {
     let fixture = Fixture::new("deterministic-json");
     fixture.write("z.rs", "");
     fixture.write(Path::new("nested").join("m.rs"), "");
+    fixture.write("docs/.hotpath/config.md", "# Nested config\n");
     fixture.write("a.rs", "");
 
     let (first_stdout, first_value) = scan_json(&fixture.path);
+    assert!(fixture.path.join(".hotpath").join("index.db").is_file());
     let (second_stdout, second_value) = scan_json(&fixture.path);
+    assert_persisted_files_match_scan_json(&fixture.path, &second_value);
     let paths = first_value["files"]
         .as_array()
         .expect("files should be an array")
@@ -284,7 +438,11 @@ fn scan_json_output_is_stable_across_runs() {
 
     assert_eq!(first_stdout, second_stdout);
     assert_eq!(first_value, second_value);
-    assert_eq!(paths, vec!["a.rs", "nested/m.rs", "z.rs"]);
+    assert_eq!(
+        paths,
+        vec!["a.rs", "docs/.hotpath/config.md", "nested/m.rs", "z.rs"]
+    );
+    assert!(paths.iter().all(|path| !path.starts_with(".hotpath/")));
 }
 
 #[test]
@@ -294,6 +452,7 @@ fn scan_json_reports_scan_warning_fields_end_to_end() {
     fixture.write("keep.rs", "");
 
     let (_, value) = scan_json(&fixture.path);
+    assert_persisted_files_match_scan_json(&fixture.path, &value);
     let warnings = value["warnings"]
         .as_array()
         .expect("top-level warnings should be an array");
@@ -312,6 +471,23 @@ fn scan_json_reports_scan_warning_fields_end_to_end() {
     assert_eq!(value["summary"]["warnings"]["scan_warnings"], 1);
     assert_eq!(value["summary"]["warnings"]["unreadable_warnings"], 0);
     assert_eq!(value["summary"]["warnings"]["skipped_warnings"], 0);
+}
+
+#[test]
+fn scan_json_persists_file_warning_payloads_end_to_end() {
+    let fixture = Fixture::new("json-file-warning");
+    fixture.write_bytes("bad.txt", &[b'a', 0xff, b'\n']);
+
+    let (_, value) = scan_json(&fixture.path);
+    assert_persisted_files_match_scan_json(&fixture.path, &value);
+    let bad = file_by_path(&value, "bad.txt");
+
+    assert_eq!(bad["warnings"][0]["code"], "unsupported_encoding");
+    assert_eq!(
+        bad["warnings"][0]["message"],
+        "file contents are not valid UTF-8"
+    );
+    assert_eq!(value["summary"]["warnings"]["total_warnings"], 1);
 }
 
 #[test]

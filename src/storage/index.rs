@@ -6,7 +6,9 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, types::Type, Connection, OptionalExtension, Row, Transaction};
+
+use crate::{ContentKind, FileRecord, FileWarning, ScanReport, ScanWarning, SCAN_SCHEMA_VERSION};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
@@ -19,7 +21,9 @@ const REQUIRED_SCHEMA_TABLES: &[&str] = &[
     "hotpath_metadata",
     "repos",
     "scan_runs",
+    "scan_warnings",
     "files",
+    "file_warnings",
     "symbols",
     "git_file_stats",
     "dependencies",
@@ -28,9 +32,55 @@ const REQUIRED_SCHEMA_TABLES: &[&str] = &[
 
 #[derive(Debug)]
 pub struct IndexStore {
-    _connection: Connection,
+    connection: Connection,
     path: PathBuf,
     schema_version: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedScan {
+    pub run: PersistedScanRun,
+    pub warnings: Vec<PersistedScanWarning>,
+    pub files: Vec<PersistedFileRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedScanRun {
+    pub id: i64,
+    pub run_key: String,
+    pub status: String,
+    pub scanner_version: Option<String>,
+    pub scan_schema_identifier: Option<String>,
+    pub files_observed: Option<u64>,
+    pub warnings_observed: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedFileRecord {
+    pub path: String,
+    pub byte_size: Option<u64>,
+    pub extension: Option<String>,
+    pub language: Option<String>,
+    pub line_count: Option<u64>,
+    pub is_vendor: bool,
+    pub is_generated: bool,
+    pub content: ContentKind,
+    pub is_symlink: bool,
+    pub classification: Option<String>,
+    pub warnings: Vec<PersistedFileWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedScanWarning {
+    pub code: String,
+    pub path: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedFileWarning {
+    pub code: String,
+    pub message: String,
 }
 
 impl IndexStore {
@@ -63,7 +113,7 @@ impl IndexStore {
         verify_metadata(&connection, &path)?;
 
         Ok(Self {
-            _connection: connection,
+            connection,
             path,
             schema_version: CURRENT_SCHEMA_VERSION,
         })
@@ -75,6 +125,159 @@ impl IndexStore {
 
     pub fn schema_version(&self) -> u32 {
         self.schema_version
+    }
+
+    pub fn persist_scan(&mut self, scan: &ScanReport) -> Result<PersistedScanRun, IndexError> {
+        let index_path = self.path.clone();
+        let transaction =
+            self.connection
+                .transaction()
+                .map_err(|source| IndexError::PersistScan {
+                    path: index_path.clone(),
+                    source,
+                })?;
+        let repo_id = ensure_repo(&transaction, &index_path)?;
+        let run_key = next_run_key(&transaction, &index_path, repo_id)?;
+        let summary = scan.summary();
+        let files_observed = u64_to_i64(summary.total_files, &index_path, "files_observed")?;
+        let warnings_observed = u64_to_i64(
+            summary.warnings.total_warnings,
+            &index_path,
+            "warnings_observed",
+        )?;
+
+        transaction
+            .execute(
+                "INSERT INTO scan_runs (
+                    repo_id,
+                    run_key,
+                    status,
+                    scanner_version,
+                    scan_schema_identifier,
+                    files_observed,
+                    warnings_observed
+                )
+                VALUES (?1, ?2, 'completed', ?3, ?4, ?5, ?6);",
+                params![
+                    repo_id,
+                    run_key,
+                    env!("CARGO_PKG_VERSION"),
+                    SCAN_SCHEMA_VERSION,
+                    files_observed,
+                    warnings_observed,
+                ],
+            )
+            .map_err(|source| IndexError::PersistScan {
+                path: index_path.clone(),
+                source,
+            })?;
+        let scan_run_id = transaction.last_insert_rowid();
+
+        persist_scan_warnings(&transaction, &index_path, scan_run_id, &scan.warnings)?;
+
+        for file in &scan.files {
+            let file_id = persist_file(&transaction, &index_path, repo_id, scan_run_id, file)?;
+            persist_file_warnings(
+                &transaction,
+                &index_path,
+                file_id,
+                scan_run_id,
+                &file.warnings,
+            )?;
+        }
+
+        transaction
+            .commit()
+            .map_err(|source| IndexError::PersistScan {
+                path: index_path,
+                source,
+            })?;
+
+        Ok(PersistedScanRun {
+            id: scan_run_id,
+            run_key,
+            status: "completed".to_owned(),
+            scanner_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            scan_schema_identifier: Some(SCAN_SCHEMA_VERSION.to_owned()),
+            files_observed: Some(summary.total_files),
+            warnings_observed: Some(summary.warnings.total_warnings),
+        })
+    }
+
+    pub fn latest_scan(&self) -> Result<Option<PersistedScan>, IndexError> {
+        let Some(run) = self
+            .connection
+            .query_row(
+                "SELECT
+                    id,
+                    run_key,
+                    status,
+                    scanner_version,
+                    scan_schema_identifier,
+                    files_observed,
+                    warnings_observed
+                 FROM scan_runs
+                 ORDER BY id DESC
+                 LIMIT 1;",
+                [],
+                read_persisted_scan_run,
+            )
+            .optional()
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })?
+        else {
+            return Ok(None);
+        };
+
+        let warnings = read_scan_warnings(&self.connection, &self.path, run.id)?;
+
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT
+                    id,
+                    path,
+                    byte_size,
+                    extension,
+                    language,
+                    line_count,
+                    is_vendor,
+                    is_generated,
+                    content_kind,
+                    is_symlink,
+                    classification
+                 FROM files
+                 WHERE scan_run_id = ?1
+                 ORDER BY path;",
+            )
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })?;
+        let rows = statement
+            .query_map(params![run.id], read_persisted_file_record)
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut files = Vec::new();
+
+        for row in rows {
+            let (file_id, mut file) = row.map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })?;
+            file.warnings = read_file_warnings(&self.connection, &self.path, run.id, file_id)?;
+            files.push(file);
+        }
+
+        Ok(Some(PersistedScan {
+            run,
+            warnings,
+            files,
+        }))
     }
 }
 
@@ -110,6 +313,18 @@ pub enum IndexError {
         from_version: u32,
         to_version: u32,
         source: rusqlite::Error,
+    },
+    PersistScan {
+        path: PathBuf,
+        source: rusqlite::Error,
+    },
+    ReadIndex {
+        path: PathBuf,
+        source: rusqlite::Error,
+    },
+    InvalidScanData {
+        path: PathBuf,
+        message: String,
     },
 }
 
@@ -158,6 +373,21 @@ impl fmt::Display for IndexError {
                 "failed to migrate Hotpath index '{}' from schema version {from_version} to {to_version}: {source}",
                 path.display()
             ),
+            Self::PersistScan { path, source } => write!(
+                f,
+                "failed to persist scan results to Hotpath index '{}': {source}",
+                path.display()
+            ),
+            Self::ReadIndex { path, source } => write!(
+                f,
+                "failed to read Hotpath index '{}': {source}",
+                path.display()
+            ),
+            Self::InvalidScanData { path, message } => write!(
+                f,
+                "scan results cannot be persisted to Hotpath index '{}': {message}",
+                path.display()
+            ),
         }
     }
 }
@@ -168,10 +398,13 @@ impl StdError for IndexError {
             Self::CreateIndexDir { source, .. } => Some(source),
             Self::OpenDatabase { source, .. }
             | Self::CorruptDatabase { source, .. }
-            | Self::Migration { source, .. } => Some(source),
+            | Self::Migration { source, .. }
+            | Self::PersistScan { source, .. }
+            | Self::ReadIndex { source, .. } => Some(source),
             Self::CorruptMetadata { .. }
             | Self::UnsafeIndexDir { .. }
-            | Self::IncompatibleFutureSchema { .. } => None,
+            | Self::IncompatibleFutureSchema { .. }
+            | Self::InvalidScanData { .. } => None,
         }
     }
 }
@@ -179,6 +412,373 @@ impl StdError for IndexError {
 pub fn default_index_path(repo_root: impl AsRef<Path>) -> PathBuf {
     repo_root.as_ref().join(HOTPATH_DIR).join(INDEX_FILE)
 }
+
+fn ensure_repo(transaction: &Transaction<'_>, path: &Path) -> Result<i64, IndexError> {
+    transaction
+        .execute(
+            "INSERT INTO repos (root_key)
+             VALUES ('.')
+             ON CONFLICT(root_key) DO NOTHING;",
+            [],
+        )
+        .map_err(|source| IndexError::PersistScan {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    transaction
+        .query_row("SELECT id FROM repos WHERE root_key = '.';", [], |row| {
+            row.get(0)
+        })
+        .map_err(|source| IndexError::PersistScan {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+fn next_run_key(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    repo_id: i64,
+) -> Result<String, IndexError> {
+    let next_run_number = transaction
+        .query_row(
+            "SELECT COUNT(*) + 1 FROM scan_runs WHERE repo_id = ?1;",
+            params![repo_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|source| IndexError::PersistScan {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+    Ok(format!("scan-{next_run_number:016}"))
+}
+
+fn persist_file(
+    transaction: &Transaction<'_>,
+    index_path: &Path,
+    repo_id: i64,
+    scan_run_id: i64,
+    file: &FileRecord,
+) -> Result<i64, IndexError> {
+    let byte_size = optional_u64_to_i64(file.byte_size, index_path, "byte_size")?;
+    let line_count = optional_u64_to_i64(file.line_count, index_path, "line_count")?;
+
+    transaction
+        .execute(
+            "INSERT INTO files (
+                repo_id,
+                path,
+                byte_size,
+                extension,
+                language,
+                line_count,
+                content_kind,
+                is_vendor,
+                is_generated,
+                is_symlink,
+                classification,
+                scan_run_id
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ON CONFLICT(repo_id, path) DO UPDATE SET
+                byte_size = excluded.byte_size,
+                extension = excluded.extension,
+                language = excluded.language,
+                line_count = excluded.line_count,
+                content_kind = excluded.content_kind,
+                is_vendor = excluded.is_vendor,
+                is_generated = excluded.is_generated,
+                is_symlink = excluded.is_symlink,
+                classification = excluded.classification,
+                scan_run_id = excluded.scan_run_id;",
+            params![
+                repo_id,
+                &file.path,
+                byte_size,
+                file.extension.as_deref(),
+                file.language,
+                line_count,
+                content_kind_to_index(file.content),
+                file.is_vendor,
+                file.is_generated,
+                file.is_symlink,
+                file.classification,
+                scan_run_id,
+            ],
+        )
+        .map_err(|source| IndexError::PersistScan {
+            path: index_path.to_path_buf(),
+            source,
+        })?;
+
+    transaction
+        .query_row(
+            "SELECT id FROM files WHERE repo_id = ?1 AND path = ?2;",
+            params![repo_id, &file.path],
+            |row| row.get(0),
+        )
+        .map_err(|source| IndexError::PersistScan {
+            path: index_path.to_path_buf(),
+            source,
+        })
+}
+
+fn persist_scan_warnings(
+    transaction: &Transaction<'_>,
+    index_path: &Path,
+    scan_run_id: i64,
+    warnings: &[ScanWarning],
+) -> Result<(), IndexError> {
+    for (index, warning) in warnings.iter().enumerate() {
+        let warning_order = warning_order_to_i64(index, index_path)?;
+        transaction
+            .execute(
+                "INSERT INTO scan_warnings (
+                    scan_run_id,
+                    warning_order,
+                    code,
+                    path,
+                    message
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5);",
+                params![
+                    scan_run_id,
+                    warning_order,
+                    warning.code,
+                    warning.path.as_deref(),
+                    &warning.message,
+                ],
+            )
+            .map_err(|source| IndexError::PersistScan {
+                path: index_path.to_path_buf(),
+                source,
+            })?;
+    }
+
+    Ok(())
+}
+
+fn persist_file_warnings(
+    transaction: &Transaction<'_>,
+    index_path: &Path,
+    file_id: i64,
+    scan_run_id: i64,
+    warnings: &[FileWarning],
+) -> Result<(), IndexError> {
+    for (index, warning) in warnings.iter().enumerate() {
+        let warning_order = warning_order_to_i64(index, index_path)?;
+        transaction
+            .execute(
+                "INSERT INTO file_warnings (
+                    file_id,
+                    scan_run_id,
+                    warning_order,
+                    code,
+                    message
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5);",
+                params![
+                    file_id,
+                    scan_run_id,
+                    warning_order,
+                    warning.code,
+                    &warning.message,
+                ],
+            )
+            .map_err(|source| IndexError::PersistScan {
+                path: index_path.to_path_buf(),
+                source,
+            })?;
+    }
+
+    Ok(())
+}
+
+fn read_persisted_scan_run(row: &Row<'_>) -> rusqlite::Result<PersistedScanRun> {
+    Ok(PersistedScanRun {
+        id: row.get(0)?,
+        run_key: row.get(1)?,
+        status: row.get(2)?,
+        scanner_version: row.get(3)?,
+        scan_schema_identifier: row.get(4)?,
+        files_observed: optional_i64_to_u64(row.get(5)?, 5)?,
+        warnings_observed: optional_i64_to_u64(row.get(6)?, 6)?,
+    })
+}
+
+fn read_persisted_file_record(row: &Row<'_>) -> rusqlite::Result<(i64, PersistedFileRecord)> {
+    let content_kind: String = row.get(8)?;
+
+    Ok((
+        row.get(0)?,
+        PersistedFileRecord {
+            path: row.get(1)?,
+            byte_size: optional_i64_to_u64(row.get(2)?, 2)?,
+            extension: row.get(3)?,
+            language: row.get(4)?,
+            line_count: optional_i64_to_u64(row.get(5)?, 5)?,
+            is_vendor: row.get(6)?,
+            is_generated: row.get(7)?,
+            content: content_kind_from_index(&content_kind).map_err(|source| {
+                rusqlite::Error::FromSqlConversionFailure(8, Type::Text, Box::new(source))
+            })?,
+            is_symlink: row.get(9)?,
+            classification: row.get(10)?,
+            warnings: Vec::new(),
+        },
+    ))
+}
+
+fn read_scan_warnings(
+    connection: &Connection,
+    index_path: &Path,
+    scan_run_id: i64,
+) -> Result<Vec<PersistedScanWarning>, IndexError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT code, path, message
+             FROM scan_warnings
+             WHERE scan_run_id = ?1
+             ORDER BY warning_order, code, path, message;",
+        )
+        .map_err(|source| IndexError::ReadIndex {
+            path: index_path.to_path_buf(),
+            source,
+        })?;
+    let rows = statement
+        .query_map(params![scan_run_id], read_persisted_scan_warning)
+        .map_err(|source| IndexError::ReadIndex {
+            path: index_path.to_path_buf(),
+            source,
+        })?;
+    let mut warnings = Vec::new();
+
+    for row in rows {
+        warnings.push(row.map_err(|source| IndexError::ReadIndex {
+            path: index_path.to_path_buf(),
+            source,
+        })?);
+    }
+
+    Ok(warnings)
+}
+
+fn read_file_warnings(
+    connection: &Connection,
+    index_path: &Path,
+    scan_run_id: i64,
+    file_id: i64,
+) -> Result<Vec<PersistedFileWarning>, IndexError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT code, message
+             FROM file_warnings
+             WHERE scan_run_id = ?1 AND file_id = ?2
+             ORDER BY warning_order, code, message;",
+        )
+        .map_err(|source| IndexError::ReadIndex {
+            path: index_path.to_path_buf(),
+            source,
+        })?;
+    let rows = statement
+        .query_map(params![scan_run_id, file_id], read_persisted_file_warning)
+        .map_err(|source| IndexError::ReadIndex {
+            path: index_path.to_path_buf(),
+            source,
+        })?;
+    let mut warnings = Vec::new();
+
+    for row in rows {
+        warnings.push(row.map_err(|source| IndexError::ReadIndex {
+            path: index_path.to_path_buf(),
+            source,
+        })?);
+    }
+
+    Ok(warnings)
+}
+
+fn read_persisted_scan_warning(row: &Row<'_>) -> rusqlite::Result<PersistedScanWarning> {
+    Ok(PersistedScanWarning {
+        code: row.get(0)?,
+        path: row.get(1)?,
+        message: row.get(2)?,
+    })
+}
+
+fn read_persisted_file_warning(row: &Row<'_>) -> rusqlite::Result<PersistedFileWarning> {
+    Ok(PersistedFileWarning {
+        code: row.get(0)?,
+        message: row.get(1)?,
+    })
+}
+
+fn optional_u64_to_i64(
+    value: Option<u64>,
+    path: &Path,
+    field_name: &'static str,
+) -> Result<Option<i64>, IndexError> {
+    value
+        .map(|value| u64_to_i64(value, path, field_name))
+        .transpose()
+}
+
+fn u64_to_i64(value: u64, path: &Path, field_name: &'static str) -> Result<i64, IndexError> {
+    i64::try_from(value).map_err(|_| IndexError::InvalidScanData {
+        path: path.to_path_buf(),
+        message: format!("{field_name} value {value} exceeds SQLite INTEGER range"),
+    })
+}
+
+fn warning_order_to_i64(value: usize, path: &Path) -> Result<i64, IndexError> {
+    i64::try_from(value).map_err(|_| IndexError::InvalidScanData {
+        path: path.to_path_buf(),
+        message: format!("warning_order value {value} exceeds SQLite INTEGER range"),
+    })
+}
+
+fn optional_i64_to_u64(value: Option<i64>, column: usize) -> rusqlite::Result<Option<u64>> {
+    value.map(|value| i64_to_u64(value, column)).transpose()
+}
+
+fn i64_to_u64(value: i64, column: usize) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|source| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(source))
+    })
+}
+
+fn content_kind_to_index(content: ContentKind) -> &'static str {
+    match content {
+        ContentKind::Text => "text",
+        ContentKind::Binary => "binary",
+        ContentKind::Unknown => "unknown",
+    }
+}
+
+fn content_kind_from_index(value: &str) -> Result<ContentKind, InvalidContentKind> {
+    match value {
+        "text" => Ok(ContentKind::Text),
+        "binary" => Ok(ContentKind::Binary),
+        "unknown" => Ok(ContentKind::Unknown),
+        _ => Err(InvalidContentKind {
+            value: value.to_owned(),
+        }),
+    }
+}
+
+#[derive(Debug)]
+struct InvalidContentKind {
+    value: String,
+}
+
+impl fmt::Display for InvalidContentKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid indexed content kind '{}'", self.value)
+    }
+}
+
+impl StdError for InvalidContentKind {}
 
 fn ensure_index_dir(path: &Path) -> Result<(), IndexError> {
     match fs::create_dir(path) {
@@ -351,6 +951,29 @@ fn create_core_schema(connection: &Connection, path: &Path) -> Result<(), IndexE
                 FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE
             ) STRICT;
 
+            CREATE TABLE IF NOT EXISTS scan_warnings (
+                id INTEGER PRIMARY KEY,
+                scan_run_id INTEGER NOT NULL,
+                warning_order INTEGER NOT NULL,
+                code TEXT NOT NULL,
+                path TEXT,
+                message TEXT NOT NULL,
+                UNIQUE (scan_run_id, warning_order),
+                CHECK (warning_order >= 0),
+                CHECK (length(code) > 0),
+                CHECK (path IS NULL OR length(path) > 0),
+                CHECK (path IS NULL OR path != '..'),
+                CHECK (path IS NULL OR path NOT LIKE '/%'),
+                CHECK (path IS NULL OR path NOT LIKE './%'),
+                CHECK (path IS NULL OR path NOT LIKE '../%'),
+                CHECK (path IS NULL OR path NOT LIKE '%/../%'),
+                CHECK (path IS NULL OR path NOT LIKE '%/..'),
+                CHECK (path IS NULL OR instr(path, '\\') = 0),
+                CHECK (path IS NULL OR instr(path, char(0)) = 0),
+                CHECK (length(message) > 0),
+                FOREIGN KEY (scan_run_id) REFERENCES scan_runs(id) ON DELETE CASCADE
+            ) STRICT;
+
             CREATE TABLE IF NOT EXISTS files (
                 id INTEGER PRIMARY KEY,
                 repo_id INTEGER NOT NULL,
@@ -383,6 +1006,21 @@ fn create_core_schema(connection: &Connection, path: &Path) -> Result<(), IndexE
                 CHECK (is_symlink IN (0, 1)),
                 FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE,
                 FOREIGN KEY (scan_run_id) REFERENCES scan_runs(id) ON DELETE SET NULL
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS file_warnings (
+                id INTEGER PRIMARY KEY,
+                file_id INTEGER NOT NULL,
+                scan_run_id INTEGER NOT NULL,
+                warning_order INTEGER NOT NULL,
+                code TEXT NOT NULL,
+                message TEXT NOT NULL,
+                UNIQUE (file_id, scan_run_id, warning_order),
+                CHECK (warning_order >= 0),
+                CHECK (length(code) > 0),
+                CHECK (length(message) > 0),
+                FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+                FOREIGN KEY (scan_run_id) REFERENCES scan_runs(id) ON DELETE CASCADE
             ) STRICT;
 
             CREATE TABLE IF NOT EXISTS symbols (
@@ -464,8 +1102,12 @@ fn create_core_schema(connection: &Connection, path: &Path) -> Result<(), IndexE
 
             CREATE INDEX IF NOT EXISTS scan_runs_by_repo_run_key
                 ON scan_runs (repo_id, run_key);
+            CREATE INDEX IF NOT EXISTS scan_warnings_by_scan_order
+                ON scan_warnings (scan_run_id, warning_order);
             CREATE INDEX IF NOT EXISTS files_by_repo_path
                 ON files (repo_id, path);
+            CREATE INDEX IF NOT EXISTS file_warnings_by_scan_file_order
+                ON file_warnings (scan_run_id, file_id, warning_order);
             CREATE INDEX IF NOT EXISTS symbols_by_file_order
                 ON symbols (file_id, line_start, line_end, kind, name);
             CREATE INDEX IF NOT EXISTS dependencies_by_source
@@ -728,6 +1370,15 @@ const SCAN_RUNS_COLUMNS: &[ExpectedColumn] = &[
     expected_column("warnings_observed", "INTEGER", false, None, 0),
 ];
 
+const SCAN_WARNINGS_COLUMNS: &[ExpectedColumn] = &[
+    expected_column("id", "INTEGER", false, None, 1),
+    expected_column("scan_run_id", "INTEGER", true, None, 0),
+    expected_column("warning_order", "INTEGER", true, None, 0),
+    expected_column("code", "TEXT", true, None, 0),
+    expected_column("path", "TEXT", false, None, 0),
+    expected_column("message", "TEXT", true, None, 0),
+];
+
 const FILES_COLUMNS: &[ExpectedColumn] = &[
     expected_column("id", "INTEGER", false, None, 1),
     expected_column("repo_id", "INTEGER", true, None, 0),
@@ -742,6 +1393,15 @@ const FILES_COLUMNS: &[ExpectedColumn] = &[
     expected_column("is_symlink", "INTEGER", true, Some("0"), 0),
     expected_column("classification", "TEXT", false, None, 0),
     expected_column("scan_run_id", "INTEGER", false, None, 0),
+];
+
+const FILE_WARNINGS_COLUMNS: &[ExpectedColumn] = &[
+    expected_column("id", "INTEGER", false, None, 1),
+    expected_column("file_id", "INTEGER", true, None, 0),
+    expected_column("scan_run_id", "INTEGER", true, None, 0),
+    expected_column("warning_order", "INTEGER", true, None, 0),
+    expected_column("code", "TEXT", true, None, 0),
+    expected_column("message", "TEXT", true, None, 0),
 ];
 
 const SYMBOLS_COLUMNS: &[ExpectedColumn] = &[
@@ -794,10 +1454,20 @@ const NO_CHECK_CONSTRAINTS: &[&str] = &[];
 
 const SCAN_RUNS_FOREIGN_KEYS: &[ExpectedForeignKey] =
     &[expected_foreign_key("repo_id", "repos", "id", "CASCADE")];
+const SCAN_WARNINGS_FOREIGN_KEYS: &[ExpectedForeignKey] = &[expected_foreign_key(
+    "scan_run_id",
+    "scan_runs",
+    "id",
+    "CASCADE",
+)];
 
 const FILES_FOREIGN_KEYS: &[ExpectedForeignKey] = &[
     expected_foreign_key("repo_id", "repos", "id", "CASCADE"),
     expected_foreign_key("scan_run_id", "scan_runs", "id", "SET NULL"),
+];
+const FILE_WARNINGS_FOREIGN_KEYS: &[ExpectedForeignKey] = &[
+    expected_foreign_key("file_id", "files", "id", "CASCADE"),
+    expected_foreign_key("scan_run_id", "scan_runs", "id", "CASCADE"),
 ];
 
 const SYMBOLS_FOREIGN_KEYS: &[ExpectedForeignKey] = &[
@@ -824,8 +1494,14 @@ const REPOS_UNIQUE_CONSTRAINTS: &[ExpectedUniqueConstraint] =
     &[expected_unique_constraint(&["root_key"])];
 const SCAN_RUNS_UNIQUE_CONSTRAINTS: &[ExpectedUniqueConstraint] =
     &[expected_unique_constraint(&["repo_id", "run_key"])];
+const SCAN_WARNINGS_UNIQUE_CONSTRAINTS: &[ExpectedUniqueConstraint] = &[
+    expected_unique_constraint(&["scan_run_id", "warning_order"]),
+];
 const FILES_UNIQUE_CONSTRAINTS: &[ExpectedUniqueConstraint] =
     &[expected_unique_constraint(&["repo_id", "path"])];
+const FILE_WARNINGS_UNIQUE_CONSTRAINTS: &[ExpectedUniqueConstraint] = &[
+    expected_unique_constraint(&["file_id", "scan_run_id", "warning_order"]),
+];
 const SYMBOLS_UNIQUE_CONSTRAINTS: &[ExpectedUniqueConstraint] = &[expected_unique_constraint(&[
     "file_id",
     "kind",
@@ -848,6 +1524,20 @@ const SCAN_RUNS_CHECK_CONSTRAINTS: &[&str] = &[
     "CHECK (files_observed IS NULL OR files_observed >= 0)",
     "CHECK (warnings_observed IS NULL OR warnings_observed >= 0)",
 ];
+const SCAN_WARNINGS_CHECK_CONSTRAINTS: &[&str] = &[
+    "CHECK (warning_order >= 0)",
+    "CHECK (length(code) > 0)",
+    "CHECK (path IS NULL OR length(path) > 0)",
+    "CHECK (path IS NULL OR path != '..')",
+    "CHECK (path IS NULL OR path NOT LIKE '/%')",
+    "CHECK (path IS NULL OR path NOT LIKE './%')",
+    "CHECK (path IS NULL OR path NOT LIKE '../%')",
+    "CHECK (path IS NULL OR path NOT LIKE '%/../%')",
+    "CHECK (path IS NULL OR path NOT LIKE '%/..')",
+    "CHECK (path IS NULL OR instr(path, '\\') = 0)",
+    "CHECK (path IS NULL OR instr(path, char(0)) = 0)",
+    "CHECK (length(message) > 0)",
+];
 const FILES_CHECK_CONSTRAINTS: &[&str] = &[
     "CHECK (length(path) > 0)",
     "CHECK (path != '..')",
@@ -864,6 +1554,11 @@ const FILES_CHECK_CONSTRAINTS: &[&str] = &[
     "CHECK (is_vendor IN (0, 1))",
     "CHECK (is_generated IN (0, 1))",
     "CHECK (is_symlink IN (0, 1))",
+];
+const FILE_WARNINGS_CHECK_CONSTRAINTS: &[&str] = &[
+    "CHECK (warning_order >= 0)",
+    "CHECK (length(code) > 0)",
+    "CHECK (length(message) > 0)",
 ];
 const SYMBOLS_CHECK_CONSTRAINTS: &[&str] = &[
     "CHECK (length(name) > 0)",
@@ -902,7 +1597,17 @@ const REQUIRED_INDEXES: &[ExpectedIndex] = &[
         "scan_runs",
         &["repo_id", "run_key"],
     ),
+    expected_index(
+        "scan_warnings_by_scan_order",
+        "scan_warnings",
+        &["scan_run_id", "warning_order"],
+    ),
     expected_index("files_by_repo_path", "files", &["repo_id", "path"]),
+    expected_index(
+        "file_warnings_by_scan_file_order",
+        "file_warnings",
+        &["scan_run_id", "file_id", "warning_order"],
+    ),
     expected_index(
         "symbols_by_file_order",
         "symbols",
@@ -1070,7 +1775,9 @@ fn expected_columns(table_name: &str) -> &'static [ExpectedColumn] {
         "hotpath_metadata" => HOTPATH_METADATA_COLUMNS,
         "repos" => REPOS_COLUMNS,
         "scan_runs" => SCAN_RUNS_COLUMNS,
+        "scan_warnings" => SCAN_WARNINGS_COLUMNS,
         "files" => FILES_COLUMNS,
+        "file_warnings" => FILE_WARNINGS_COLUMNS,
         "symbols" => SYMBOLS_COLUMNS,
         "git_file_stats" => GIT_FILE_STATS_COLUMNS,
         "dependencies" => DEPENDENCIES_COLUMNS,
@@ -1083,7 +1790,9 @@ fn expected_foreign_keys(table_name: &str) -> &'static [ExpectedForeignKey] {
     match table_name {
         "hotpath_metadata" | "repos" => NO_FOREIGN_KEYS,
         "scan_runs" => SCAN_RUNS_FOREIGN_KEYS,
+        "scan_warnings" => SCAN_WARNINGS_FOREIGN_KEYS,
         "files" => FILES_FOREIGN_KEYS,
+        "file_warnings" => FILE_WARNINGS_FOREIGN_KEYS,
         "symbols" => SYMBOLS_FOREIGN_KEYS,
         "git_file_stats" => GIT_FILE_STATS_FOREIGN_KEYS,
         "dependencies" => DEPENDENCIES_FOREIGN_KEYS,
@@ -1096,7 +1805,9 @@ fn expected_unique_constraints(table_name: &str) -> &'static [ExpectedUniqueCons
     match table_name {
         "repos" => REPOS_UNIQUE_CONSTRAINTS,
         "scan_runs" => SCAN_RUNS_UNIQUE_CONSTRAINTS,
+        "scan_warnings" => SCAN_WARNINGS_UNIQUE_CONSTRAINTS,
         "files" => FILES_UNIQUE_CONSTRAINTS,
+        "file_warnings" => FILE_WARNINGS_UNIQUE_CONSTRAINTS,
         "symbols" => SYMBOLS_UNIQUE_CONSTRAINTS,
         "dependencies" => DEPENDENCIES_UNIQUE_CONSTRAINTS,
         _ => NO_UNIQUE_CONSTRAINTS,
@@ -1107,7 +1818,9 @@ fn expected_check_constraints(table_name: &str) -> &'static [&'static str] {
     match table_name {
         "repos" => REPOS_CHECK_CONSTRAINTS,
         "scan_runs" => SCAN_RUNS_CHECK_CONSTRAINTS,
+        "scan_warnings" => SCAN_WARNINGS_CHECK_CONSTRAINTS,
         "files" => FILES_CHECK_CONSTRAINTS,
+        "file_warnings" => FILE_WARNINGS_CHECK_CONSTRAINTS,
         "symbols" => SYMBOLS_CHECK_CONSTRAINTS,
         "git_file_stats" => GIT_FILE_STATS_CHECK_CONSTRAINTS,
         "dependencies" => DEPENDENCIES_CHECK_CONSTRAINTS,
@@ -1525,6 +2238,8 @@ fn read_metadata_schema_identifier(
 mod tests {
     use super::*;
 
+    use crate::{FileWarning, ScanWarning};
+
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT_FIXTURE_ID: AtomicUsize = AtomicUsize::new(0);
@@ -1644,6 +2359,40 @@ mod tests {
             .expect("metadata rows should read")
     }
 
+    fn scan_report(files: Vec<FileRecord>) -> ScanReport {
+        ScanReport {
+            status: "ok",
+            file_walking: "implemented",
+            classification: "implemented",
+            warnings: Vec::new(),
+            files,
+        }
+    }
+
+    fn scan_file(
+        path: &str,
+        byte_size: Option<u64>,
+        language: Option<&'static str>,
+        content: ContentKind,
+    ) -> FileRecord {
+        FileRecord {
+            path: path.to_owned(),
+            byte_size,
+            extension: Path::new(path)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(str::to_owned),
+            language,
+            line_count: None,
+            is_vendor: false,
+            is_generated: false,
+            content,
+            is_symlink: false,
+            classification: "implemented",
+            warnings: Vec::new(),
+        }
+    }
+
     fn files_table_sql(include_unique: bool, include_bare_dotdot_check: bool) -> String {
         format!(
             "CREATE TABLE files (
@@ -1758,6 +2507,152 @@ mod tests {
     }
 
     #[test]
+    fn persist_scan_records_completed_run_and_file_facts() {
+        let fixture = Fixture::new("persist-scan");
+        let mut store = IndexStore::open(&fixture.path).expect("index should open");
+        let mut generated = scan_file(
+            "dist/app.generated.js",
+            Some(21),
+            Some("JavaScript"),
+            ContentKind::Text,
+        );
+        generated.line_count = Some(1);
+        generated.is_generated = true;
+        generated.warnings.push(FileWarning {
+            code: "line_count_skipped",
+            message: "test warning".to_owned(),
+        });
+        let mut vendor = scan_file("vendor/blob.bin", Some(4), None, ContentKind::Binary);
+        vendor.is_vendor = true;
+        vendor.is_symlink = true;
+        let mut scan = scan_report(vec![vendor, generated]);
+        scan.warnings.push(ScanWarning {
+            code: "walk_error",
+            path: Some("blocked".to_owned()),
+            message: "test scan warning".to_owned(),
+        });
+
+        let run = store
+            .persist_scan(&scan)
+            .expect("scan should persist successfully");
+        let persisted = store
+            .latest_scan()
+            .expect("latest scan should read")
+            .expect("latest scan should exist");
+
+        assert_eq!(run.run_key, "scan-0000000000000001");
+        assert_eq!(run.status, "completed");
+        assert_eq!(
+            run.scanner_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            run.scan_schema_identifier.as_deref(),
+            Some(SCAN_SCHEMA_VERSION)
+        );
+        assert_eq!(run.files_observed, Some(2));
+        assert_eq!(run.warnings_observed, Some(2));
+        assert_eq!(persisted.run, run);
+        assert_eq!(
+            persisted.warnings,
+            vec![PersistedScanWarning {
+                code: "walk_error".to_owned(),
+                path: Some("blocked".to_owned()),
+                message: "test scan warning".to_owned(),
+            }]
+        );
+        assert_eq!(
+            persisted
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dist/app.generated.js", "vendor/blob.bin"]
+        );
+        assert_eq!(
+            persisted.files[0],
+            PersistedFileRecord {
+                path: "dist/app.generated.js".to_owned(),
+                byte_size: Some(21),
+                extension: Some("js".to_owned()),
+                language: Some("JavaScript".to_owned()),
+                line_count: Some(1),
+                is_vendor: false,
+                is_generated: true,
+                content: ContentKind::Text,
+                is_symlink: false,
+                classification: Some("implemented".to_owned()),
+                warnings: vec![PersistedFileWarning {
+                    code: "line_count_skipped".to_owned(),
+                    message: "test warning".to_owned(),
+                }],
+            }
+        );
+        assert_eq!(
+            persisted.files[1],
+            PersistedFileRecord {
+                path: "vendor/blob.bin".to_owned(),
+                byte_size: Some(4),
+                extension: Some("bin".to_owned()),
+                language: None,
+                line_count: None,
+                is_vendor: true,
+                is_generated: false,
+                content: ContentKind::Binary,
+                is_symlink: true,
+                classification: Some("implemented".to_owned()),
+                warnings: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn persist_scan_appends_one_run_per_successful_scan() {
+        let fixture = Fixture::new("persist-scan-runs");
+        let mut store = IndexStore::open(&fixture.path).expect("index should open");
+        let first = scan_report(vec![scan_file(
+            "a.rs",
+            Some(0),
+            Some("Rust"),
+            ContentKind::Text,
+        )]);
+        let second = scan_report(vec![scan_file(
+            "b.rs",
+            Some(1),
+            Some("Rust"),
+            ContentKind::Text,
+        )]);
+
+        let first_run = store
+            .persist_scan(&first)
+            .expect("first scan should persist");
+        let second_run = store
+            .persist_scan(&second)
+            .expect("second scan should persist");
+        let latest = store
+            .latest_scan()
+            .expect("latest scan should read")
+            .expect("latest scan should exist");
+        let connection = Connection::open(store.path()).expect("index should reopen");
+        let run_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM scan_runs;", [], |row| row.get(0))
+            .expect("run count should read");
+
+        assert_eq!(first_run.run_key, "scan-0000000000000001");
+        assert_eq!(second_run.run_key, "scan-0000000000000002");
+        assert_eq!(run_count, 2);
+        assert_eq!(latest.run, second_run);
+        assert_eq!(
+            latest
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b.rs"]
+        );
+    }
+
+    #[test]
     fn default_index_path_uses_hotpath_directory() {
         assert_eq!(
             default_index_path(Path::new("repo")),
@@ -1821,6 +2716,28 @@ mod tests {
             ]
         );
         assert_eq!(
+            table_columns(&connection, "scan_warnings"),
+            [
+                "id",
+                "scan_run_id",
+                "warning_order",
+                "code",
+                "path",
+                "message"
+            ]
+        );
+        assert_eq!(
+            table_columns(&connection, "file_warnings"),
+            [
+                "id",
+                "file_id",
+                "scan_run_id",
+                "warning_order",
+                "code",
+                "message",
+            ]
+        );
+        assert_eq!(
             table_columns(&connection, "hotspots"),
             [
                 "file_id",
@@ -1835,9 +2752,22 @@ mod tests {
             ]
         );
         assert!(is_strict_table(&connection, "repos"));
+        assert!(is_strict_table(&connection, "scan_warnings"));
         assert!(is_strict_table(&connection, "files"));
+        assert!(is_strict_table(&connection, "file_warnings"));
         assert!(is_strict_table(&connection, "hotspots"));
         assert!(table_has_foreign_key(&connection, "files", "repos"));
+        assert!(table_has_foreign_key(
+            &connection,
+            "scan_warnings",
+            "scan_runs"
+        ));
+        assert!(table_has_foreign_key(&connection, "file_warnings", "files"));
+        assert!(table_has_foreign_key(
+            &connection,
+            "file_warnings",
+            "scan_runs"
+        ));
         assert!(table_has_foreign_key(&connection, "symbols", "files"));
         assert!(table_has_foreign_key(&connection, "dependencies", "files"));
         assert!(table_has_foreign_key(&connection, "hotspots", "files"));

@@ -16,7 +16,7 @@ pub mod storage;
 #[cfg(test)]
 const BINARY_SAMPLE_BYTES: usize = 8 * 1024;
 const MAX_TEXT_READ_BYTES: u64 = 8 * 1024 * 1024;
-const SCAN_SCHEMA_VERSION: &str = "hotpath.scan.v1";
+pub const SCAN_SCHEMA_VERSION: &str = "hotpath.scan.v1";
 const SUMMARY_LABEL_WIDTH: usize = 12;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +211,7 @@ pub enum ScanError {
         root: PathBuf,
         path: PathBuf,
     },
+    Index(storage::index::IndexError),
     Json(serde_json::Error),
 }
 
@@ -236,6 +237,7 @@ impl fmt::Display for ScanError {
                 path.display(),
                 root.display()
             ),
+            Self::Index(source) => write!(f, "failed to persist scan results: {source}"),
             Self::Json(source) => write!(f, "failed to render scan JSON: {source}"),
         }
     }
@@ -246,8 +248,15 @@ impl StdError for ScanError {
         match self {
             Self::CurrentDir(source) | Self::Root { source, .. } => Some(source),
             Self::RootNotDirectory { .. } | Self::RelativePath { .. } => None,
+            Self::Index(source) => Some(source),
             Self::Json(source) => Some(source),
         }
+    }
+}
+
+impl From<storage::index::IndexError> for ScanError {
+    fn from(source: storage::index::IndexError) -> Self {
+        Self::Index(source)
     }
 }
 
@@ -287,6 +296,7 @@ pub fn scan_repository(root: impl AsRef<Path>) -> Result<ScanReport, ScanError> 
 
     let mut warnings = Vec::new();
     let mut files = Vec::new();
+    let internal_filter_root = root.clone();
 
     for entry in WalkBuilder::new(&root)
         .follow_links(false)
@@ -296,7 +306,7 @@ pub fn scan_repository(root: impl AsRef<Path>) -> Result<ScanReport, ScanError> 
         .git_ignore(true)
         .git_global(false)
         .git_exclude(false)
-        .filter_entry(|entry| !is_git_entry(entry))
+        .filter_entry(move |entry| !is_internal_entry(&internal_filter_root, entry))
         .build()
     {
         let entry = match entry {
@@ -335,11 +345,20 @@ pub fn scan_repository(root: impl AsRef<Path>) -> Result<ScanReport, ScanError> 
 }
 
 pub fn scan_summary() -> Result<String, ScanError> {
-    Ok(render_summary(&scan_current_dir()?))
+    Ok(render_summary(&scan_current_dir_and_persist()?))
 }
 
 pub fn scan_json() -> Result<String, ScanError> {
-    render_json(&scan_current_dir()?)
+    render_json(&scan_current_dir_and_persist()?)
+}
+
+fn scan_current_dir_and_persist() -> Result<ScanReport, ScanError> {
+    let root = env::current_dir().map_err(ScanError::CurrentDir)?;
+    let report = scan_repository(&root)?;
+    let mut index = storage::index::IndexStore::open(&root)?;
+    index.persist_scan(&report)?;
+
+    Ok(report)
 }
 
 fn render_json(scan: &ScanReport) -> Result<String, ScanError> {
@@ -351,8 +370,12 @@ fn render_json(scan: &ScanReport) -> Result<String, ScanError> {
     })?)
 }
 
-fn is_git_entry(entry: &DirEntry) -> bool {
-    entry.file_name() == ".git"
+fn is_internal_entry(root: &Path, entry: &DirEntry) -> bool {
+    match entry.file_name().to_str() {
+        Some(".git") => true,
+        Some(".hotpath") => entry.path() == root.join(".hotpath"),
+        _ => false,
+    }
 }
 
 fn is_walked_file(entry: &DirEntry) -> bool {
