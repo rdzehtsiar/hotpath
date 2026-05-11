@@ -17,7 +17,7 @@ enum Commands {
     /// Scan a repository and print an early placeholder report.
     Scan(ScanArgs),
 
-    /// Build a deterministic parser scaffold report for scanned files.
+    /// Parse supported scanned source files and print an early symbol report.
     Parse(ParseArgs),
 
     /// Explain hotspot scoring for one current file.
@@ -73,7 +73,7 @@ struct ScanArgs {
 
 #[derive(Debug, Args)]
 struct ParseArgs {
-    /// Print a machine-readable JSON parse scaffold report.
+    /// Print a machine-readable JSON parse report.
     #[arg(long)]
     json: bool,
 }

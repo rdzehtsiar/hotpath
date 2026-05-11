@@ -673,9 +673,10 @@ fn parse_summary_command_exists_and_persists_scan() {
             "Hotpath parse summary\n",
             "total files   2\n",
             "candidates    1\n",
-            "pending       1\n",
+            "parsed        1\n",
+            "pending       0\n",
             "skipped       1\n",
-            "symbols       0\n",
+            "symbols       1\n",
             "imports       0\n",
         )
     );
@@ -695,13 +696,13 @@ fn parse_json_reports_schema_and_skips_unsupported_files_end_to_end() {
     assert_eq!(value["schema_version"], "hotpath.parse.v1");
     assert_eq!(value["summary"]["total_files"], 3);
     assert_eq!(value["summary"]["candidate_files"], 1);
-    assert_eq!(value["summary"]["pending_files"], 1);
+    assert_eq!(value["summary"]["parsed_files"], 1);
+    assert_eq!(value["summary"]["pending_files"], 0);
     assert_eq!(value["summary"]["skipped_files"], 2);
-    assert_eq!(value["summary"]["symbol_count"], 0);
+    assert_eq!(value["summary"]["symbol_count"], 1);
     assert_eq!(value["summary"]["import_count"], 0);
     assert_eq!(value["summary"]["warning_count"], 0);
     assert_eq!(value["warnings"], Value::Array(Vec::new()));
-    assert_eq!(value["symbols"], Value::Array(Vec::new()));
     assert_eq!(value["imports"], Value::Array(Vec::new()));
     assert_json_strings_do_not_contain_path(&value, &fixture.path);
 
@@ -716,10 +717,25 @@ fn parse_json_reports_schema_and_skips_unsupported_files_end_to_end() {
     let rust = file_by_path(&value, "src/lib.rs");
     assert_eq!(rust["language"], "Rust");
     assert_eq!(rust["content"], "text");
-    assert_eq!(rust["status"], "pending");
-    assert_eq!(rust["reason"], "parser_extraction_pending");
-    assert_eq!(rust["symbol_count"], 0);
+    assert_eq!(rust["status"], "parsed");
+    assert_eq!(rust["reason"], Value::Null);
+    assert_eq!(rust["symbol_count"], 1);
     assert_eq!(rust["import_count"], 0);
+
+    let symbols = value["symbols"]
+        .as_array()
+        .expect("symbols should be an array");
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0]["path"], "src/lib.rs");
+    assert_eq!(symbols[0]["name"], "lib");
+    assert_eq!(symbols[0]["kind"], "function");
+    assert_eq!(symbols[0]["start_line"], 1);
+    assert_eq!(symbols[0]["end_line"], 1);
+    assert_eq!(symbols[0]["signature"], "pub fn lib()");
+    assert_eq!(symbols[0]["nesting_depth"], 0);
+    assert_eq!(symbols[0]["parent"], Value::Null);
+    assert_eq!(symbols[0]["cyclomatic_complexity"], 1);
+    assert_eq!(symbols[0]["max_control_flow_nesting"], 0);
 
     let markdown = file_by_path(&value, "README.md");
     assert_eq!(markdown["language"], "Markdown");
@@ -748,6 +764,81 @@ fn parse_json_reports_schema_and_skips_unsupported_files_end_to_end() {
             .collect::<Vec<_>>(),
         vec!["README.md", "assets/logo.bin", "src/lib.rs"]
     );
+}
+
+#[test]
+fn parse_json_parses_supported_languages_end_to_end() {
+    let fixture = Fixture::new("parse-supported-languages");
+    fixture.write("src/lib.rs", "use std::fmt;\npub fn lib() {}\n");
+    fixture.write(
+        "cmd/main.go",
+        "package main\n\nimport \"fmt\"\n\nfunc main() {\n    fmt.Println(\"hi\")\n}\n",
+    );
+    fixture.write(
+        "web/app.ts",
+        "import { value } from \"./value\";\n\nexport function run() {\n    if (value) {\n        return 1;\n    }\n    return 0;\n}\n",
+    );
+    fixture.write(
+        "web/App.tsx",
+        "import React from \"react\";\n\nexport function App() {\n    return <div />;\n}\n",
+    );
+
+    let (_, value) = parse_json(&fixture.path);
+
+    assert_eq!(value["summary"]["total_files"], 4);
+    assert_eq!(value["summary"]["candidate_files"], 4);
+    assert_eq!(value["summary"]["parsed_files"], 4);
+    assert_eq!(value["summary"]["pending_files"], 0);
+    assert_eq!(value["summary"]["skipped_files"], 0);
+    assert_eq!(value["summary"]["symbol_count"], 5);
+    assert_eq!(value["summary"]["import_count"], 4);
+    assert_eq!(value["warnings"], Value::Array(Vec::new()));
+
+    for path in ["cmd/main.go", "src/lib.rs", "web/App.tsx", "web/app.ts"] {
+        let file = file_by_path(&value, path);
+        assert_eq!(file["status"], "parsed");
+        assert_eq!(file["reason"], Value::Null);
+    }
+
+    let imports = value["imports"]
+        .as_array()
+        .expect("imports should be an array");
+    assert_eq!(
+        imports
+            .iter()
+            .map(|import| (
+                import["path"].as_str().expect("path should be a string"),
+                import["target"]
+                    .as_str()
+                    .expect("target should be a string")
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("cmd/main.go", "fmt"),
+            ("src/lib.rs", "std::fmt"),
+            ("web/App.tsx", "react"),
+            ("web/app.ts", "./value"),
+        ]
+    );
+
+    let symbols = value["symbols"]
+        .as_array()
+        .expect("symbols should be an array");
+    assert!(symbols.iter().any(|symbol| {
+        symbol["path"] == "cmd/main.go" && symbol["name"] == "main" && symbol["kind"] == "package"
+    }));
+    assert!(symbols.iter().any(|symbol| {
+        symbol["path"] == "cmd/main.go" && symbol["name"] == "main" && symbol["kind"] == "function"
+    }));
+    assert!(symbols.iter().any(|symbol| {
+        symbol["path"] == "src/lib.rs" && symbol["name"] == "lib" && symbol["kind"] == "function"
+    }));
+    assert!(symbols.iter().any(|symbol| {
+        symbol["path"] == "web/App.tsx" && symbol["name"] == "App" && symbol["kind"] == "function"
+    }));
+    assert!(symbols.iter().any(|symbol| {
+        symbol["path"] == "web/app.ts" && symbol["name"] == "run" && symbol["kind"] == "function"
+    }));
 }
 
 #[test]

@@ -12,8 +12,14 @@ use ignore::{DirEntry, Error as IgnoreError, WalkBuilder};
 use serde::Serialize;
 
 pub mod git;
+pub mod parse;
 pub mod scoring;
 pub mod storage;
+
+pub use parse::{
+    ParseFileReason, ParseFileRecord, ParseFileStatus, ParseImportRecord, ParseReport,
+    ParseSummary, ParseSymbolRecord, ParseWarning,
+};
 
 #[cfg(test)]
 const BINARY_SAMPLE_BYTES: usize = 8 * 1024;
@@ -147,101 +153,6 @@ impl ScanReport {
         }
 
         summary
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ParseFileStatus {
-    Pending,
-    Skipped,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ParseFileReason {
-    ParserExtractionPending,
-    UnsupportedContent,
-    UnsupportedLanguage,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ParseWarning {
-    pub code: &'static str,
-    pub path: Option<String>,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ParseFileRecord {
-    pub path: String,
-    pub language: Option<&'static str>,
-    pub content: ContentKind,
-    pub status: ParseFileStatus,
-    pub reason: Option<ParseFileReason>,
-    pub symbol_count: u64,
-    pub import_count: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ParseSymbolRecord {
-    pub path: String,
-    pub name: String,
-    pub kind: String,
-    pub start_line: u64,
-    pub end_line: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ParseImportRecord {
-    pub path: String,
-    pub target: String,
-    pub kind: String,
-    pub line: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ParseSummary {
-    pub total_files: u64,
-    pub candidate_files: u64,
-    pub pending_files: u64,
-    pub skipped_files: u64,
-    pub symbol_count: u64,
-    pub import_count: u64,
-    pub warning_count: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseReport {
-    pub warnings: Vec<ParseWarning>,
-    pub files: Vec<ParseFileRecord>,
-    pub symbols: Vec<ParseSymbolRecord>,
-    pub imports: Vec<ParseImportRecord>,
-}
-
-impl ParseReport {
-    fn summary(&self) -> ParseSummary {
-        ParseSummary {
-            total_files: self.files.len() as u64,
-            candidate_files: self
-                .files
-                .iter()
-                .filter(|file| file.status == ParseFileStatus::Pending)
-                .count() as u64,
-            pending_files: self
-                .files
-                .iter()
-                .filter(|file| file.status == ParseFileStatus::Pending)
-                .count() as u64,
-            skipped_files: self
-                .files
-                .iter()
-                .filter(|file| file.status == ParseFileStatus::Skipped)
-                .count() as u64,
-            symbol_count: self.symbols.len() as u64,
-            import_count: self.imports.len() as u64,
-            warning_count: self.warnings.len() as u64,
-        }
     }
 }
 
@@ -722,18 +633,7 @@ pub fn parse_json() -> Result<String, ScanError> {
 }
 
 pub fn parse_scan_report(scan: &ScanReport) -> ParseReport {
-    let mut warnings = parse_warnings_from_scan(scan);
-
-    warnings.sort_by(|left, right| {
-        (&left.path, left.code, &left.message).cmp(&(&right.path, right.code, &right.message))
-    });
-
-    ParseReport {
-        warnings,
-        files: scan.files.iter().map(parse_file_from_scan_file).collect(),
-        symbols: Vec::new(),
-        imports: Vec::new(),
-    }
+    parse::scaffold_report_from_scan(scan)
 }
 
 pub fn hotspots(options: HotspotsOptions) -> Result<String, HotspotsCommandError> {
@@ -878,57 +778,12 @@ fn scan_current_dir_and_persist() -> Result<ScanReport, ScanError> {
 }
 
 fn parse_current_dir_and_persist() -> Result<ParseReport, ScanError> {
-    Ok(parse_scan_report(&scan_current_dir_and_persist()?))
-}
+    let root = env::current_dir().map_err(ScanError::CurrentDir)?;
+    let scan = scan_repository(&root)?;
+    let mut index = storage::index::IndexStore::open(&root)?;
+    index.persist_scan(&scan)?;
 
-fn parse_warnings_from_scan(scan: &ScanReport) -> Vec<ParseWarning> {
-    let scan_warnings = scan.warnings.iter().map(|warning| ParseWarning {
-        code: warning.code,
-        path: warning.path.clone(),
-        message: warning.message.clone(),
-    });
-    let file_warnings = scan.files.iter().flat_map(|file| {
-        file.warnings.iter().map(|warning| ParseWarning {
-            code: warning.code,
-            path: Some(file.path.clone()),
-            message: warning.message.clone(),
-        })
-    });
-
-    scan_warnings.chain(file_warnings).collect()
-}
-
-fn parse_file_from_scan_file(file: &FileRecord) -> ParseFileRecord {
-    let (status, reason) = if file.content != ContentKind::Text {
-        (
-            ParseFileStatus::Skipped,
-            Some(ParseFileReason::UnsupportedContent),
-        )
-    } else if is_parse_candidate_language(file.language) {
-        (
-            ParseFileStatus::Pending,
-            Some(ParseFileReason::ParserExtractionPending),
-        )
-    } else {
-        (
-            ParseFileStatus::Skipped,
-            Some(ParseFileReason::UnsupportedLanguage),
-        )
-    };
-
-    ParseFileRecord {
-        path: file.path.clone(),
-        language: file.language,
-        content: file.content,
-        status,
-        reason,
-        symbol_count: 0,
-        import_count: 0,
-    }
-}
-
-fn is_parse_candidate_language(language: Option<&str>) -> bool {
-    matches!(language, Some("Rust"))
+    Ok(parse::report_from_scan(&root, &scan))
 }
 
 fn ranked_hotspot_scores_from_scan_and_git(
@@ -1931,11 +1786,13 @@ fn render_parse_summary(report: &ParseReport) -> String {
     let parse_summary = report.summary();
 
     let mut summary = format!(
-        "Hotpath parse summary\n{:<SUMMARY_LABEL_WIDTH$}  {}\n{:<SUMMARY_LABEL_WIDTH$}  {}\n{:<SUMMARY_LABEL_WIDTH$}  {}\n{:<SUMMARY_LABEL_WIDTH$}  {}\n{:<SUMMARY_LABEL_WIDTH$}  {}\n{:<SUMMARY_LABEL_WIDTH$}  {}",
+        "Hotpath parse summary\n{:<SUMMARY_LABEL_WIDTH$}  {}\n{:<SUMMARY_LABEL_WIDTH$}  {}\n{:<SUMMARY_LABEL_WIDTH$}  {}\n{:<SUMMARY_LABEL_WIDTH$}  {}\n{:<SUMMARY_LABEL_WIDTH$}  {}\n{:<SUMMARY_LABEL_WIDTH$}  {}\n{:<SUMMARY_LABEL_WIDTH$}  {}",
         "total files",
         parse_summary.total_files,
         "candidates",
         parse_summary.candidate_files,
+        "parsed",
+        parse_summary.parsed_files,
         "pending",
         parse_summary.pending_files,
         "skipped",
@@ -3235,7 +3092,7 @@ mod tests {
 
         assert_eq!(
             json,
-            "{\n  \"schema_version\": \"hotpath.parse.v1\",\n  \"summary\": {\n    \"total_files\": 1,\n    \"candidate_files\": 1,\n    \"pending_files\": 1,\n    \"skipped_files\": 0,\n    \"symbol_count\": 0,\n    \"import_count\": 0,\n    \"warning_count\": 0\n  },\n  \"warnings\": [],\n  \"files\": [\n    {\n      \"path\": \"src/lib.rs\",\n      \"language\": \"Rust\",\n      \"content\": \"text\",\n      \"status\": \"pending\",\n      \"reason\": \"parser_extraction_pending\",\n      \"symbol_count\": 0,\n      \"import_count\": 0\n    }\n  ],\n  \"symbols\": [],\n  \"imports\": []\n}"
+            "{\n  \"schema_version\": \"hotpath.parse.v1\",\n  \"summary\": {\n    \"total_files\": 1,\n    \"candidate_files\": 1,\n    \"parsed_files\": 0,\n    \"pending_files\": 1,\n    \"skipped_files\": 0,\n    \"symbol_count\": 0,\n    \"import_count\": 0,\n    \"warning_count\": 0\n  },\n  \"warnings\": [],\n  \"files\": [\n    {\n      \"path\": \"src/lib.rs\",\n      \"language\": \"Rust\",\n      \"content\": \"text\",\n      \"status\": \"pending\",\n      \"reason\": \"parser_extraction_pending\",\n      \"symbol_count\": 0,\n      \"import_count\": 0\n    }\n  ],\n  \"symbols\": [],\n  \"imports\": []\n}"
         );
     }
 
@@ -3251,6 +3108,7 @@ mod tests {
 
         assert_eq!(value["summary"]["total_files"], 3);
         assert_eq!(value["summary"]["candidate_files"], 1);
+        assert_eq!(value["summary"]["parsed_files"], 0);
         assert_eq!(value["summary"]["pending_files"], 1);
         assert_eq!(value["summary"]["skipped_files"], 2);
         assert_eq!(value["symbols"], serde_json::Value::Array(Vec::new()));
