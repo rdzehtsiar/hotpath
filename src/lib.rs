@@ -1394,6 +1394,89 @@ mod tests {
     }
 
     #[test]
+    fn language_guesses_cover_supported_extensions_and_special_file_names() {
+        let cases = [
+            ("script.bash", Some("Shell")),
+            ("script.sh", Some("Shell")),
+            ("script.zsh", Some("Shell")),
+            ("main.c", Some("C")),
+            ("main.cc", Some("C++")),
+            ("main.cpp", Some("C++")),
+            ("main.cxx", Some("C++")),
+            ("include.hpp", Some("C++")),
+            ("include.hh", Some("C++")),
+            ("include.hxx", Some("C++")),
+            ("Program.cs", Some("C#")),
+            ("style.css", Some("CSS")),
+            ("main.go", Some("Go")),
+            ("include.h", Some("C/C++ Header")),
+            ("index.htm", Some("HTML")),
+            ("index.html", Some("HTML")),
+            ("Main.java", Some("Java")),
+            ("index.js", Some("JavaScript")),
+            ("index.mjs", Some("JavaScript")),
+            ("index.cjs", Some("JavaScript")),
+            ("data.json", Some("JSON")),
+            ("view.jsx", Some("JavaScript JSX")),
+            ("Main.kt", Some("Kotlin")),
+            ("build.gradle.kts", Some("Kotlin")),
+            ("README.markdown", Some("Markdown")),
+            ("index.php", Some("PHP")),
+            ("schema.proto", Some("Protocol Buffers")),
+            ("build.ps1", Some("PowerShell")),
+            ("tool.py", Some("Python")),
+            ("tool.rb", Some("Ruby")),
+            ("lib.rs", Some("Rust")),
+            ("Job.scala", Some("Scala")),
+            ("style.scss", Some("Sass")),
+            ("query.sql", Some("SQL")),
+            ("App.swift", Some("Swift")),
+            ("Cargo.toml", Some("TOML")),
+            ("index.ts", Some("TypeScript")),
+            ("index.tsx", Some("TypeScript JSX")),
+            ("document.xml", Some("XML")),
+            ("config.yaml", Some("YAML")),
+            ("config.yml", Some("YAML")),
+            ("Dockerfile", Some("Dockerfile")),
+            ("Containerfile", Some("Dockerfile")),
+            ("Makefile", Some("Makefile")),
+            ("unknown.hotpath", None),
+        ];
+
+        for (path, expected) in cases {
+            assert_eq!(language_guess(path), expected, "language guess for {path}");
+        }
+    }
+
+    #[test]
+    fn path_classification_covers_generated_suffixes_and_vendor_components() {
+        for path in [
+            "src/schema.pb.go",
+            "src/schema.pb.rs",
+            "src/messages.g.cs",
+            "src/api.gen.ts",
+            "generated/client.ts",
+            "build/client.ts",
+            "dist/client.js",
+        ] {
+            assert!(is_generated_path(path), "{path} should be generated");
+        }
+
+        for path in [
+            "third_party/pkg/lib.rs",
+            "third-party/pkg/lib.rs",
+            "external/pkg/lib.rs",
+            "vendor/pkg/lib.rs",
+            "node_modules/pkg/index.js",
+        ] {
+            assert!(is_vendor_path(path), "{path} should be vendor");
+        }
+
+        assert!(!is_generated_path("src/generation_notes.rs"));
+        assert!(!is_vendor_path("src/vendor_notes.rs"));
+    }
+
+    #[test]
     fn symlinked_files_inside_scan_root_are_classified() {
         let fixture = Fixture::new("symlinked-file");
         fixture.write("target.rs", "fn linked() {}\n");

@@ -214,6 +214,73 @@ fn explain_git_accepts_cwd_relative_and_repository_relative_paths_from_subdirect
 }
 
 #[test]
+fn explain_git_rejects_ambiguous_subdirectory_paths_without_persisting() {
+    let fixture = GitFixture::new("explain-git-ambiguous-path");
+    let author = GitIdentity::new("Ambiguous Author", "ambiguous@example.invalid");
+
+    fixture.write("lib.rs", "pub fn root() {}\n");
+    fixture.write("src/lib.rs", "pub fn nested() {}\n");
+    fixture.commit(CommitOptions::new(
+        "Add ambiguous library paths",
+        author,
+        "2024-02-01T00:00:00 +0000",
+    ));
+
+    let stderr = failed_stderr(&["explain-git", "lib.rs"], &fixture.path().join("src"));
+
+    assert!(stderr.starts_with("hotpath: requested path is ambiguous inside this worktree"));
+    assert!(stderr.contains("'lib.rs'"));
+    assert!(stderr.contains("'src/lib.rs'"));
+    assert!(!stderr.contains("raw metrics"));
+    assert!(!contains_path(&stderr, fixture.path()));
+    assert!(!fixture.path().join(".hotpath").exists());
+}
+
+#[test]
+fn explain_git_reports_zero_metrics_for_existing_file_without_history() {
+    let fixture = GitFixture::new("explain-git-untracked-file");
+    let author = GitIdentity::new("Tracked Author", "tracked@example.invalid");
+
+    fixture.write("src/lib.rs", "pub fn lib() {}\n");
+    fixture.commit(CommitOptions::new(
+        "Add tracked source",
+        author,
+        "2024-02-01T00:00:00 +0000",
+    ));
+    fixture.write("notes/todo.md", "- local note\n");
+
+    let stdout = successful_stdout(&["explain-git", "notes/todo.md"], fixture.path());
+
+    assert!(stdout.starts_with("Hotpath Git explanation\npath: notes/todo.md\n"));
+    assert!(stdout.contains("\nraw changes\n  none\n"));
+    assert!(stdout.contains("  commits per file: 0"));
+    assert!(stdout.contains("  total churn: 0 added, 0 deleted, 0 combined"));
+    assert!(stdout.contains("  recent churn (90 days): 0 added, 0 deleted, 0 combined"));
+    assert!(stdout.contains("  author count: 0"));
+    assert!(stdout.contains("  dominant owner: unavailable"));
+    assert!(stdout.contains("  first observed commit: unavailable"));
+    assert!(stdout.contains("  last observed commit: unavailable"));
+    assert!(stdout.contains("  file age: unavailable"));
+    assert!(stdout.contains("\nco-changes\n  none\n"));
+    assert!(!contains_path(&stdout, fixture.path()));
+
+    let persisted = IndexStore::open(fixture.path())
+        .expect("index should open")
+        .latest_git_analysis()
+        .expect("Git analysis should read")
+        .expect("Git analysis should exist");
+
+    assert_eq!(
+        persisted
+            .file_stats
+            .iter()
+            .map(|stats| stats.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["src/lib.rs"]
+    );
+}
+
+#[test]
 fn explain_git_rejects_paths_outside_worktree_without_leaking_absolute_paths() {
     let fixture = GitFixture::new("explain-git-outside-path");
     let author = GitIdentity::new("Path Author", "path@example.invalid");

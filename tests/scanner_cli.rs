@@ -73,6 +73,20 @@ fn successful_stdout(args: &[&str], current_dir: &Path) -> String {
     String::from_utf8(output.stdout).expect("stdout should be UTF-8")
 }
 
+fn failed_stderr(args: &[&str], current_dir: &Path) -> String {
+    let output = hotpath(args, current_dir);
+
+    assert!(
+        !output.status.success(),
+        "hotpath unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+
+    String::from_utf8(output.stderr).expect("stderr should be UTF-8")
+}
+
 fn scan_json(current_dir: &Path) -> (String, Value) {
     let stdout = successful_stdout(&["scan", "--json"], current_dir);
     let value = serde_json::from_str(&stdout).expect("scan JSON should parse");
@@ -623,6 +637,19 @@ fn scan_summary_and_default_cli_report_concise_totals() {
             "  Rust        1\n",
         )
     );
+}
+
+#[test]
+fn scan_rejects_conflicting_output_flags_before_persisting() {
+    let fixture = Fixture::new("conflicting-flags");
+    fixture.write("src/lib.rs", "fn lib() {}\n");
+
+    let stderr = failed_stderr(&["scan", "--summary", "--json"], &fixture.path);
+
+    assert!(stderr.contains("cannot be used with"));
+    assert!(stderr.contains("--summary"));
+    assert!(stderr.contains("--json"));
+    assert!(!fixture.path.join(".hotpath").exists());
 }
 
 #[test]
