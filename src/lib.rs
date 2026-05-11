@@ -14,6 +14,7 @@ use serde::Serialize;
 #[cfg(test)]
 const BINARY_SAMPLE_BYTES: usize = 8 * 1024;
 const MAX_TEXT_READ_BYTES: u64 = 8 * 1024 * 1024;
+const SCAN_SCHEMA_VERSION: &str = "hotpath.scan.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -45,6 +46,36 @@ pub struct FileRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContentSummary {
+    pub text_files: u64,
+    pub binary_files: u64,
+    pub unknown_files: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FlagSummary {
+    pub generated_files: u64,
+    pub vendor_files: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WarningSummary {
+    pub total_warnings: u64,
+    pub unreadable_warnings: u64,
+    pub skipped_warnings: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScanSummary {
+    pub total_files: u64,
+    pub total_bytes: u64,
+    pub content: ContentSummary,
+    pub flags: FlagSummary,
+    pub warnings: WarningSummary,
+    pub languages: BTreeMap<&'static str, u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ScanReport {
     pub status: &'static str,
     pub file_walking: &'static str,
@@ -61,6 +92,71 @@ impl ScanReport {
             files,
         }
     }
+
+    fn summary(&self) -> ScanSummary {
+        let mut summary = ScanSummary {
+            total_files: self.files.len() as u64,
+            total_bytes: 0,
+            content: ContentSummary {
+                text_files: 0,
+                binary_files: 0,
+                unknown_files: 0,
+            },
+            flags: FlagSummary {
+                generated_files: 0,
+                vendor_files: 0,
+            },
+            warnings: WarningSummary {
+                total_warnings: 0,
+                unreadable_warnings: 0,
+                skipped_warnings: 0,
+            },
+            languages: BTreeMap::new(),
+        };
+
+        for file in &self.files {
+            summary.total_bytes += file.byte_size.unwrap_or(0);
+
+            match file.content {
+                ContentKind::Text => summary.content.text_files += 1,
+                ContentKind::Binary => summary.content.binary_files += 1,
+                ContentKind::Unknown => summary.content.unknown_files += 1,
+            }
+
+            if file.is_generated {
+                summary.flags.generated_files += 1;
+            }
+
+            if file.is_vendor {
+                summary.flags.vendor_files += 1;
+            }
+
+            if let Some(language) = file.language {
+                *summary.languages.entry(language).or_insert(0) += 1;
+            }
+
+            for warning in &file.warnings {
+                summary.warnings.total_warnings += 1;
+
+                if is_unreadable_warning(warning.code) {
+                    summary.warnings.unreadable_warnings += 1;
+                }
+
+                if is_skipped_warning(warning.code) {
+                    summary.warnings.skipped_warnings += 1;
+                }
+            }
+        }
+
+        summary
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ScanJsonReport<'a> {
+    schema_version: &'static str,
+    summary: ScanSummary,
+    files: &'a [FileRecord],
 }
 
 #[derive(Debug)]
@@ -166,7 +262,15 @@ pub fn scan_summary() -> Result<String, ScanError> {
 }
 
 pub fn scan_json() -> Result<String, ScanError> {
-    Ok(serde_json::to_string_pretty(&scan_current_dir()?)?)
+    render_json(&scan_current_dir()?)
+}
+
+fn render_json(scan: &ScanReport) -> Result<String, ScanError> {
+    Ok(serde_json::to_string_pretty(&ScanJsonReport {
+        schema_version: SCAN_SCHEMA_VERSION,
+        summary: scan.summary(),
+        files: &scan.files,
+    })?)
 }
 
 fn is_git_entry(entry: &DirEntry) -> bool {
@@ -401,75 +505,34 @@ fn normalized_components(path: &str) -> impl Iterator<Item = &str> {
 }
 
 fn render_summary(scan: &ScanReport) -> String {
-    let mut total_bytes = 0;
-    let mut text_files = 0;
-    let mut binary_files = 0;
-    let mut unknown_files = 0;
-    let mut generated_files = 0;
-    let mut vendor_files = 0;
-    let mut warning_count = 0;
-    let mut unreadable_count = 0;
-    let mut skipped_count = 0;
-    let mut languages = BTreeMap::new();
-
-    for file in &scan.files {
-        total_bytes += file.byte_size.unwrap_or(0);
-
-        match file.content {
-            ContentKind::Text => text_files += 1,
-            ContentKind::Binary => binary_files += 1,
-            ContentKind::Unknown => unknown_files += 1,
-        }
-
-        if file.is_generated {
-            generated_files += 1;
-        }
-
-        if file.is_vendor {
-            vendor_files += 1;
-        }
-
-        if let Some(language) = file.language {
-            *languages.entry(language).or_insert(0) += 1;
-        }
-
-        for warning in &file.warnings {
-            warning_count += 1;
-
-            if is_unreadable_warning(warning.code) {
-                unreadable_count += 1;
-            }
-
-            if is_skipped_warning(warning.code) {
-                skipped_count += 1;
-            }
-        }
-    }
+    let scan_summary = scan.summary();
 
     let mut summary = format!(
         "Hotpath scan summary\ntotal files: {}\ntotal bytes: {}\ncontent: text {}, binary {}, unknown {}\nflags: generated {}, vendor {}",
-        scan.files.len(),
-        total_bytes,
-        text_files,
-        binary_files,
-        unknown_files,
-        generated_files,
-        vendor_files
+        scan_summary.total_files,
+        scan_summary.total_bytes,
+        scan_summary.content.text_files,
+        scan_summary.content.binary_files,
+        scan_summary.content.unknown_files,
+        scan_summary.flags.generated_files,
+        scan_summary.flags.vendor_files
     );
 
-    if warning_count > 0 {
+    if scan_summary.warnings.total_warnings > 0 {
         summary.push_str(&format!(
             "\nwarnings: {} (unreadable {}, skipped {})",
-            warning_count, unreadable_count, skipped_count
+            scan_summary.warnings.total_warnings,
+            scan_summary.warnings.unreadable_warnings,
+            scan_summary.warnings.skipped_warnings
         ));
     }
 
     summary.push_str("\nlanguages:");
 
-    if languages.is_empty() {
+    if scan_summary.languages.is_empty() {
         summary.push_str("\n  none");
     } else {
-        for (language, count) in languages {
+        for (language, count) in scan_summary.languages {
             summary.push_str(&format!("\n  {language}: {count}"));
         }
     }
@@ -581,6 +644,12 @@ mod tests {
             .into_iter()
             .find(|record| record.path == path)
             .unwrap_or_else(|| panic!("expected scan record for {path}"))
+    }
+
+    fn json_value(scan: &ScanReport) -> serde_json::Value {
+        let json = render_json(scan).expect("json should render");
+
+        serde_json::from_str(&json).expect("json should parse")
     }
 
     fn record(
@@ -959,7 +1028,65 @@ mod tests {
     }
 
     #[test]
-    fn json_reports_file_records() {
+    fn json_reports_schema_version_and_summary_totals() {
+        let mut generated = record(
+            "dist/app.generated.js",
+            Some(30),
+            Some("JavaScript"),
+            ContentKind::Text,
+        );
+        generated.is_generated = true;
+        let mut vendor = record("vendor/blob.bin", Some(5), None, ContentKind::Binary);
+        vendor.is_vendor = true;
+        let mut unknown = record("notes.txt", None, None, ContentKind::Unknown);
+        unknown.warnings.push(file_warning(
+            "read_failed",
+            "failed to open file contents: denied".to_owned(),
+        ));
+
+        let value = json_value(&ScanReport::from_files(vec![
+            record("src/lib.rs", Some(10), Some("Rust"), ContentKind::Text),
+            generated,
+            vendor,
+            unknown,
+        ]));
+
+        assert_eq!(value["schema_version"], "hotpath.scan.v1");
+        assert_eq!(value["summary"]["total_files"], 4);
+        assert_eq!(value["summary"]["total_bytes"], 45);
+        assert_eq!(value["summary"]["content"]["text_files"], 2);
+        assert_eq!(value["summary"]["content"]["binary_files"], 1);
+        assert_eq!(value["summary"]["content"]["unknown_files"], 1);
+        assert_eq!(value["summary"]["flags"]["generated_files"], 1);
+        assert_eq!(value["summary"]["flags"]["vendor_files"], 1);
+        assert_eq!(value["summary"]["warnings"]["total_warnings"], 1);
+        assert_eq!(value["summary"]["warnings"]["unreadable_warnings"], 1);
+        assert_eq!(value["summary"]["warnings"]["skipped_warnings"], 0);
+        assert_eq!(value["summary"]["languages"]["JavaScript"], 1);
+        assert_eq!(value["summary"]["languages"]["Rust"], 1);
+    }
+
+    #[test]
+    fn json_preserves_stable_file_order_from_scan() {
+        let fixture = Fixture::new("json-file-order");
+        fixture.write("z.rs", "");
+        fixture.write(Path::new("nested").join("m.rs"), "");
+        fixture.write("a.rs", "");
+
+        let report = scan_repository(&fixture.path).expect("fixture scan should succeed");
+        let value = json_value(&report);
+        let paths = value["files"]
+            .as_array()
+            .expect("files should be an array")
+            .iter()
+            .map(|file| file["path"].as_str().expect("path should be a string"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, vec!["a.rs", "nested/m.rs", "z.rs"]);
+    }
+
+    #[test]
+    fn json_reports_stable_file_fields() {
         let report = ScanReport::from_files(vec![FileRecord {
             path: "src/lib.rs".to_owned(),
             byte_size: Some(10),
@@ -973,11 +1100,26 @@ mod tests {
             classification: "implemented",
             warnings: Vec::new(),
         }]);
-        let json = serde_json::to_string_pretty(&report).expect("json should render");
+        let json = render_json(&report).expect("json should render");
 
         assert_eq!(
             json,
-            "{\n  \"status\": \"ok\",\n  \"file_walking\": \"implemented\",\n  \"classification\": \"implemented\",\n  \"files\": [\n    {\n      \"path\": \"src/lib.rs\",\n      \"byte_size\": 10,\n      \"extension\": \"rs\",\n      \"language\": \"Rust\",\n      \"line_count\": 1,\n      \"is_vendor\": false,\n      \"is_generated\": false,\n      \"content\": \"text\",\n      \"is_symlink\": false,\n      \"classification\": \"implemented\",\n      \"warnings\": []\n    }\n  ]\n}"
+            "{\n  \"schema_version\": \"hotpath.scan.v1\",\n  \"summary\": {\n    \"total_files\": 1,\n    \"total_bytes\": 10,\n    \"content\": {\n      \"text_files\": 1,\n      \"binary_files\": 0,\n      \"unknown_files\": 0\n    },\n    \"flags\": {\n      \"generated_files\": 0,\n      \"vendor_files\": 0\n    },\n    \"warnings\": {\n      \"total_warnings\": 0,\n      \"unreadable_warnings\": 0,\n      \"skipped_warnings\": 0\n    },\n    \"languages\": {\n      \"Rust\": 1\n    }\n  },\n  \"files\": [\n    {\n      \"path\": \"src/lib.rs\",\n      \"byte_size\": 10,\n      \"extension\": \"rs\",\n      \"language\": \"Rust\",\n      \"line_count\": 1,\n      \"is_vendor\": false,\n      \"is_generated\": false,\n      \"content\": \"text\",\n      \"is_symlink\": false,\n      \"classification\": \"implemented\",\n      \"warnings\": []\n    }\n  ]\n}"
         );
+    }
+
+    #[test]
+    fn json_reports_stable_warning_fields() {
+        let mut unreadable = record("notes.txt", None, None, ContentKind::Unknown);
+        unreadable.warnings.push(file_warning(
+            "read_failed",
+            "failed to open file contents: denied".to_owned(),
+        ));
+
+        let value = json_value(&ScanReport::from_files(vec![unreadable]));
+        let warning = &value["files"][0]["warnings"][0];
+
+        assert_eq!(warning["code"], "read_failed");
+        assert_eq!(warning["message"], "failed to open file contents: denied");
     }
 }
