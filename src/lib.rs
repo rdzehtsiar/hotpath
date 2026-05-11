@@ -12,6 +12,7 @@ use ignore::{DirEntry, Error as IgnoreError, WalkBuilder};
 use serde::Serialize;
 
 pub mod git;
+pub mod scoring;
 pub mod storage;
 
 #[cfg(test)]
