@@ -79,6 +79,11 @@ Repositories with unusual encodings, large generated trees, vendored source,
 submodules, symlinks, rewritten history, or nonstandard build layouts may
 produce incomplete or approximate results.
 
+Git history metrics require a readable local Git worktree with a commit at
+`HEAD` and complete local history. Non-Git directories, repositories without an
+initial commit, bare repositories, and shallow clones are reported as
+unsupported instead of producing partial metrics.
+
 ## Privacy And Environment Limits
 
 The core workflow should be offline and local-first, with no telemetry by

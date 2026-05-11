@@ -478,6 +478,29 @@ fn git_history_errors_when_head_has_no_commit() {
     assert!(error.to_string().contains("does not have a commit at HEAD"));
 }
 
+#[test]
+fn git_history_errors_when_repository_is_shallow() {
+    let fixture = GitFixture::new("shallow-history");
+    let author = GitIdentity::new("Shallow Author", "shallow@example.invalid");
+
+    fixture.write("src/lib.rs", "pub fn lib() {}\n");
+    let commit = fixture.commit(CommitOptions::new(
+        "Add library",
+        author,
+        "2024-01-01T00:00:00 +0000",
+    ));
+    fs::write(
+        fixture.path().join(".git").join("shallow"),
+        format!("{commit}\n"),
+    )
+    .expect("shallow marker should be written");
+
+    let error = file_changes_from_head(fixture.path()).expect_err("shallow history should fail");
+
+    assert!(matches!(error, GitHistoryError::ShallowRepository { .. }));
+    assert!(error.to_string().contains("shallow history"));
+}
+
 fn change_summary(changes: &[GitFileChange]) -> Vec<ChangeSummary<'_>> {
     changes
         .iter()

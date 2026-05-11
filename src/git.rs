@@ -125,6 +125,9 @@ pub enum GitHistoryError {
     MissingHead {
         path: PathBuf,
     },
+    ShallowRepository {
+        path: PathBuf,
+    },
     BareRepository {
         path: PathBuf,
     },
@@ -158,30 +161,29 @@ pub enum GitExplainError {
 impl fmt::Display for GitHistoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotRepository { path, source } => write!(
+            Self::NotRepository { .. } => write!(
                 f,
-                "failed to open Git repository from '{}': path is not a readable Git worktree ({source})",
-                path.display()
+                "path is not a readable Git worktree; run explain-git from inside a repository with local history"
             ),
-            Self::OpenRepository { path, source } => write!(
+            Self::OpenRepository { .. } => write!(
                 f,
-                "failed to open Git repository from '{}': {source}",
-                path.display()
+                "failed to open Git repository from the current worktree; ensure local Git metadata is readable"
             ),
-            Self::MissingHead { path } => write!(
+            Self::MissingHead { .. } => write!(
                 f,
-                "Git repository at '{}' does not have a commit at HEAD; create an initial commit before analyzing history",
-                path.display()
+                "Git repository does not have a commit at HEAD; create an initial commit before analyzing history"
             ),
-            Self::BareRepository { path } => write!(
+            Self::ShallowRepository { .. } => write!(
                 f,
-                "Git repository at '{}' has no worktree; Git analysis requires a local worktree",
-                path.display()
+                "Git repository has shallow history; fetch complete local history before running explain-git so metrics are not based on incomplete commits"
             ),
-            Self::HeadNotCommit { path, source } => write!(
+            Self::BareRepository { .. } => write!(
                 f,
-                "Git HEAD for '{}' does not resolve to a commit: {source}",
-                path.display()
+                "Git repository has no worktree; Git analysis requires a local worktree"
+            ),
+            Self::HeadNotCommit { source, .. } => write!(
+                f,
+                "Git HEAD does not resolve to a commit: {source}"
             ),
             Self::Git { context, source } => {
                 write!(f, "failed to traverse Git history while {context}: {source}")
@@ -206,6 +208,7 @@ impl StdError for GitHistoryError {
             | Self::HeadNotCommit { source, .. }
             | Self::Git { source, .. } => Some(source),
             Self::MissingHead { .. }
+            | Self::ShallowRepository { .. }
             | Self::BareRepository { .. }
             | Self::UnsupportedAuthorIdentity { .. }
             | Self::UnsupportedPathEncoding { .. } => None,
@@ -263,6 +266,7 @@ pub fn file_changes_from_head(
 ) -> Result<Vec<GitFileChange>, GitHistoryError> {
     let worktree_path = worktree_path.as_ref();
     let repository = open_repository(worktree_path)?;
+    reject_shallow_repository(&repository, worktree_path)?;
     let head_commit = head_commit(&repository, worktree_path)?;
 
     file_changes_from_repository(&repository, head_commit.id())
@@ -274,6 +278,7 @@ pub fn analyze_from_head_at(
 ) -> Result<GitAnalysis, GitHistoryError> {
     let worktree_path = worktree_path.as_ref();
     let repository = open_repository(worktree_path)?;
+    reject_shallow_repository(&repository, worktree_path)?;
     let head_commit = head_commit(&repository, worktree_path)?;
     let head_commit_id = head_commit.id();
     let head_commit_time = head_commit.time().seconds();
@@ -536,6 +541,19 @@ fn open_repository(worktree_path: &Path) -> Result<Repository, GitHistoryError> 
             }
         }
     })
+}
+
+fn reject_shallow_repository(
+    repository: &Repository,
+    worktree_path: &Path,
+) -> Result<(), GitHistoryError> {
+    if repository.is_shallow() {
+        Err(GitHistoryError::ShallowRepository {
+            path: worktree_path.to_path_buf(),
+        })
+    } else {
+        Ok(())
+    }
 }
 
 fn head_commit<'repo>(

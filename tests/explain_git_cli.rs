@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hotpath::storage::index::IndexStore;
 
 mod support;
 
 use support::git::{CommitOptions, GitFixture, GitIdentity};
+
+static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
 fn hotpath(args: &[&str], current_dir: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_hotpath"))
@@ -29,6 +33,20 @@ fn successful_stdout(args: &[&str], current_dir: &Path) -> String {
     );
 
     String::from_utf8(output.stdout).expect("stdout should be UTF-8")
+}
+
+fn failed_stderr(args: &[&str], current_dir: &Path) -> String {
+    let output = hotpath(args, current_dir);
+
+    assert!(
+        !output.status.success(),
+        "hotpath unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+
+    String::from_utf8(output.stderr).expect("stderr should be UTF-8")
 }
 
 #[test]
@@ -223,6 +241,60 @@ fn explain_git_rejects_paths_outside_worktree_without_leaking_absolute_paths() {
     assert!(!contains_path(&stderr, fixture.path()));
 }
 
+#[test]
+fn explain_git_rejects_non_git_directory_without_metric_output_or_path_leak() {
+    let fixture = TempDir::new("explain-git-non-git");
+    fixture.write("src/lib.rs", "pub fn lib() {}\n");
+
+    let stderr = failed_stderr(&["explain-git", "src/lib.rs"], fixture.path());
+
+    assert!(stderr.starts_with("hotpath: path is not a readable Git worktree"));
+    assert!(!stderr.contains("raw metrics"));
+    assert!(!contains_path(&stderr, fixture.path()));
+    assert!(!fixture.path().join(".hotpath").exists());
+}
+
+#[test]
+fn explain_git_rejects_missing_head_without_metric_output_or_path_leak() {
+    let fixture = GitFixture::new("explain-git-missing-head");
+    fixture.write("src/lib.rs", "pub fn lib() {}\n");
+
+    let stderr = failed_stderr(&["explain-git", "src/lib.rs"], fixture.path());
+
+    assert!(stderr.starts_with("hotpath: Git repository does not have a commit at HEAD"));
+    assert!(stderr.contains("create an initial commit before analyzing history"));
+    assert!(!stderr.contains("raw metrics"));
+    assert!(!contains_path(&stderr, fixture.path()));
+    assert!(!fixture.path().join(".hotpath").exists());
+}
+
+#[test]
+fn explain_git_rejects_shallow_repository_before_output_or_persistence() {
+    let fixture = GitFixture::new("explain-git-shallow");
+    let author = GitIdentity::new("Shallow Author", "shallow@example.invalid");
+
+    fixture.write("src/lib.rs", "pub fn lib() {}\n");
+    let commit = fixture.commit(CommitOptions::new(
+        "Add library",
+        author,
+        "2024-02-01T00:00:00 +0000",
+    ));
+    fs::write(
+        fixture.path().join(".git").join("shallow"),
+        format!("{commit}\n"),
+    )
+    .expect("shallow marker should be written");
+
+    let stderr = failed_stderr(&["explain-git", "src/lib.rs"], fixture.path());
+
+    assert!(stderr.starts_with("hotpath: Git repository has shallow history"));
+    assert!(stderr.contains("fetch complete local history"));
+    assert!(!stderr.contains("Hotpath Git explanation"));
+    assert!(!stderr.contains("raw metrics"));
+    assert!(!contains_path(&stderr, fixture.path()));
+    assert!(!fixture.path().join(".hotpath").exists());
+}
+
 fn contains_path(output: &str, path: &Path) -> bool {
     let path = path.display().to_string();
     let without_verbatim_prefix = path
@@ -239,6 +311,49 @@ fn contains_path(output: &str, path: &Path) -> bool {
         .iter()
         .filter(|candidate| !candidate.is_empty())
         .any(|candidate| output.contains(candidate))
+}
+
+#[derive(Debug)]
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(name: &str) -> Self {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::current_dir()
+            .expect("test should have a current directory")
+            .join("target")
+            .join("explain-git-cli-tests")
+            .join(format!("{name}-{}-{id}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("temporary directory should be created");
+        fs::write(path.join(".git"), "not a gitdir\n")
+            .expect("invalid git marker should be written");
+
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn write(&self, relative_path: impl AsRef<Path>, contents: &str) {
+        let path = self.path.join(relative_path);
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("temporary parent should be created");
+        }
+
+        fs::write(path, contents).expect("temporary file should be written");
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }
 
 fn persisted_git_analysis_contains_path(

@@ -15,6 +15,11 @@ By default, Git metrics use local repository history reachable from `HEAD`.
 Hotpath should not call GitHub, another hosted Git provider, telemetry, or cloud
 APIs to calculate these metrics.
 
+Repositories with shallow local history are rejected before metrics are
+rendered or persisted. The current implementation does not estimate missing
+commit history from a shallow clone because that would make churn, ownership,
+age, and co-change metrics misleading.
+
 The reference time for time-windowed metrics is the `HEAD` commit's committer
 timestamp from the local Git history, not the machine's current wall-clock time.
 This keeps results reproducible for the same repository state. Elsewhere on
