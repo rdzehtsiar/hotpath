@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::fmt;
@@ -400,20 +401,91 @@ fn normalized_components(path: &str) -> impl Iterator<Item = &str> {
 }
 
 fn render_summary(scan: &ScanReport) -> String {
-    let mut summary = format!(
-        "Hotpath scan summary\nstatus: {}\nfile walking: {}\nclassification: {}\nfiles: {}",
-        scan.status,
-        scan.file_walking,
-        scan.classification,
-        scan.files.len()
-    );
+    let mut total_bytes = 0;
+    let mut text_files = 0;
+    let mut binary_files = 0;
+    let mut unknown_files = 0;
+    let mut generated_files = 0;
+    let mut vendor_files = 0;
+    let mut warning_count = 0;
+    let mut unreadable_count = 0;
+    let mut skipped_count = 0;
+    let mut languages = BTreeMap::new();
 
     for file in &scan.files {
-        summary.push_str("\n- ");
-        summary.push_str(&file.path);
+        total_bytes += file.byte_size.unwrap_or(0);
+
+        match file.content {
+            ContentKind::Text => text_files += 1,
+            ContentKind::Binary => binary_files += 1,
+            ContentKind::Unknown => unknown_files += 1,
+        }
+
+        if file.is_generated {
+            generated_files += 1;
+        }
+
+        if file.is_vendor {
+            vendor_files += 1;
+        }
+
+        if let Some(language) = file.language {
+            *languages.entry(language).or_insert(0) += 1;
+        }
+
+        for warning in &file.warnings {
+            warning_count += 1;
+
+            if is_unreadable_warning(warning.code) {
+                unreadable_count += 1;
+            }
+
+            if is_skipped_warning(warning.code) {
+                skipped_count += 1;
+            }
+        }
+    }
+
+    let mut summary = format!(
+        "Hotpath scan summary\ntotal files: {}\ntotal bytes: {}\ncontent: text {}, binary {}, unknown {}\nflags: generated {}, vendor {}",
+        scan.files.len(),
+        total_bytes,
+        text_files,
+        binary_files,
+        unknown_files,
+        generated_files,
+        vendor_files
+    );
+
+    if warning_count > 0 {
+        summary.push_str(&format!(
+            "\nwarnings: {} (unreadable {}, skipped {})",
+            warning_count, unreadable_count, skipped_count
+        ));
+    }
+
+    summary.push_str("\nlanguages:");
+
+    if languages.is_empty() {
+        summary.push_str("\n  none");
+    } else {
+        for (language, count) in languages {
+            summary.push_str(&format!("\n  {language}: {count}"));
+        }
     }
 
     summary
+}
+
+fn is_unreadable_warning(code: &str) -> bool {
+    matches!(
+        code,
+        "metadata_failed" | "read_failed" | "symlink_target_unreadable"
+    )
+}
+
+fn is_skipped_warning(code: &str) -> bool {
+    matches!(code, "line_count_skipped" | "symlink_target_outside_root")
 }
 
 fn normalized_relative_path(root: &Path, path: &Path) -> Result<String, ScanError> {
@@ -509,6 +581,27 @@ mod tests {
             .into_iter()
             .find(|record| record.path == path)
             .unwrap_or_else(|| panic!("expected scan record for {path}"))
+    }
+
+    fn record(
+        path: &str,
+        byte_size: Option<u64>,
+        language: Option<&'static str>,
+        content: ContentKind,
+    ) -> FileRecord {
+        FileRecord {
+            path: path.to_owned(),
+            byte_size,
+            extension: file_extension(path),
+            language,
+            line_count: None,
+            is_vendor: false,
+            is_generated: false,
+            content,
+            is_symlink: false,
+            classification: "implemented",
+            warnings: Vec::new(),
+        }
     }
 
     #[cfg(unix)]
@@ -794,26 +887,75 @@ mod tests {
     }
 
     #[test]
-    fn summary_reports_current_scan_boundaries() {
-        let scan = ScanReport::from_files(vec![FileRecord {
-            path: "src/lib.rs".to_owned(),
-            byte_size: Some(10),
-            extension: Some("rs".to_owned()),
-            language: Some("Rust"),
-            line_count: Some(1),
-            is_vendor: false,
-            is_generated: false,
-            content: ContentKind::Text,
-            is_symlink: false,
-            classification: "implemented",
-            warnings: Vec::new(),
-        }]);
+    fn summary_reports_concise_totals() {
+        let mut generated = record(
+            "dist/app.generated.js",
+            Some(30),
+            Some("JavaScript"),
+            ContentKind::Text,
+        );
+        generated.is_generated = true;
+        let mut vendor = record("vendor/blob.bin", Some(5), None, ContentKind::Binary);
+        vendor.is_vendor = true;
+        let mut unknown = record("notes.txt", None, None, ContentKind::Unknown);
+        unknown.warnings.push(file_warning(
+            "read_failed",
+            "failed to open file contents: denied".to_owned(),
+        ));
+
+        let scan = ScanReport::from_files(vec![
+            record("src/lib.rs", Some(10), Some("Rust"), ContentKind::Text),
+            generated,
+            vendor,
+            unknown,
+        ]);
         let summary = render_summary(&scan);
 
-        assert!(summary.contains("status: ok"));
-        assert!(summary.contains("file walking: implemented"));
-        assert!(summary.contains("classification: implemented"));
-        assert!(summary.contains("- src/lib.rs"));
+        assert_eq!(
+            summary,
+            "Hotpath scan summary\ntotal files: 4\ntotal bytes: 45\ncontent: text 2, binary 1, unknown 1\nflags: generated 1, vendor 1\nwarnings: 1 (unreadable 1, skipped 0)\nlanguages:\n  JavaScript: 1\n  Rust: 1"
+        );
+    }
+
+    #[test]
+    fn summary_omits_warning_line_when_no_warnings_are_present() {
+        let scan = ScanReport::from_files(vec![record(
+            "src/lib.rs",
+            Some(10),
+            Some("Rust"),
+            ContentKind::Text,
+        )]);
+
+        let summary = render_summary(&scan);
+
+        assert!(!summary.contains("warnings:"));
+    }
+
+    #[test]
+    fn summary_reports_empty_language_counts_explicitly() {
+        let scan = ScanReport::from_files(vec![record(
+            "blob.bin",
+            Some(10),
+            None,
+            ContentKind::Binary,
+        )]);
+
+        let summary = render_summary(&scan);
+
+        assert!(summary.ends_with("languages:\n  none"));
+    }
+
+    #[test]
+    fn summary_reports_skipped_warning_counts() {
+        let mut skipped = record("large.txt", Some(10), None, ContentKind::Text);
+        skipped.warnings.push(file_warning(
+            "line_count_skipped",
+            "file is larger than the safe text read limit".to_owned(),
+        ));
+
+        let summary = render_summary(&ScanReport::from_files(vec![skipped]));
+
+        assert!(summary.contains("warnings: 1 (unreadable 0, skipped 1)"));
     }
 
     #[test]
