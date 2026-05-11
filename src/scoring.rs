@@ -13,6 +13,40 @@ const CHURN_LINE_SATURATION: u64 = 2_000;
 const RECENT_GROWTH_SATURATION: f64 = 1.0;
 const AUTHOR_FRAGMENTATION_SATURATION: u64 = 5;
 const CO_CHANGED_FILE_SATURATION: u64 = 25;
+const INITIAL_RISK_FORMULA_TERMS: [RiskFormulaTerm; 5] = [
+    RiskFormulaTerm {
+        name: "churn_score",
+        metric: NormalizedMetric::Churn,
+        weight: 0.35,
+    },
+    RiskFormulaTerm {
+        name: "size_score",
+        metric: NormalizedMetric::Size,
+        weight: 0.20,
+    },
+    RiskFormulaTerm {
+        name: "author_fragmentation",
+        metric: NormalizedMetric::Ownership,
+        weight: 0.20,
+    },
+    RiskFormulaTerm {
+        name: "recent_growth",
+        metric: NormalizedMetric::RecentChurn,
+        weight: 0.15,
+    },
+    RiskFormulaTerm {
+        name: "cochange_score",
+        metric: NormalizedMetric::Coupling,
+        weight: 0.10,
+    },
+];
+
+#[derive(Debug, Clone, Copy)]
+struct RiskFormulaTerm {
+    name: &'static str,
+    metric: NormalizedMetric,
+    weight: f64,
+}
 
 /// Version identity for a hotspot score formula.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -90,8 +124,14 @@ pub struct WeightedTerm {
     pub name: String,
     /// Normalized metric consumed by this term.
     pub metric: NormalizedMetric,
+    /// Exact formula version that assigned this term weight.
+    pub formula_version: FormulaVersion,
     /// Formula weight assigned to this term.
     pub weight: f64,
+    /// Normalized input consumed by this term, when available.
+    pub normalized_input: Option<f64>,
+    /// Weight multiplied by the normalized input, or `0.0` when input is unavailable.
+    pub weighted_contribution: f64,
 }
 
 /// Named normalized metrics that can participate in a score formula.
@@ -135,6 +175,33 @@ pub struct HotspotScore {
     pub normalized_metrics: NormalizedScoreMetrics,
     /// Known limitations and approximations for this score.
     pub limitations: Vec<ScoreLimitation>,
+}
+
+/// Calculate the initial advisory hotspot risk score for one path.
+///
+/// Missing normalized inputs contribute `0.0` for their fixed-weight terms.
+/// Weights are never redistributed across available inputs; omissions remain
+/// visible through normalization limitations.
+pub fn calculate_hotspot_score(raw_metrics: RawScoreMetrics) -> HotspotScore {
+    let path = raw_metrics.path.clone();
+    let normalization = normalize_score_metrics(&raw_metrics);
+    let normalized_metrics = normalization.normalized_metrics;
+    let formula_version = FormulaVersion::current();
+    let weighted_terms = weighted_risk_terms(&formula_version, &normalized_metrics);
+    let value = weighted_terms
+        .iter()
+        .map(|term| term.weighted_contribution)
+        .sum();
+
+    HotspotScore {
+        path,
+        value,
+        formula_version,
+        weighted_terms,
+        raw_metrics,
+        normalized_metrics,
+        limitations: normalization.limitations,
+    }
 }
 
 /// Convert raw facts into bounded normalized score inputs.
@@ -327,6 +394,40 @@ fn normalize_count(
     }
 }
 
+fn weighted_risk_terms(
+    formula_version: &FormulaVersion,
+    normalized_metrics: &NormalizedScoreMetrics,
+) -> Vec<WeightedTerm> {
+    INITIAL_RISK_FORMULA_TERMS
+        .iter()
+        .map(|term| {
+            let normalized_input = normalized_metric_value(normalized_metrics, term.metric);
+
+            WeightedTerm {
+                name: term.name.to_owned(),
+                metric: term.metric,
+                formula_version: formula_version.clone(),
+                weight: term.weight,
+                normalized_input,
+                weighted_contribution: normalized_input.unwrap_or(0.0) * term.weight,
+            }
+        })
+        .collect()
+}
+
+fn normalized_metric_value(
+    normalized_metrics: &NormalizedScoreMetrics,
+    metric: NormalizedMetric,
+) -> Option<f64> {
+    match metric {
+        NormalizedMetric::Size => normalized_metrics.size,
+        NormalizedMetric::Churn => normalized_metrics.churn,
+        NormalizedMetric::RecentChurn => normalized_metrics.recent_churn,
+        NormalizedMetric::Ownership => normalized_metrics.ownership,
+        NormalizedMetric::Coupling => normalized_metrics.coupling,
+    }
+}
+
 fn saturating_author_fragmentation(author_count: u64) -> f64 {
     saturating_ratio(
         author_count.saturating_sub(1),
@@ -386,12 +487,18 @@ mod tests {
             WeightedTerm {
                 name: "churn".to_owned(),
                 metric: NormalizedMetric::Churn,
+                formula_version: FormulaVersion::current(),
                 weight: 0.4,
+                normalized_input: Some(0.7),
+                weighted_contribution: 0.28,
             },
             WeightedTerm {
                 name: "coupling".to_owned(),
                 metric: NormalizedMetric::Coupling,
+                formula_version: FormulaVersion::current(),
                 weight: 0.2,
+                normalized_input: Some(0.5),
+                weighted_contribution: 0.1,
             },
         ];
         let limitations = vec![ScoreLimitation {
@@ -414,6 +521,129 @@ mod tests {
         assert_eq!(score.raw_metrics, raw_metrics);
         assert_eq!(score.normalized_metrics, normalized_metrics);
         assert_eq!(score.limitations, limitations);
+    }
+
+    #[test]
+    fn calculates_initial_risk_formula_and_preserves_contributions() {
+        let raw_metrics = RawScoreMetrics {
+            path: "src/risk.rs".to_owned(),
+            byte_size: Some(20_000),
+            line_count: Some(400),
+            commits_per_file: Some(10),
+            total_churn_lines: Some(1_000),
+            recent_churn_lines: Some(200),
+            author_count: Some(3),
+            dominant_owner_share: Some(0.5),
+            co_changed_file_count: Some(10),
+        };
+
+        let score = calculate_hotspot_score(raw_metrics.clone());
+
+        assert_eq!(score.path, "src/risk.rs");
+        assert_eq!(score.formula_version, FormulaVersion::current());
+        assert_eq!(score.raw_metrics, raw_metrics);
+        assert_eq!(score.limitations, Vec::new());
+        assert_eq!(
+            score.normalized_metrics,
+            NormalizedScoreMetrics {
+                size: Some(0.4),
+                churn: Some(0.5),
+                recent_churn: Some(0.5),
+                ownership: Some(0.45),
+                coupling: Some(0.4),
+            }
+        );
+        assert_f64_near(score.value, 0.46);
+
+        let expected_terms = [
+            (
+                "churn_score",
+                NormalizedMetric::Churn,
+                0.35,
+                Some(0.5),
+                0.175,
+            ),
+            ("size_score", NormalizedMetric::Size, 0.20, Some(0.4), 0.08),
+            (
+                "author_fragmentation",
+                NormalizedMetric::Ownership,
+                0.20,
+                Some(0.45),
+                0.09,
+            ),
+            (
+                "recent_growth",
+                NormalizedMetric::RecentChurn,
+                0.15,
+                Some(0.5),
+                0.075,
+            ),
+            (
+                "cochange_score",
+                NormalizedMetric::Coupling,
+                0.10,
+                Some(0.4),
+                0.04,
+            ),
+        ];
+
+        assert_eq!(score.weighted_terms.len(), expected_terms.len());
+        for (term, (name, metric, weight, normalized_input, weighted_contribution)) in
+            score.weighted_terms.iter().zip(expected_terms)
+        {
+            assert_eq!(term.name, name);
+            assert_eq!(term.metric, metric);
+            assert_eq!(term.formula_version, score.formula_version);
+            assert_f64_near(term.weight, weight);
+            assert_f64_near(
+                term.normalized_input
+                    .expect("formula term should preserve its normalized input"),
+                normalized_input.expect("expected formula term should include a normalized input"),
+            );
+            assert_f64_near(term.weighted_contribution, weighted_contribution);
+        }
+    }
+
+    #[test]
+    fn missing_score_inputs_keep_fixed_weights_and_existing_limitations() {
+        let score = calculate_hotspot_score(RawScoreMetrics {
+            path: "src/missing.rs".to_owned(),
+            byte_size: None,
+            line_count: None,
+            commits_per_file: None,
+            total_churn_lines: None,
+            recent_churn_lines: None,
+            author_count: None,
+            dominant_owner_share: None,
+            co_changed_file_count: None,
+        });
+
+        assert_eq!(score.value, 0.0);
+        assert_eq!(
+            limitation_codes(&score.limitations),
+            vec![
+                "missing_size_metric",
+                "missing_total_churn_lines",
+                "missing_recent_churn_lines",
+                "missing_author_fragmentation_metrics",
+                "missing_co_changed_file_count",
+            ]
+        );
+        assert!(score
+            .weighted_terms
+            .iter()
+            .all(|term| term.normalized_input.is_none()));
+        assert!(score
+            .weighted_terms
+            .iter()
+            .all(|term| term.weighted_contribution == 0.0));
+
+        let weights = score
+            .weighted_terms
+            .iter()
+            .map(|term| term.weight)
+            .collect::<Vec<_>>();
+        assert_eq!(weights, vec![0.35, 0.20, 0.20, 0.15, 0.10]);
     }
 
     #[test]
@@ -643,8 +873,12 @@ mod tests {
 
     fn assert_near(actual: Option<f64>, expected: f64) {
         let actual = actual.expect("normalized metric should be present");
+        assert_f64_near(actual, expected);
+    }
+
+    fn assert_f64_near(actual: f64, expected: f64) {
         assert!(
-            (actual - expected).abs() < f64::EPSILON,
+            (actual - expected).abs() < 1e-12,
             "expected {actual} to be near {expected}"
         );
     }
