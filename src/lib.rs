@@ -4,15 +4,43 @@ use std::env;
 use std::error::Error;
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use ignore::{DirEntry, WalkBuilder};
 use serde::Serialize;
 
+#[cfg(test)]
+const BINARY_SAMPLE_BYTES: usize = 8 * 1024;
+const MAX_TEXT_READ_BYTES: u64 = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentKind {
+    Text,
+    Binary,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FileWarning {
+    pub code: &'static str,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FileRecord {
     pub path: String,
+    pub byte_size: Option<u64>,
+    pub extension: Option<String>,
+    pub language: Option<&'static str>,
+    pub line_count: Option<u64>,
+    pub is_vendor: bool,
+    pub is_generated: bool,
+    pub content: ContentKind,
+    pub is_symlink: bool,
     pub classification: &'static str,
+    pub warnings: Vec<FileWarning>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -28,7 +56,7 @@ impl ScanReport {
         Self {
             status: "ok",
             file_walking: "implemented",
-            classification: "not_implemented",
+            classification: "implemented",
             files,
         }
     }
@@ -120,17 +148,11 @@ pub fn scan_repository(root: impl AsRef<Path>) -> Result<ScanReport, ScanError> 
     {
         let entry = entry?;
 
-        if !entry
-            .file_type()
-            .is_some_and(|file_type| file_type.is_file())
-        {
+        if !is_walked_file(&entry) {
             continue;
         }
 
-        files.push(FileRecord {
-            path: normalized_relative_path(&root, entry.path())?,
-            classification: "not_implemented",
-        });
+        files.push(classify_file(&root, entry.path())?);
     }
 
     files.sort_by(|left, right| left.path.cmp(&right.path));
@@ -148,6 +170,233 @@ pub fn scan_json() -> Result<String, ScanError> {
 
 fn is_git_entry(entry: &DirEntry) -> bool {
     entry.file_name() == ".git"
+}
+
+fn is_walked_file(entry: &DirEntry) -> bool {
+    entry.file_type().is_some_and(|file_type| {
+        file_type.is_file()
+            || (file_type.is_symlink()
+                && fs::metadata(entry.path())
+                    .map(|metadata| metadata.is_file())
+                    .unwrap_or(true))
+    })
+}
+
+fn classify_file(root: &Path, path: &Path) -> Result<FileRecord, ScanError> {
+    let relative_path = normalized_relative_path(root, path)?;
+    let mut record = FileRecord {
+        byte_size: None,
+        extension: file_extension(&relative_path),
+        language: language_guess(&relative_path),
+        line_count: None,
+        is_vendor: is_vendor_path(&relative_path),
+        is_generated: is_generated_path(&relative_path),
+        content: ContentKind::Unknown,
+        is_symlink: fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false),
+        classification: "implemented",
+        warnings: Vec::new(),
+        path: relative_path,
+    };
+
+    if record.is_symlink {
+        let target = match fs::canonicalize(path) {
+            Ok(target) => target,
+            Err(source) => {
+                record.warnings.push(file_warning(
+                    "symlink_target_unreadable",
+                    format!("failed to canonicalize symlink target: {source}"),
+                ));
+                return Ok(record);
+            }
+        };
+
+        if !target.starts_with(root) {
+            record.warnings.push(file_warning(
+                "symlink_target_outside_root",
+                "symlink target is outside the scan root".to_owned(),
+            ));
+            return Ok(record);
+        }
+    }
+
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) => {
+            record.warnings.push(file_warning(
+                "metadata_failed",
+                format!("failed to read file metadata: {source}"),
+            ));
+            return Ok(record);
+        }
+    };
+
+    record.byte_size = Some(metadata.len());
+
+    classify_content(path, &mut record);
+
+    Ok(record)
+}
+
+fn classify_content(path: &Path, record: &mut FileRecord) {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(source) => {
+            record.warnings.push(file_warning(
+                "read_failed",
+                format!("failed to open file contents: {source}"),
+            ));
+            return;
+        }
+    };
+
+    let mut bytes = Vec::new();
+    let mut bounded = file.take(MAX_TEXT_READ_BYTES.saturating_add(1));
+    if let Err(source) = bounded.read_to_end(&mut bytes) {
+        record.warnings.push(file_warning(
+            "read_failed",
+            format!("failed to read file contents: {source}"),
+        ));
+        return;
+    }
+
+    if bytes.contains(&0) {
+        record.content = ContentKind::Binary;
+        return;
+    }
+
+    let exceeded_read_limit = bytes.len() as u64 > MAX_TEXT_READ_BYTES;
+    if exceeded_read_limit {
+        bytes.truncate(MAX_TEXT_READ_BYTES as usize);
+    }
+
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) => {
+            record.warnings.push(file_warning(
+                "unsupported_encoding",
+                "file contents are not valid UTF-8".to_owned(),
+            ));
+            return;
+        }
+    };
+
+    record.content = ContentKind::Text;
+
+    if exceeded_read_limit {
+        record.warnings.push(file_warning(
+            "line_count_skipped",
+            format!("file is larger than the safe text read limit of {MAX_TEXT_READ_BYTES} bytes"),
+        ));
+        return;
+    }
+
+    record.line_count = Some(count_lines(&text));
+}
+
+fn file_warning(code: &'static str, message: String) -> FileWarning {
+    FileWarning { code, message }
+}
+
+fn count_lines(text: &str) -> u64 {
+    text.lines().count() as u64
+}
+
+fn file_extension(path: &str) -> Option<String> {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+}
+
+fn language_guess(path: &str) -> Option<&'static str> {
+    let extension = file_extension(path);
+    let file_name = Path::new(path)
+        .file_name()
+        .and_then(|file_name| file_name.to_str())?;
+
+    match file_name {
+        "Dockerfile" | "Containerfile" => return Some("Dockerfile"),
+        "Makefile" => return Some("Makefile"),
+        _ => {}
+    }
+
+    match extension.as_deref()? {
+        "bash" | "sh" | "zsh" => Some("Shell"),
+        "c" => Some("C"),
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => Some("C++"),
+        "cs" => Some("C#"),
+        "css" => Some("CSS"),
+        "go" => Some("Go"),
+        "h" => Some("C/C++ Header"),
+        "htm" | "html" => Some("HTML"),
+        "java" => Some("Java"),
+        "js" | "mjs" | "cjs" => Some("JavaScript"),
+        "json" => Some("JSON"),
+        "jsx" => Some("JavaScript JSX"),
+        "kt" | "kts" => Some("Kotlin"),
+        "md" | "markdown" => Some("Markdown"),
+        "php" => Some("PHP"),
+        "proto" => Some("Protocol Buffers"),
+        "ps1" => Some("PowerShell"),
+        "py" => Some("Python"),
+        "rb" => Some("Ruby"),
+        "rs" => Some("Rust"),
+        "scala" => Some("Scala"),
+        "scss" => Some("Sass"),
+        "sql" => Some("SQL"),
+        "swift" => Some("Swift"),
+        "toml" => Some("TOML"),
+        "ts" => Some("TypeScript"),
+        "tsx" => Some("TypeScript JSX"),
+        "xml" => Some("XML"),
+        "yaml" | "yml" => Some("YAML"),
+        _ => None,
+    }
+}
+
+fn is_vendor_path(path: &str) -> bool {
+    normalized_components(path).any(|component| {
+        matches_case_insensitive(
+            component,
+            &[
+                "node_modules",
+                "vendor",
+                "third_party",
+                "third-party",
+                "external",
+            ],
+        )
+    })
+}
+
+fn is_generated_path(path: &str) -> bool {
+    let file_name = Path::new(path)
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    normalized_components(path).any(|component| {
+        matches_case_insensitive(component, &["generated", "gen", "codegen", "dist", "build"])
+    }) || file_name.contains(".generated.")
+        || file_name.contains(".gen.")
+        || file_name.ends_with(".pb.go")
+        || file_name.ends_with(".pb.rs")
+        || file_name.ends_with(".g.cs")
+}
+
+fn matches_case_insensitive(value: &str, candidates: &[&str]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| value.eq_ignore_ascii_case(candidate))
+}
+
+fn normalized_components(path: &str) -> impl Iterator<Item = &str> {
+    path.split('/')
+        .filter(|component| !component.is_empty())
+        .map(|component| component.trim())
 }
 
 fn render_summary(scan: &ScanReport) -> String {
@@ -222,6 +471,16 @@ mod tests {
 
             fs::write(path, contents).expect("fixture file should be written");
         }
+
+        fn write_bytes(&self, relative_path: impl AsRef<Path>, contents: &[u8]) {
+            let path = self.path.join(relative_path);
+
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("fixture parent should be created");
+            }
+
+            fs::write(path, contents).expect("fixture file should be written");
+        }
     }
 
     impl Drop for Fixture {
@@ -239,6 +498,19 @@ mod tests {
             .collect()
     }
 
+    fn scanned_records(root: &Path) -> Vec<FileRecord> {
+        scan_repository(root)
+            .expect("fixture scan should succeed")
+            .files
+    }
+
+    fn scanned_record(root: &Path, path: &str) -> FileRecord {
+        scanned_records(root)
+            .into_iter()
+            .find(|record| record.path == path)
+            .unwrap_or_else(|| panic!("expected scan record for {path}"))
+    }
+
     #[cfg(unix)]
     fn symlink_dir(original: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<()> {
         std::os::unix::fs::symlink(original, link)
@@ -247,6 +519,16 @@ mod tests {
     #[cfg(windows)]
     fn symlink_dir(original: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<()> {
         std::os::windows::fs::symlink_dir(original, link)
+    }
+
+    #[cfg(unix)]
+    fn symlink_file(original: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<()> {
+        std::os::unix::fs::symlink(original, link)
+    }
+
+    #[cfg(windows)]
+    fn symlink_file(original: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<()> {
+        std::os::windows::fs::symlink_file(original, link)
     }
 
     #[test]
@@ -315,16 +597,222 @@ mod tests {
     }
 
     #[test]
+    fn binary_files_are_classified_without_line_counts() {
+        let fixture = Fixture::new("binary-file");
+        fixture.write_bytes("image.bin", &[0x89, b'P', b'N', b'G', 0, 1, 2, 3]);
+
+        let record = scanned_record(&fixture.path, "image.bin");
+
+        assert_eq!(record.byte_size, Some(8));
+        assert_eq!(record.extension, Some("bin".to_owned()));
+        assert_eq!(record.content, ContentKind::Binary);
+        assert_eq!(record.line_count, None);
+        assert!(record.warnings.is_empty());
+    }
+
+    #[test]
+    fn nul_after_initial_sample_classifies_file_as_binary() {
+        let fixture = Fixture::new("delayed-nul");
+        let mut contents = vec![b'a'; BINARY_SAMPLE_BYTES + 1];
+        contents.push(0);
+        fixture.write_bytes("delayed.bin", &contents);
+
+        let record = scanned_record(&fixture.path, "delayed.bin");
+
+        assert_eq!(record.content, ContentKind::Binary);
+        assert_eq!(record.line_count, None);
+        assert!(record.warnings.is_empty());
+    }
+
+    #[test]
+    fn text_larger_than_read_limit_skips_line_count() {
+        let fixture = Fixture::new("large-text");
+        let contents = vec![b'a'; MAX_TEXT_READ_BYTES as usize + 1];
+        fixture.write_bytes("large.txt", &contents);
+
+        let record = scanned_record(&fixture.path, "large.txt");
+
+        assert_eq!(record.content, ContentKind::Text);
+        assert_eq!(record.line_count, None);
+        assert_eq!(record.warnings.len(), 1);
+        assert_eq!(record.warnings[0].code, "line_count_skipped");
+    }
+
+    #[test]
+    fn utf8_text_files_record_line_counts_and_sizes() {
+        let fixture = Fixture::new("utf8-line-count");
+        fixture.write("src/lib.rs", "fn main() {}\n\n// done\n");
+
+        let record = scanned_record(&fixture.path, "src/lib.rs");
+
+        assert_eq!(record.byte_size, Some(22));
+        assert_eq!(record.extension, Some("rs".to_owned()));
+        assert_eq!(record.language, Some("Rust"));
+        assert_eq!(record.content, ContentKind::Text);
+        assert_eq!(record.line_count, Some(3));
+    }
+
+    #[test]
+    fn invalid_utf8_fallback_does_not_panic_or_count_lines() {
+        let fixture = Fixture::new("invalid-utf8");
+        fixture.write_bytes("bad.txt", &[b'a', 0xff, b'\n']);
+
+        let record = scanned_record(&fixture.path, "bad.txt");
+
+        assert_eq!(record.byte_size, Some(3));
+        assert_eq!(record.extension, Some("txt".to_owned()));
+        assert_eq!(record.content, ContentKind::Unknown);
+        assert_eq!(record.line_count, None);
+        assert_eq!(record.warnings.len(), 1);
+        assert_eq!(record.warnings[0].code, "unsupported_encoding");
+    }
+
+    #[test]
+    fn vendor_and_generated_paths_are_flagged() {
+        let fixture = Fixture::new("vendor-generated");
+        fixture.write("node_modules/pkg/index.js", "");
+        fixture.write("src/api.generated.ts", "");
+        fixture.write("src/handwritten.ts", "");
+
+        let vendor = scanned_record(&fixture.path, "node_modules/pkg/index.js");
+        let generated = scanned_record(&fixture.path, "src/api.generated.ts");
+        let handwritten = scanned_record(&fixture.path, "src/handwritten.ts");
+
+        assert!(vendor.is_vendor);
+        assert!(!vendor.is_generated);
+        assert!(generated.is_generated);
+        assert!(!generated.is_vendor);
+        assert!(!handwritten.is_vendor);
+        assert!(!handwritten.is_generated);
+    }
+
+    #[test]
+    fn vendor_and_generated_component_matching_is_case_insensitive() {
+        let fixture = Fixture::new("cased-vendor-generated");
+        fixture.write("Node_Modules/pkg/index.js", "");
+        fixture.write("Src/CodeGen/api.ts", "");
+
+        let vendor = scanned_record(&fixture.path, "Node_Modules/pkg/index.js");
+        let generated = scanned_record(&fixture.path, "Src/CodeGen/api.ts");
+
+        assert!(vendor.is_vendor);
+        assert!(generated.is_generated);
+    }
+
+    #[test]
+    fn extension_and_language_guesses_are_conservative() {
+        let fixture = Fixture::new("language-guesses");
+        fixture.write("README.md", "");
+        fixture.write("Dockerfile", "");
+        fixture.write("src/view.tsx", "");
+        fixture.write("unknown.hotpath", "");
+
+        let markdown = scanned_record(&fixture.path, "README.md");
+        let dockerfile = scanned_record(&fixture.path, "Dockerfile");
+        let tsx = scanned_record(&fixture.path, "src/view.tsx");
+        let unknown = scanned_record(&fixture.path, "unknown.hotpath");
+
+        assert_eq!(markdown.extension, Some("md".to_owned()));
+        assert_eq!(markdown.language, Some("Markdown"));
+        assert_eq!(dockerfile.extension, None);
+        assert_eq!(dockerfile.language, Some("Dockerfile"));
+        assert_eq!(tsx.extension, Some("tsx".to_owned()));
+        assert_eq!(tsx.language, Some("TypeScript JSX"));
+        assert_eq!(unknown.extension, Some("hotpath".to_owned()));
+        assert_eq!(unknown.language, None);
+    }
+
+    #[test]
+    fn symlinked_files_inside_scan_root_are_classified() {
+        let fixture = Fixture::new("symlinked-file");
+        fixture.write("target.rs", "fn linked() {}\n");
+
+        if symlink_file(
+            fixture.path.join("target.rs"),
+            fixture.path.join("linked.rs"),
+        )
+        .is_err()
+        {
+            return;
+        }
+
+        let record = scanned_record(&fixture.path, "linked.rs");
+
+        assert!(record.is_symlink);
+        assert_eq!(record.language, Some("Rust"));
+        assert_eq!(record.content, ContentKind::Text);
+        assert_eq!(record.line_count, Some(1));
+        assert!(record.warnings.is_empty());
+    }
+
+    #[test]
+    fn symlinked_files_outside_scan_root_are_recorded_without_content() {
+        let fixture = Fixture::new("outside-symlink");
+        let target = Fixture::new("outside-symlink-target");
+        target.write("target.rs", "fn linked() {}\n");
+
+        if symlink_file(
+            target.path.join("target.rs"),
+            fixture.path.join("linked.rs"),
+        )
+        .is_err()
+        {
+            return;
+        }
+
+        let record = scanned_record(&fixture.path, "linked.rs");
+
+        assert!(record.is_symlink);
+        assert_eq!(record.byte_size, None);
+        assert_eq!(record.content, ContentKind::Unknown);
+        assert_eq!(record.line_count, None);
+        assert_eq!(record.warnings.len(), 1);
+        assert_eq!(record.warnings[0].code, "symlink_target_outside_root");
+    }
+
+    #[test]
+    fn unreadable_symlink_targets_are_recorded_without_content() {
+        let fixture = Fixture::new("broken-symlink");
+
+        if symlink_file(
+            fixture.path.join("missing.rs"),
+            fixture.path.join("linked.rs"),
+        )
+        .is_err()
+        {
+            return;
+        }
+
+        let record = scanned_record(&fixture.path, "linked.rs");
+
+        assert!(record.is_symlink);
+        assert_eq!(record.byte_size, None);
+        assert_eq!(record.content, ContentKind::Unknown);
+        assert_eq!(record.line_count, None);
+        assert_eq!(record.warnings.len(), 1);
+        assert_eq!(record.warnings[0].code, "symlink_target_unreadable");
+    }
+
+    #[test]
     fn summary_reports_current_scan_boundaries() {
         let scan = ScanReport::from_files(vec![FileRecord {
             path: "src/lib.rs".to_owned(),
-            classification: "not_implemented",
+            byte_size: Some(10),
+            extension: Some("rs".to_owned()),
+            language: Some("Rust"),
+            line_count: Some(1),
+            is_vendor: false,
+            is_generated: false,
+            content: ContentKind::Text,
+            is_symlink: false,
+            classification: "implemented",
+            warnings: Vec::new(),
         }]);
         let summary = render_summary(&scan);
 
         assert!(summary.contains("status: ok"));
         assert!(summary.contains("file walking: implemented"));
-        assert!(summary.contains("classification: not_implemented"));
+        assert!(summary.contains("classification: implemented"));
         assert!(summary.contains("- src/lib.rs"));
     }
 
@@ -332,13 +820,22 @@ mod tests {
     fn json_reports_file_records() {
         let report = ScanReport::from_files(vec![FileRecord {
             path: "src/lib.rs".to_owned(),
-            classification: "not_implemented",
+            byte_size: Some(10),
+            extension: Some("rs".to_owned()),
+            language: Some("Rust"),
+            line_count: Some(1),
+            is_vendor: false,
+            is_generated: false,
+            content: ContentKind::Text,
+            is_symlink: false,
+            classification: "implemented",
+            warnings: Vec::new(),
         }]);
         let json = serde_json::to_string_pretty(&report).expect("json should render");
 
         assert_eq!(
             json,
-            "{\n  \"status\": \"ok\",\n  \"file_walking\": \"implemented\",\n  \"classification\": \"not_implemented\",\n  \"files\": [\n    {\n      \"path\": \"src/lib.rs\",\n      \"classification\": \"not_implemented\"\n    }\n  ]\n}"
+            "{\n  \"status\": \"ok\",\n  \"file_walking\": \"implemented\",\n  \"classification\": \"implemented\",\n  \"files\": [\n    {\n      \"path\": \"src/lib.rs\",\n      \"byte_size\": 10,\n      \"extension\": \"rs\",\n      \"language\": \"Rust\",\n      \"line_count\": 1,\n      \"is_vendor\": false,\n      \"is_generated\": false,\n      \"content\": \"text\",\n      \"is_symlink\": false,\n      \"classification\": \"implemented\",\n      \"warnings\": []\n    }\n  ]\n}"
         );
     }
 }
