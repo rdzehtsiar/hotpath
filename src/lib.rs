@@ -1043,7 +1043,7 @@ mod tests {
             .expect("blocked directory metadata should be readable")
             .permissions();
         let mut denied_permissions = original_permissions.clone();
-        denied_permissions.set_mode(0);
+        denied_permissions.set_mode(0o0);
         fs::set_permissions(&blocked, denied_permissions)
             .expect("blocked directory permissions should be changed");
 
