@@ -15,6 +15,7 @@ use serde::Serialize;
 const BINARY_SAMPLE_BYTES: usize = 8 * 1024;
 const MAX_TEXT_READ_BYTES: u64 = 8 * 1024 * 1024;
 const SCAN_SCHEMA_VERSION: &str = "hotpath.scan.v1";
+const SUMMARY_LABEL_WIDTH: usize = 12;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NormalizedPath {
@@ -696,12 +697,16 @@ fn render_summary(scan: &ScanReport) -> String {
     let scan_summary = scan.summary();
 
     let mut summary = format!(
-        "Hotpath scan summary\ntotal files: {}\ntotal bytes: {}\ncontent: text {}, binary {}, unknown {}\nflags: generated {}, vendor {}",
+        "Hotpath scan summary\n{:<SUMMARY_LABEL_WIDTH$}  {}\n{:<SUMMARY_LABEL_WIDTH$}  {}\n{:<SUMMARY_LABEL_WIDTH$}  text {}, binary {}, unknown {}\n{:<SUMMARY_LABEL_WIDTH$}  generated {}, vendor {}",
+        "total files",
         scan_summary.total_files,
+        "total bytes",
         scan_summary.total_bytes,
+        "content",
         scan_summary.content.text_files,
         scan_summary.content.binary_files,
         scan_summary.content.unknown_files,
+        "flags",
         scan_summary.flags.generated_files,
         scan_summary.flags.vendor_files
     );
@@ -709,7 +714,8 @@ fn render_summary(scan: &ScanReport) -> String {
     if scan_summary.warnings.total_warnings > 0 {
         if scan_summary.warnings.scan_warnings > 0 {
             summary.push_str(&format!(
-                "\nwarnings: {} (scan {}, unreadable {}, skipped {})",
+                "\n{:<SUMMARY_LABEL_WIDTH$}  {} (scan {}, unreadable {}, skipped {})",
+                "warnings",
                 scan_summary.warnings.total_warnings,
                 scan_summary.warnings.scan_warnings,
                 scan_summary.warnings.unreadable_warnings,
@@ -717,7 +723,8 @@ fn render_summary(scan: &ScanReport) -> String {
             ));
         } else {
             summary.push_str(&format!(
-                "\nwarnings: {} (unreadable {}, skipped {})",
+                "\n{:<SUMMARY_LABEL_WIDTH$}  {} (unreadable {}, skipped {})",
+                "warnings",
                 scan_summary.warnings.total_warnings,
                 scan_summary.warnings.unreadable_warnings,
                 scan_summary.warnings.skipped_warnings
@@ -725,13 +732,20 @@ fn render_summary(scan: &ScanReport) -> String {
         }
     }
 
-    summary.push_str("\nlanguages:");
+    summary.push_str("\nlanguages");
 
     if scan_summary.languages.is_empty() {
         summary.push_str("\n  none");
     } else {
+        let language_width = scan_summary
+            .languages
+            .keys()
+            .map(|language| language.len())
+            .max()
+            .unwrap_or(0);
+
         for (language, count) in scan_summary.languages {
-            summary.push_str(&format!("\n  {language}: {count}"));
+            summary.push_str(&format!("\n  {language:<language_width$}  {count}"));
         }
     }
 
@@ -1313,7 +1327,7 @@ mod tests {
 
         assert_eq!(
             summary,
-            "Hotpath scan summary\ntotal files: 4\ntotal bytes: 45\ncontent: text 2, binary 1, unknown 1\nflags: generated 1, vendor 1\nwarnings: 1 (unreadable 1, skipped 0)\nlanguages:\n  JavaScript: 1\n  Rust: 1"
+            "Hotpath scan summary\ntotal files   4\ntotal bytes   45\ncontent       text 2, binary 1, unknown 1\nflags         generated 1, vendor 1\nwarnings      1 (unreadable 1, skipped 0)\nlanguages\n  JavaScript  1\n  Rust        1"
         );
     }
 
@@ -1342,7 +1356,10 @@ mod tests {
 
         let summary = render_summary(&scan);
 
-        assert!(summary.ends_with("languages:\n  none"));
+        assert_eq!(
+            summary,
+            "Hotpath scan summary\ntotal files   1\ntotal bytes   10\ncontent       text 0, binary 1, unknown 0\nflags         generated 0, vendor 0\nlanguages\n  none"
+        );
     }
 
     #[test]
@@ -1355,7 +1372,10 @@ mod tests {
 
         let summary = render_summary(&ScanReport::from_files(vec![skipped]));
 
-        assert!(summary.contains("warnings: 1 (unreadable 0, skipped 1)"));
+        assert_eq!(
+            summary,
+            "Hotpath scan summary\ntotal files   1\ntotal bytes   10\ncontent       text 1, binary 0, unknown 0\nflags         generated 0, vendor 0\nwarnings      1 (unreadable 0, skipped 1)\nlanguages\n  none"
+        );
     }
 
     #[test]
@@ -1372,7 +1392,10 @@ mod tests {
 
         let summary = render_summary(&scan);
 
-        assert!(summary.contains("warnings: 1 (scan 1, unreadable 1, skipped 1)"));
+        assert_eq!(
+            summary,
+            "Hotpath scan summary\ntotal files   1\ntotal bytes   10\ncontent       text 1, binary 0, unknown 0\nflags         generated 0, vendor 0\nwarnings      1 (scan 1, unreadable 1, skipped 1)\nlanguages\n  Rust  1"
+        );
     }
 
     #[test]

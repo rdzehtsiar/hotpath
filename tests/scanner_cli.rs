@@ -329,13 +329,13 @@ fn scan_summary_and_default_cli_report_concise_totals() {
         summary,
         concat!(
             "Hotpath scan summary\n",
-            "total files: 3\n",
-            "total bytes: 16\n",
-            "content: text 2, binary 1, unknown 0\n",
-            "flags: generated 1, vendor 1\n",
-            "languages:\n",
-            "  JavaScript: 1\n",
-            "  Rust: 1\n",
+            "total files   3\n",
+            "total bytes   16\n",
+            "content       text 2, binary 1, unknown 0\n",
+            "flags         generated 1, vendor 1\n",
+            "languages\n",
+            "  JavaScript  1\n",
+            "  Rust        1\n",
         )
     );
 }
