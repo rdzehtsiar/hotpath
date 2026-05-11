@@ -934,6 +934,33 @@ mod tests {
     }
 
     #[test]
+    fn normalization_hits_each_metric_saturation_threshold() {
+        let normalization = normalize_score_metrics(&RawScoreMetrics {
+            byte_size: Some(42),
+            line_count: Some(SIZE_LINE_COUNT_SATURATION),
+            commits_per_file: Some(10),
+            total_churn_lines: Some(CHURN_LINE_SATURATION),
+            recent_churn_lines: Some(SIZE_LINE_COUNT_SATURATION),
+            author_count: Some(AUTHOR_FRAGMENTATION_SATURATION + 1),
+            dominant_owner_share: Some(0.0),
+            co_changed_file_count: Some(CO_CHANGED_FILE_SATURATION),
+            path: "src/saturated.rs".to_owned(),
+        });
+
+        assert_eq!(
+            normalization.normalized_metrics,
+            NormalizedScoreMetrics {
+                size: Some(1.0),
+                churn: Some(1.0),
+                recent_churn: Some(1.0),
+                ownership: Some(1.0),
+                coupling: Some(1.0),
+            }
+        );
+        assert!(normalization.limitations.is_empty());
+    }
+
+    #[test]
     fn missing_inputs_are_omitted_and_recorded_as_limitations() {
         let normalization = normalize_score_metrics(&RawScoreMetrics {
             path: "src/missing.rs".to_owned(),
@@ -1075,6 +1102,109 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fixture_derived_scores_match_expected_formula_math_and_ordering() {
+        let files = vec![
+            file_record("src/stable.rs", Some(19), Some(1)),
+            file_record("src/risky.rs", Some(1_980), Some(100)),
+            file_record("src/related.rs", Some(42), Some(2)),
+        ];
+        let git_metrics = vec![
+            GitFileMetrics {
+                path: "src/related.rs".to_owned(),
+                commits_per_file: 2,
+                total_churn_added: 2,
+                total_churn_deleted: 0,
+                recent_churn_added: 2,
+                recent_churn_deleted: 0,
+                author_count: 2,
+                dominant_owner: Some("Ben Bitdiddle <ben@example.invalid>".to_owned()),
+                dominant_owner_share: Some(0.5),
+                first_commit_id: Some("b".repeat(40)),
+                first_commit_time: Some(1_710_892_800),
+                last_commit_id: Some("c".repeat(40)),
+                last_commit_time: Some(1_712_707_200),
+                file_age_days: Some(21),
+            },
+            GitFileMetrics {
+                path: "src/risky.rs".to_owned(),
+                commits_per_file: 3,
+                total_churn_added: 100,
+                total_churn_deleted: 0,
+                recent_churn_added: 50,
+                recent_churn_deleted: 0,
+                author_count: 3,
+                dominant_owner: Some("Ada Lovelace <ada@example.invalid>".to_owned()),
+                dominant_owner_share: Some(1.0 / 3.0),
+                first_commit_id: Some("a".repeat(40)),
+                first_commit_time: Some(1_704_067_200),
+                last_commit_id: Some("c".repeat(40)),
+                last_commit_time: Some(1_712_707_200),
+                file_age_days: Some(100),
+            },
+            GitFileMetrics {
+                path: "src/stable.rs".to_owned(),
+                commits_per_file: 1,
+                total_churn_added: 1,
+                total_churn_deleted: 0,
+                recent_churn_added: 0,
+                recent_churn_deleted: 0,
+                author_count: 1,
+                dominant_owner: Some("Ada Lovelace <ada@example.invalid>".to_owned()),
+                dominant_owner_share: Some(1.0),
+                first_commit_id: Some("a".repeat(40)),
+                first_commit_time: Some(1_704_067_200),
+                last_commit_id: Some("a".repeat(40)),
+                last_commit_time: Some(1_704_067_200),
+                file_age_days: Some(100),
+            },
+        ];
+        let co_changes = vec![
+            GitCoChange {
+                left_path: "src/risky.rs".to_owned(),
+                right_path: "src/stable.rs".to_owned(),
+                commit_count: 1,
+            },
+            GitCoChange {
+                left_path: "src/related.rs".to_owned(),
+                right_path: "src/risky.rs".to_owned(),
+                commit_count: 2,
+            },
+        ];
+
+        let scores = raw_score_metrics_from_scan_and_git(&files, &git_metrics, &co_changes)
+            .into_iter()
+            .map(calculate_hotspot_score)
+            .collect::<Vec<_>>();
+        let related = score_for_path(&scores, "src/related.rs");
+        let risky = score_for_path(&scores, "src/risky.rs");
+        let stable = score_for_path(&scores, "src/stable.rs");
+
+        assert_f64_near(related.value, 0.22475);
+        assert_eq!(
+            related.normalized_metrics,
+            NormalizedScoreMetrics {
+                size: Some(0.002),
+                churn: Some(0.001),
+                recent_churn: Some(1.0),
+                ownership: Some(0.35),
+                coupling: Some(0.04),
+            }
+        );
+        assert_f64_near(risky.value, 0.22716666666666668);
+        assert_eq!(risky.normalized_metrics.size, Some(0.1));
+        assert_eq!(risky.normalized_metrics.churn, Some(0.05));
+        assert_eq!(risky.normalized_metrics.recent_churn, Some(0.5));
+        assert_near(risky.normalized_metrics.ownership, 0.5333333333333333);
+        assert_eq!(risky.normalized_metrics.coupling, Some(0.08));
+        assert_f64_near(stable.value, 0.004375);
+
+        assert_eq!(
+            ranked_paths(&rank_hotspot_scores(&scores)),
+            vec!["src/risky.rs", "src/related.rs", "src/stable.rs"]
+        );
+    }
+
     fn score_with_value(path: &str, value: f64) -> HotspotScore {
         let mut score = calculate_hotspot_score(RawScoreMetrics {
             path: path.to_owned(),
@@ -1105,6 +1235,13 @@ mod tests {
             .iter()
             .map(|ranked_score| ranked_score.score.path.clone())
             .collect()
+    }
+
+    fn score_for_path<'a>(scores: &'a [HotspotScore], path: &str) -> &'a HotspotScore {
+        scores
+            .iter()
+            .find(|score| score.path == path)
+            .unwrap_or_else(|| panic!("expected score for {path}"))
     }
 
     fn raw_metrics() -> RawScoreMetrics {
