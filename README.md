@@ -33,9 +33,9 @@ into explainable hotspot reports that help engineers decide where to investigate
 
 Hotpath is at the very beginning of development.
 
-The repository currently contains an early Rust CLI with `hotpath scan` and `hotpath doctor`. The scanner reports local file facts and warnings, and scan commands persist a derived local SQLite index at `.hotpath/index.db`.
+The repository currently contains an early Rust CLI with `hotpath scan`, `hotpath doctor`, and an early non-stable `hotpath explain-git` command. The scanner reports local file facts and warnings, scan commands persist a derived local SQLite index at `.hotpath/index.db`, and `explain-git` can explain local Git history for a requested path while persisting derived Git metric rows after successful analysis.
 
-There is no released binary, stable CLI contract, stable index format, supported report format, Git analysis, parser-backed symbol analysis, dependency analysis, or hotspot scoring compatibility promise yet.
+There is no released binary, stable CLI contract, stable index format, supported report format, stable Git analysis, parser-backed symbol analysis, dependency analysis, or hotspot scoring compatibility promise yet.
 
 Expect the crate layout, commands, data model, scoring formulas, output formats, and documentation to change as the product contract and first implementation milestones are built.
 

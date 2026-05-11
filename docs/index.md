@@ -4,9 +4,9 @@ Hotpath is at the beginning of development. The local index exists now, but it
 is still an early derived cache, not a stable public database format or
 compatibility promise.
 
-The index makes repeated local analysis easier to inspect and extend. It is
-created from repository files and Hotpath's scanner results. It is not
-user-authored data and should be safe to delete and rebuild.
+The index makes repeated local analysis easier to inspect and extend. It can be
+created and populated by `hotpath scan` and by successful `hotpath explain-git`
+runs. It is not user-authored data and should be safe to delete and rebuild.
 
 ## Location And Scope
 
@@ -17,8 +17,9 @@ The current index location is:
 ```
 
 The `.hotpath/` directory is created at the repository root being analyzed when
-`hotpath scan` persists results. `hotpath doctor` can inspect this location, but
-it does not create a missing index.
+`hotpath scan` or a successful `hotpath explain-git` run persists results.
+`hotpath doctor` can inspect this location, but it does not create a missing
+index.
 
 The `.hotpath/index.db` file is local working data, not a portable report
 format. Users should not commit it, share it, or edit it by hand.
@@ -55,6 +56,14 @@ analysis:
   count, dominant owner/share, first/last observed commits, and file age
 - co-change pairs with deterministic left/right repository-relative paths and
   commit counts
+
+These Git rows are derived cache data, not source-of-truth repository metadata.
+They inherit the limitations documented in [Git metric semantics](git-metrics.md),
+including conservative rename handling, first-parent merge diffs, rejection of
+shallow history, exact author identity matching, binary line churn limits, and
+timestamp skew. Generated and vendor scanner flags are stored separately from
+Git metrics; index v2 does not imply those paths are excluded from Git-derived
+rows.
 
 Reserved as schema extension points but not populated by current scans:
 

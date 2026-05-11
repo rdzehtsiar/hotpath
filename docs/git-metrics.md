@@ -9,6 +9,41 @@ Git metrics are advisory signals. They can point to files that may be volatile,
 recently active, or ownership-fragmented, but they do not prove that a file is
 bad, risky, or owned by the wrong person.
 
+## Practical Limitations
+
+Git metrics are derived from local history and should be read as approximations,
+not facts about code quality or team ownership. The current `hotpath
+explain-git` implementation surfaces calculation notes and selected limitations
+in its explanation output, and persists the derived metrics to the local index
+after successful analysis.
+
+Important limitations:
+
+- Rename handling is path-based and conservative. Earlier history remains under
+  the old path, so renamed files can have understated age, churn, author count,
+  ownership continuity, and co-change history under the new path.
+- Merge commits are included, but each merge commit is diffed against its first
+  parent. Side-branch commits reachable from `HEAD` are still walked separately.
+  This can make the merge commit itself appear to touch files introduced or
+  changed on the side branch.
+- Git metrics do not currently filter or weight generated and vendor files by
+  scanner classification. If those paths exist in Git history, their churn,
+  authorship, and co-change rows can be present in Git metric output and index
+  rows.
+- Shallow repositories are rejected before output or persistence. Hotpath does
+  not estimate missing history.
+- Author identity is the exact commit author string. `.mailmap`, case folding,
+  bot detection, domain normalization, and account merging are not applied.
+- Binary file changes, pure renames, and changes where Git does not provide line
+  statistics contribute `0` added and deleted lines. Commit counts and ownership
+  can still change even when line churn is `0`.
+- Commit timestamps come from local Git metadata. Recent churn and file age use
+  the `HEAD` committer timestamp as the reference time, so rewritten, imported,
+  rebased, or otherwise skewed timestamps can distort age and recency metrics.
+- Results are advisory local signals. They can guide review and investigation,
+  but they should not be treated as proof of risk, ownership, quality, or
+  responsibility.
+
 ## History Scope
 
 By default, Git metrics use local repository history reachable from `HEAD`.
@@ -224,7 +259,8 @@ These semantics define the target behavior for Git metrics. `hotpath
 explain-git` is an early, non-stable command that computes local `HEAD` Git
 history and persists the resulting full-repository file metrics and co-change
 pairs to the local Hotpath index as derived cache data after successful
-analysis. Current Hotpath scans do not compute Git metrics.
+analysis. Current Hotpath scans do not compute Git metrics, and index v2 stores
+Git metric rows only after a successful `hotpath explain-git` run.
 
 Future implementation work should add deterministic fixture repositories and
 focused tests that cover commit counting, recent churn windows, exact author

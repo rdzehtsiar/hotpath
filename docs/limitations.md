@@ -10,12 +10,13 @@ This page documents the limits Hotpath should make explicit as it develops.
 ## Current Limitations
 
 Hotpath currently provides early repository scanning, scan persistence to a
-local index, and `hotpath doctor` index health checks. These are not stable
-interfaces.
+local index, `hotpath doctor` index health checks, and an early non-stable
+`hotpath explain-git` command for local Git history explanation. These are not
+stable interfaces.
 
-Hotpath does not currently provide a stable implementation of Git analysis,
-parser-backed symbol analysis, dependency analysis, hotspot scoring, CI output,
-architecture rules, or a terminal UI.
+Hotpath does not currently provide stable Git analysis, parser-backed symbol
+analysis, dependency analysis, hotspot scoring, CI output, architecture rules,
+or a terminal UI.
 
 Future commands, crate layout, data models, scoring formulas, and output formats
 may change while the product contract and first implementation milestones are
@@ -59,6 +60,35 @@ Expected limitations include:
 
 Each metric should document what it measures, why it may matter, and where it
 can mislead.
+
+## Git Metric Limits
+
+The current `hotpath explain-git` command calculates Git metrics from local
+history reachable from `HEAD` and writes derived rows to index v2 after
+successful analysis. These metrics are advisory and are not a stable report
+contract.
+
+Known Git metric limitations include:
+
+- renamed files are tracked conservatively by path, so pre-rename history stays
+  under the old path instead of being reconstructed under the new path
+- merge commits are diffed against their first parent, while reachable
+  side-branch commits are still analyzed separately
+- generated and vendor paths are not excluded from Git metrics merely because a
+  scan can classify them as generated or vendor files
+- shallow repositories are rejected because missing history would make churn,
+  ownership, age, and co-change metrics misleading
+- author identity uses the exact commit author string and does not apply
+  `.mailmap`, case folding, bot detection, domain normalization, or account
+  merging
+- binary changes and changes without available line statistics contribute `0`
+  line churn even when the file was touched
+- recency and file age depend on local Git committer timestamps, so timestamp
+  skew from rebases, imports, rewritten history, or unusual commit metadata can
+  distort time-based metrics
+
+See [Git metric semantics](git-metrics.md) for the current formulas and
+calculation notes.
 
 ## False Positives And False Negatives
 
