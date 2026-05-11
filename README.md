@@ -31,11 +31,11 @@ into explainable hotspot reports that help engineers decide where to investigate
 
 ## Current State
 
-Hotpath is at the very beginning of development.
+Hotpath is at the beginning of development.
 
-The repository currently contains an early Rust CLI with `hotpath scan`, `hotpath doctor`, and an early non-stable `hotpath explain-git` command. The scanner reports local file facts and warnings, scan commands persist a derived local SQLite index at `.hotpath/index.db`, and `explain-git` can explain local Git history for a requested path while persisting derived Git metric rows after successful analysis.
+The repository currently contains an early Rust CLI with `hotpath scan`, `hotpath doctor`, `hotpath explain-git`, `hotpath hotspots`, and `hotpath explain`. The scanner reports local file facts and warnings, scan commands persist a derived local SQLite index at `.hotpath/index.db`, Git analysis explains local history for requested paths, and hotspot commands rank and explain current files with the documented `hotpath.score.v1` formula.
 
-There is no released binary, stable CLI contract, stable index format, supported report format, stable Git analysis, parser-backed symbol analysis, dependency analysis, or hotspot scoring compatibility promise yet.
+There is no released binary, stable CLI contract, stable index format, supported report format, stable Git analysis compatibility promise, parser-backed symbol analysis, dependency analysis, CI output, architecture rules, or terminal UI yet.
 
 Expect the crate layout, commands, data model, scoring formulas, output formats, and documentation to change as the product contract and first implementation milestones are built.
 
@@ -114,7 +114,7 @@ cargo test
 
 Hotpath is designed as a local tool. The core workflow should not require network access, telemetry, cloud APIs, hosted services, or uploading repository contents.
 
-Current scans write derived local cache data under `.hotpath/`, including `.hotpath/index.db`. The index stores scanner file facts, scan run metadata, and scan/file warnings using repository-relative paths. It does not require a daemon or network access, and it can be deleted and rebuilt with `hotpath scan`. See [Local index](docs/index.md).
+Current scans and analysis commands write derived local cache data under `.hotpath/`, including `.hotpath/index.db`. The index stores scanner file facts, scan run metadata, scan/file warnings, Git metrics, co-change rows, and hotspot score rows using repository-relative paths. It does not require a daemon or network access, and it can be deleted and rebuilt from local repository data. See [Local index](docs/index.md).
 
 ## License
 

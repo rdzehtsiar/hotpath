@@ -6,7 +6,8 @@ contents.
 
 Hotpath is at the beginning of development. This document defines the privacy
 posture the project is being built toward and describes the local data written
-by the current early scanner and index implementation.
+by the current early scanner, Git metric, hotspot scoring, and index
+implementation.
 
 ## Default Posture
 
@@ -39,16 +40,17 @@ other classification limits.
 
 ## Local Data Hotpath Writes Now
 
-Current scan commands write derived local index data at:
+Current scan and analysis commands write derived local index data at:
 
 ```text
 .hotpath/index.db
 ```
 
-The index stores scanner file facts, scan run metadata, scan warnings, and
-per-file warnings. It uses repository-relative paths and does not store full
-source-file contents. Reserved schema tables for future Git, parser,
-dependency, and hotspot data exist but are not populated by current scans.
+The index stores scanner file facts, scan run metadata, scan warnings,
+per-file warnings, Git analysis metadata, per-file Git metrics, co-change
+pairs, and hotspot score rows. It uses repository-relative paths and does not
+store full source-file contents. Reserved schema tables for future parser and
+dependency data exist but are not populated by current commands.
 
 The index is documented as derived local cache data in [Local index](index.md).
 It may contain sensitive repository-derived information, but creating, reading,
@@ -63,8 +65,8 @@ host-specific absolute paths in portable output unless the user asks for them.
 ## Network And Cloud Boundaries
 
 Primary Hotpath workflows should not make network calls. Scanning, indexing,
-and report generation should not depend on cloud APIs. Future scoring behavior
-should follow the same boundary when it is implemented.
+Git analysis, hotspot scoring, and report generation should not depend on cloud
+APIs.
 
 If future optional features ever need network access, they should be explicit,
 documented, opt-in, and separate from the core local workflow. They should not

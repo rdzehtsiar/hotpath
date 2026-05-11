@@ -19,9 +19,9 @@ major: 1
 minor: 0
 ```
 
-Formula identifiers are part of score explanations. Persisted score records
-should include them when hotspot score persistence is implemented. Meaningful
-changes to score semantics should use a new formula identifier or version.
+Formula identifiers are part of score explanations and persisted hotspot score
+records. Meaningful changes to score semantics should use a new formula
+identifier or version.
 
 The final score is the sum of fixed weighted contributions:
 

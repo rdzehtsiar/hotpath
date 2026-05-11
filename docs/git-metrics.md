@@ -256,11 +256,11 @@ skew as a limitation where the age is explained.
 ## Current Implementation Status
 
 These semantics define the target behavior for Git metrics. `hotpath
-explain-git` is an early, non-stable command that computes local `HEAD` Git
-history and persists the resulting full-repository file metrics and co-change
-pairs to the local Hotpath index as derived cache data after successful
-analysis. Current Hotpath scans do not compute Git metrics, and index v2 stores
-Git metric rows only after a successful `hotpath explain-git` run.
+explain-git`, `hotpath hotspots`, and `hotpath explain` compute local `HEAD`
+Git history and persist the resulting full-repository file metrics and
+co-change pairs to the local Hotpath index as derived cache data after
+successful analysis. Current Hotpath scan-only commands do not compute Git
+metrics.
 
 Future implementation work should add deterministic fixture repositories and
 focused tests that cover commit counting, recent churn windows, exact author

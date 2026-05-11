@@ -5,8 +5,9 @@ is still an early derived cache, not a stable public database format or
 compatibility promise.
 
 The index makes repeated local analysis easier to inspect and extend. It can be
-created and populated by `hotpath scan` and by successful `hotpath explain-git`
-runs. It is not user-authored data and should be safe to delete and rebuild.
+created and populated by `hotpath scan`, `hotpath explain-git`, `hotpath
+hotspots`, and `hotpath explain` runs. It is not user-authored data and should
+be safe to delete and rebuild.
 
 ## Location And Scope
 
@@ -17,9 +18,8 @@ The current index location is:
 ```
 
 The `.hotpath/` directory is created at the repository root being analyzed when
-`hotpath scan` or a successful `hotpath explain-git` run persists results.
-`hotpath doctor` can inspect this location, but it does not create a missing
-index.
+`hotpath scan` or a successful analysis command persists results. `hotpath
+doctor` can inspect this location, but it does not create a missing index.
 
 The `.hotpath/index.db` file is local working data, not a portable report
 format. Users should not commit it, share it, or edit it by hand.
@@ -47,8 +47,8 @@ Currently populated by `hotpath scan`:
   flag, and classification
 - per-file warnings, including warning code and message
 
-Currently populated by `hotpath explain-git` after successful local history
-analysis:
+Currently populated by `hotpath explain-git`, `hotpath hotspots`, and `hotpath
+explain` after successful local history analysis:
 
 - Git analysis metadata, including analyzer version, `HEAD` commit id, `HEAD`
   committer timestamp, recent churn window, and observed row counts
@@ -65,15 +65,28 @@ timestamp skew. Generated and vendor scanner flags are stored separately from
 Git metrics; index v2 does not imply those paths are excluded from Git-derived
 rows.
 
-Reserved as schema extension points but not populated by current scans:
+Currently populated by `hotpath hotspots` and `hotpath explain` after
+successful hotspot scoring:
+
+- hotspot score rows for ranked current files
+- formula version identifiers
+- raw score metrics serialized as JSON
+- normalized metric and weighted-term explanation payloads
+- score limitation payloads
+
+These hotspot rows are derived cache data. They inherit the limitations
+documented in [Scoring](scoring.md), including fixed-weight missing-input
+behavior, conservative Git metric inputs, lack of parser-backed complexity, and
+advisory-only interpretation.
+
+Reserved as schema extension points but not populated by current commands:
 
 - `symbols` for future parser output
 - `dependencies` for future coupling or dependency analysis
-- `hotspots` for future scoring output
 
-Current scans do not populate parser symbols, dependency edges, or hotspot
-scores. Documentation and reports should not imply those analyses are available
-until implementation and tests exist.
+Current commands do not populate parser symbols or dependency edges.
+Documentation and reports should not imply those analyses are available until
+implementation and tests exist.
 
 ## Path Storage
 
@@ -174,8 +187,9 @@ daemon for the index.
 
 The index may contain sensitive repository-derived information, including file
 paths, byte sizes, language guesses, line counts, generated/vendor
-classification, symlink classification, scan warnings, and file warning
-messages. Current scans do not store full source-file contents in the index.
+classification, symlink classification, scan warnings, file warning messages,
+Git metric rows, co-change pairs, and hotspot score explanations. Current
+commands do not store full source-file contents in the index.
 
 Users should treat `.hotpath/index.db` like any other local cache derived from a
 private repository and handle it according to their own security and retention

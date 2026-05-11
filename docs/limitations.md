@@ -1,22 +1,23 @@
 # Limitations
 
 Hotpath is at the beginning of development. The repository currently contains
-an early Rust CLI with scanner and index health commands. There is no released
-binary, stable CLI contract, supported report format, or compatibility promise
-yet.
+an early Rust CLI with scanner, index health, Git metric, hotspot ranking, and
+hotspot explanation commands. There is no released binary, stable CLI contract,
+supported report format, or compatibility promise yet.
 
 This page documents the limits Hotpath should make explicit as it develops.
 
 ## Current Limitations
 
 Hotpath currently provides early repository scanning, scan persistence to a
-local index, `hotpath doctor` index health checks, and an early non-stable
-`hotpath explain-git` command for local Git history explanation. These are not
-stable interfaces.
+local index, `hotpath doctor` index health checks, local Git history
+explanation with `hotpath explain-git`, hotspot ranking with `hotpath
+hotspots`, and per-file hotspot explanation with `hotpath explain`. These are
+not stable interfaces.
 
-Hotpath does not currently provide stable Git analysis, parser-backed symbol
-analysis, dependency analysis, hotspot scoring, CI output, architecture rules,
-or a terminal UI.
+Hotpath does not currently provide stable Git analysis or scoring compatibility,
+parser-backed symbol analysis, dependency analysis, CI output, architecture
+rules, or a terminal UI.
 
 Future commands, crate layout, data models, scoring formulas, and output formats
 may change while the product contract and first implementation milestones are
@@ -89,6 +90,29 @@ Known Git metric limitations include:
 
 See [Git metric semantics](git-metrics.md) for the current formulas and
 calculation notes.
+
+## Hotspot Score Limits
+
+The current `hotpath hotspots` and `hotpath explain` commands combine scanner
+facts with local Git metrics to produce advisory hotspot scores using the
+documented `hotpath.score.v1` formula. Successful hotspot analysis writes
+derived score rows to index v2.
+
+Known hotspot score limitations include:
+
+- scores use current scanned files plus local Git history reachable from
+  `HEAD`; they do not query hosted Git providers or cloud APIs
+- parser-backed complexity, symbol coupling, dependency analysis, test
+  coverage, runtime incidents, ownership policy, and architecture rules are not
+  formula inputs
+- generated and vendor classifications are visible scanner facts but are not
+  weighted terms in `hotpath.score.v1`
+- missing source facts are not guessed; missing normalized inputs contribute
+  `0.0` for their fixed-weight terms and are listed as limitations
+- a higher score means "worth investigating sooner," not "bad code"
+
+See [Scoring](scoring.md) for the current formula, normalization rules, ranking
+behavior, and limitation codes.
 
 ## False Positives And False Negatives
 
