@@ -693,6 +693,35 @@ mod tests {
         std::os::windows::fs::symlink_file(original, link)
     }
 
+    fn symlink_setup_should_skip(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+        ) || cfg!(windows) && error.raw_os_error() == Some(1314)
+    }
+
+    fn create_dir_symlink_or_skip(
+        original: impl AsRef<Path>,
+        link: impl AsRef<Path>,
+    ) -> Result<(), io::Error> {
+        match symlink_dir(original, link) {
+            Ok(()) => Ok(()),
+            Err(error) if symlink_setup_should_skip(&error) => Err(error),
+            Err(error) => panic!("unexpected symlink setup error: {error}"),
+        }
+    }
+
+    fn create_file_symlink_or_skip(
+        original: impl AsRef<Path>,
+        link: impl AsRef<Path>,
+    ) -> Result<(), io::Error> {
+        match symlink_file(original, link) {
+            Ok(()) => Ok(()),
+            Err(error) if symlink_setup_should_skip(&error) => Err(error),
+            Err(error) => panic!("unexpected symlink setup error: {error}"),
+        }
+    }
+
     #[test]
     fn scan_records_are_sorted_by_normalized_relative_path() {
         let fixture = Fixture::new("deterministic-ordering");
@@ -751,7 +780,7 @@ mod tests {
         linked.write("nested/secret.rs", "");
         fixture.write("keep.rs", "");
 
-        if symlink_dir(&linked.path, fixture.path.join("linked")).is_err() {
+        if create_dir_symlink_or_skip(&linked.path, fixture.path.join("linked")).is_err() {
             return;
         }
 
@@ -889,7 +918,7 @@ mod tests {
         let fixture = Fixture::new("symlinked-file");
         fixture.write("target.rs", "fn linked() {}\n");
 
-        if symlink_file(
+        if create_file_symlink_or_skip(
             fixture.path.join("target.rs"),
             fixture.path.join("linked.rs"),
         )
@@ -913,7 +942,7 @@ mod tests {
         let target = Fixture::new("outside-symlink-target");
         target.write("target.rs", "fn linked() {}\n");
 
-        if symlink_file(
+        if create_file_symlink_or_skip(
             target.path.join("target.rs"),
             fixture.path.join("linked.rs"),
         )
@@ -936,7 +965,7 @@ mod tests {
     fn unreadable_symlink_targets_are_recorded_without_content() {
         let fixture = Fixture::new("broken-symlink");
 
-        if symlink_file(
+        if create_file_symlink_or_skip(
             fixture.path.join("missing.rs"),
             fixture.path.join("linked.rs"),
         )
