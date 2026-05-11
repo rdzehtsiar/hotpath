@@ -2416,6 +2416,29 @@ mod tests {
             .expect("table count should read")
     }
 
+    fn create_legacy_metadata_only_index(index_path: &Path, metadata_rows: &[(&str, &str)]) {
+        fs::create_dir_all(index_path.parent().expect("index path should have parent"))
+            .expect("index directory should be created");
+        let connection = Connection::open(index_path).expect("test database should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE hotpath_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                ) STRICT;",
+            )
+            .expect("legacy metadata table should be created");
+
+        for (key, value) in metadata_rows {
+            connection
+                .execute(
+                    "INSERT INTO hotpath_metadata (key, value) VALUES (?1, ?2);",
+                    params![key, value],
+                )
+                .expect("legacy metadata row should be inserted");
+        }
+    }
+
     fn scan_report(files: Vec<FileRecord>) -> ScanReport {
         ScanReport {
             status: "ok",
@@ -3063,6 +3086,39 @@ mod tests {
     }
 
     #[test]
+    fn repeated_open_after_version_zero_metadata_migration_is_idempotent() {
+        let fixture = Fixture::new("idempotent-legacy-metadata");
+        let index_path = default_index_path(&fixture.path);
+        create_legacy_metadata_only_index(
+            &index_path,
+            &[
+                (SCHEMA_VERSION_KEY, "0"),
+                (SCHEMA_IDENTIFIER_KEY, SCHEMA_IDENTIFIER),
+            ],
+        );
+
+        let first = IndexStore::open(&fixture.path).expect("legacy metadata should migrate");
+        assert_eq!(first.schema_version(), CURRENT_SCHEMA_VERSION);
+        let first_connection = Connection::open(&index_path).expect("index should reopen");
+        assert_eq!(
+            read_user_version(&first_connection, &index_path)
+                .expect("user_version should read after migration"),
+            CURRENT_SCHEMA_VERSION
+        );
+        let first_tables = user_table_names(&first_connection);
+        let first_metadata = metadata_rows(&first_connection);
+        drop(first_connection);
+        drop(first);
+
+        let second = IndexStore::open(&fixture.path).expect("current schema should reopen");
+        assert_eq!(second.schema_version(), CURRENT_SCHEMA_VERSION);
+        let second_connection = Connection::open(&index_path).expect("index should reopen");
+
+        assert_eq!(user_table_names(&second_connection), first_tables);
+        assert_eq!(metadata_rows(&second_connection), first_metadata);
+    }
+
+    #[test]
     fn open_rejects_incompatible_future_user_version() {
         let fixture = Fixture::new("future-user-version");
         let index_path = default_index_path(&fixture.path);
@@ -3084,6 +3140,56 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn open_rejects_current_schema_missing_schema_version_metadata() {
+        let fixture = Fixture::new("missing-current-schema-version");
+        let store = IndexStore::open(&fixture.path).expect("index should open");
+        let index_path = store.path().to_path_buf();
+        drop(store);
+
+        let connection = Connection::open(&index_path).expect("test database should reopen");
+        connection
+            .execute(
+                "DELETE FROM hotpath_metadata WHERE key = ?1;",
+                params![SCHEMA_VERSION_KEY],
+            )
+            .expect("schema_version metadata row should be removed");
+        drop(connection);
+
+        let error =
+            IndexStore::open(&fixture.path).expect_err("missing schema_version should fail");
+
+        assert!(matches!(error, IndexError::CorruptMetadata { .. }));
+        let message = error.to_string();
+        assert!(message.contains(index_path.to_string_lossy().as_ref()));
+        assert!(message.contains("missing schema_version metadata row"));
+    }
+
+    #[test]
+    fn open_rejects_current_schema_missing_schema_identifier_metadata() {
+        let fixture = Fixture::new("missing-current-schema-identifier");
+        let store = IndexStore::open(&fixture.path).expect("index should open");
+        let index_path = store.path().to_path_buf();
+        drop(store);
+
+        let connection = Connection::open(&index_path).expect("test database should reopen");
+        connection
+            .execute(
+                "DELETE FROM hotpath_metadata WHERE key = ?1;",
+                params![SCHEMA_IDENTIFIER_KEY],
+            )
+            .expect("schema_identifier metadata row should be removed");
+        drop(connection);
+
+        let error =
+            IndexStore::open(&fixture.path).expect_err("missing schema_identifier should fail");
+
+        assert!(matches!(error, IndexError::CorruptMetadata { .. }));
+        let message = error.to_string();
+        assert!(message.contains(index_path.to_string_lossy().as_ref()));
+        assert!(message.contains("missing schema_identifier metadata row"));
     }
 
     #[test]
@@ -3177,6 +3283,49 @@ mod tests {
     }
 
     #[test]
+    fn migration_rejects_missing_metadata_schema_version_with_zero_user_version() {
+        let fixture = Fixture::new("missing-migration-schema-version");
+        let index_path = default_index_path(&fixture.path);
+        create_legacy_metadata_only_index(
+            &index_path,
+            &[(SCHEMA_IDENTIFIER_KEY, SCHEMA_IDENTIFIER)],
+        );
+
+        let error =
+            IndexStore::open(&fixture.path).expect_err("missing schema_version should fail");
+
+        assert!(matches!(error, IndexError::CorruptMetadata { .. }));
+        let message = error.to_string();
+        assert!(message.contains("missing schema_version metadata row"));
+        let connection = Connection::open(&index_path).expect("test database should reopen");
+        assert_eq!(
+            read_user_version(&connection, &index_path)
+                .expect("user_version should remain readable"),
+            0
+        );
+    }
+
+    #[test]
+    fn migration_rejects_missing_metadata_schema_identifier_with_zero_user_version() {
+        let fixture = Fixture::new("missing-migration-schema-identifier");
+        let index_path = default_index_path(&fixture.path);
+        create_legacy_metadata_only_index(&index_path, &[(SCHEMA_VERSION_KEY, "0")]);
+
+        let error =
+            IndexStore::open(&fixture.path).expect_err("missing schema_identifier should fail");
+
+        assert!(matches!(error, IndexError::CorruptMetadata { .. }));
+        let message = error.to_string();
+        assert!(message.contains("missing schema_identifier metadata row"));
+        let connection = Connection::open(&index_path).expect("test database should reopen");
+        assert_eq!(
+            read_user_version(&connection, &index_path)
+                .expect("user_version should remain readable"),
+            0
+        );
+    }
+
+    #[test]
     fn migration_rejects_wrong_metadata_identifier_with_zero_user_version() {
         let fixture = Fixture::new("wrong-identifier-zero-user-version");
         let index_path = default_index_path(&fixture.path);
@@ -3206,6 +3355,38 @@ mod tests {
                 .expect("user_version should remain readable"),
             0
         );
+    }
+
+    #[test]
+    fn open_rejects_current_user_version_with_future_metadata_schema_version() {
+        let fixture = Fixture::new("future-current-metadata");
+        let store = IndexStore::open(&fixture.path).expect("index should open");
+        let index_path = store.path().to_path_buf();
+        drop(store);
+
+        let connection = Connection::open(&index_path).expect("test database should reopen");
+        connection
+            .execute(
+                "UPDATE hotpath_metadata SET value = '2' WHERE key = ?1;",
+                params![SCHEMA_VERSION_KEY],
+            )
+            .expect("metadata schema version should be updated");
+        drop(connection);
+
+        let error =
+            IndexStore::open(&fixture.path).expect_err("future metadata schema should be rejected");
+
+        assert!(matches!(
+            error,
+            IndexError::IncompatibleFutureSchema {
+                found_version: 2,
+                supported_version: CURRENT_SCHEMA_VERSION,
+                ..
+            }
+        ));
+        let message = error.to_string();
+        assert!(message.contains(index_path.to_string_lossy().as_ref()));
+        assert!(message.contains("supports up to version 1"));
     }
 
     #[test]
@@ -3460,5 +3641,25 @@ mod tests {
             error,
             IndexError::OpenDatabase { .. } | IndexError::CorruptDatabase { .. }
         ));
+        let message = error.to_string();
+        assert!(message.contains(index_path.to_string_lossy().as_ref()));
+        assert!(
+            message.contains("failed to open Hotpath index")
+                || message.contains("unreadable or corrupt")
+        );
+    }
+
+    #[test]
+    fn open_reports_database_open_failure_with_index_path() {
+        let fixture = Fixture::new("database-open-failure");
+        let index_path = default_index_path(&fixture.path);
+        fs::create_dir_all(&index_path).expect("index path directory should be created");
+
+        let error = IndexStore::open(&fixture.path).expect_err("directory index should fail");
+
+        assert!(matches!(error, IndexError::OpenDatabase { .. }));
+        let message = error.to_string();
+        assert!(message.contains(index_path.to_string_lossy().as_ref()));
+        assert!(message.contains("failed to open Hotpath index"));
     }
 }
