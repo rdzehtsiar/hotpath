@@ -17,6 +17,9 @@ enum Commands {
     /// Scan a repository and print an early placeholder report.
     Scan(ScanArgs),
 
+    /// Explain hotspot scoring for one current file.
+    Explain(ExplainArgs),
+
     /// Explain local Git history metrics for one file.
     ExplainGit(ExplainGitArgs),
 
@@ -29,6 +32,12 @@ enum Commands {
 
 #[derive(Debug, Args)]
 struct ExplainGitArgs {
+    /// Repository-relative or worktree-relative file path to explain.
+    path: std::path::PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct ExplainArgs {
     /// Repository-relative or worktree-relative file path to explain.
     path: std::path::PathBuf,
 }
@@ -51,6 +60,7 @@ fn main() -> ExitCode {
         Commands::Scan(args) if args.json => hotpath::scan_json().map_err(Into::into),
         Commands::Scan(args) if args.summary => hotpath::scan_summary().map_err(Into::into),
         Commands::Scan(_) => hotpath::scan_summary().map_err(Into::into),
+        Commands::Explain(args) => hotpath::explain(&args.path).map_err(Into::into),
         Commands::ExplainGit(args) => {
             hotpath::explain_git_and_persist(&args.path).map_err(Into::into)
         }

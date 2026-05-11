@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::error::Error as StdError;
 use std::fmt;
@@ -363,6 +363,94 @@ pub enum HotspotsCommandError {
     PersistGitAnalysis(storage::index::IndexError),
 }
 
+#[derive(Debug)]
+pub enum ExplainCommandError {
+    CurrentDir(std::io::Error),
+    Git(git::GitHistoryError),
+    Path(ExplainPathError),
+    Scan(ScanError),
+    PersistScan(storage::index::IndexError),
+    PersistGitAnalysis(storage::index::IndexError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExplainPathError {
+    EmptyPath,
+    PathOutsideRepository,
+    UnsupportedPathEncoding,
+    AmbiguousPath { first: String, second: String },
+    NotCurrentFile,
+}
+
+impl fmt::Display for ExplainCommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CurrentDir(source) => {
+                write!(f, "failed to determine the current directory: {source}")
+            }
+            Self::Git(source) => write_explain_git_error(f, source),
+            Self::Path(source) => write!(f, "{source}"),
+            Self::Scan(source) => write!(f, "{source}"),
+            Self::PersistScan(source) => {
+                write_explain_persistence_error(f, "persist scan results", source)
+            }
+            Self::PersistGitAnalysis(source) => {
+                write_explain_persistence_error(f, "persist Git analysis", source)
+            }
+        }
+    }
+}
+
+impl fmt::Display for ExplainPathError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyPath => write!(f, "explain requires a non-empty file path"),
+            Self::PathOutsideRepository => write!(
+                f,
+                "requested path is outside the Git worktree; pass a repository-relative path or a path under the current worktree"
+            ),
+            Self::UnsupportedPathEncoding => write!(
+                f,
+                "requested path is not valid UTF-8 and cannot be rendered as a portable repository-relative path"
+            ),
+            Self::AmbiguousPath { first, second } => write!(
+                f,
+                "requested path is ambiguous inside this worktree; it could refer to '{first}' or '{second}'"
+            ),
+            Self::NotCurrentFile => write!(
+                f,
+                "requested path is not a current scanned file; pass an existing file under the worktree"
+            ),
+        }
+    }
+}
+
+impl StdError for ExplainCommandError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::CurrentDir(source) => Some(source),
+            Self::Git(source) => Some(source),
+            Self::Path(source) => Some(source),
+            Self::Scan(source) => Some(source),
+            Self::PersistScan(source) | Self::PersistGitAnalysis(source) => Some(source),
+        }
+    }
+}
+
+impl StdError for ExplainPathError {}
+
+impl From<git::GitHistoryError> for ExplainCommandError {
+    fn from(source: git::GitHistoryError) -> Self {
+        Self::Git(source)
+    }
+}
+
+impl From<ScanError> for ExplainCommandError {
+    fn from(source: ScanError) -> Self {
+        Self::Scan(source)
+    }
+}
+
 impl fmt::Display for HotspotsCommandError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -525,6 +613,47 @@ pub fn hotspots() -> Result<String, HotspotsCommandError> {
     Ok(render_hotspots(&ranked, analysis.recent_window_days))
 }
 
+pub fn explain(requested_path: impl AsRef<Path>) -> Result<String, ExplainCommandError> {
+    let current_dir = env::current_dir().map_err(ExplainCommandError::CurrentDir)?;
+    let analysis = git::analyze_from_head_at(&current_dir)?;
+    let scan = scan_repository(&analysis.worktree_root)?;
+    let path = normalize_explain_file_path(
+        &current_dir,
+        &analysis.worktree_root,
+        requested_path.as_ref(),
+        &scan.files,
+    )
+    .map_err(ExplainCommandError::Path)?;
+    let mut index = storage::index::IndexStore::open(&analysis.worktree_root)
+        .map_err(ExplainCommandError::PersistScan)?;
+
+    index
+        .persist_scan(&scan)
+        .map_err(ExplainCommandError::PersistScan)?;
+    index
+        .persist_git_analysis(
+            &analysis.worktree_root,
+            &analysis.head_commit_id,
+            analysis.head_commit_time,
+            analysis.recent_window_days as u64,
+            &analysis.file_metrics,
+            &analysis.co_changes,
+        )
+        .map_err(ExplainCommandError::PersistGitAnalysis)?;
+
+    let score = scoring::raw_score_metrics_from_scan_and_git(
+        &scan.files,
+        &analysis.file_metrics,
+        &analysis.co_changes,
+    )
+    .into_iter()
+    .find(|metrics| metrics.path == path)
+    .map(scoring::calculate_hotspot_score)
+    .ok_or(ExplainCommandError::Path(ExplainPathError::NotCurrentFile))?;
+
+    Ok(render_explain(&score, analysis.recent_window_days))
+}
+
 pub fn doctor() -> Result<String, DoctorError> {
     let root = env::current_dir().map_err(DoctorError::CurrentDir)?;
 
@@ -634,6 +763,62 @@ fn render_hotspots(
     output
 }
 
+fn render_explain(score: &scoring::HotspotScore, recent_window_days: i64) -> String {
+    let mut output = format!(
+        "Hotpath score explanation\npath: {}\nscope: current scanned file plus local Git history reachable from HEAD\nformula version: {} (major {}, minor {})\nfinal score: {:.3}\n\nraw metrics",
+        score.path,
+        score.formula_version.id,
+        score.formula_version.major,
+        score.formula_version.minor,
+        score.value
+    );
+
+    output.push_str(&format!(
+        "\n  byte size: {}\n  line count: {}\n  commits per file: {}\n  total churn lines: {}\n  recent churn lines ({} days): {}\n  author count: {}\n  dominant owner share: {}\n  co-changed file count: {}",
+        render_optional_count(score.raw_metrics.byte_size),
+        render_optional_count(score.raw_metrics.line_count),
+        render_optional_count(score.raw_metrics.commits_per_file),
+        render_optional_count(score.raw_metrics.total_churn_lines),
+        recent_window_days,
+        render_optional_count(score.raw_metrics.recent_churn_lines),
+        render_optional_count(score.raw_metrics.author_count),
+        render_optional_share(score.raw_metrics.dominant_owner_share),
+        render_optional_count(score.raw_metrics.co_changed_file_count),
+    ));
+
+    output.push_str("\n\nnormalized metrics");
+    for (name, value) in normalized_metric_rows(&score.normalized_metrics) {
+        output.push_str(&format!("\n  {name}: {}", render_optional_score(value)));
+    }
+
+    output.push_str("\n\nweighted contributions");
+    for term in &score.weighted_terms {
+        output.push_str(&format!(
+            "\n  {}: weight {:.3} * {} {} = {:.3}",
+            term.name,
+            term.weight,
+            normalized_metric_name(term.metric),
+            render_optional_score(term.normalized_input),
+            term.weighted_contribution
+        ));
+    }
+
+    output.push_str("\n\nlimitations");
+    if score.limitations.is_empty() {
+        output.push_str("\n  - Uses local Git history only; advisory score.");
+    } else {
+        for limitation in &score.limitations {
+            output.push_str(&format!("\n  - {}", limitation.message));
+        }
+    }
+
+    output.push_str(&format!(
+        "\n\ncalculation notes\n  - Scores are advisory signals for investigation, not proof that a file is defective.\n  - Inputs come from scanner facts and local Git history reachable from HEAD only.\n  - Recent churn uses the {recent_window_days}-day window before the HEAD committer timestamp.\n  - Missing normalized inputs contribute 0.0; formula weights are not redistributed."
+    ));
+
+    output
+}
+
 fn render_doctor(index_path: &str, schema_version: &str, readable: &str, health: &str) -> String {
     format!(
         "Hotpath doctor\nindex path: {index_path}\nschema version: {schema_version}\nreadable: {readable}\nhealth: {health}"
@@ -696,12 +881,217 @@ fn render_optional_count(value: Option<u64>) -> String {
     value.map_or_else(|| "unavailable".to_owned(), |value| value.to_string())
 }
 
+fn render_optional_score(value: Option<f64>) -> String {
+    value.map_or_else(|| "unavailable".to_owned(), |value| format!("{value:.3}"))
+}
+
+fn render_optional_share(value: Option<f64>) -> String {
+    value.map_or_else(
+        || "unavailable".to_owned(),
+        |value| format!("{:.2}%", value * 100.0),
+    )
+}
+
 fn render_size_summary(raw_metrics: &scoring::RawScoreMetrics) -> String {
     match (raw_metrics.line_count, raw_metrics.byte_size) {
         (Some(line_count), _) => format!("{line_count} lines"),
         (None, Some(byte_size)) => format!("{byte_size} bytes"),
         (None, None) => "size unavailable".to_owned(),
     }
+}
+
+fn normalized_metric_rows(
+    metrics: &scoring::NormalizedScoreMetrics,
+) -> [(&'static str, Option<f64>); 5] {
+    [
+        ("size", metrics.size),
+        ("churn", metrics.churn),
+        ("recent_churn", metrics.recent_churn),
+        ("ownership", metrics.ownership),
+        ("coupling", metrics.coupling),
+    ]
+}
+
+fn normalized_metric_name(metric: scoring::NormalizedMetric) -> &'static str {
+    match metric {
+        scoring::NormalizedMetric::Size => "size",
+        scoring::NormalizedMetric::Churn => "churn",
+        scoring::NormalizedMetric::RecentChurn => "recent_churn",
+        scoring::NormalizedMetric::Ownership => "ownership",
+        scoring::NormalizedMetric::Coupling => "coupling",
+    }
+}
+
+fn normalize_explain_file_path(
+    current_dir: &Path,
+    worktree_root: &Path,
+    requested_path: &Path,
+    files: &[FileRecord],
+) -> Result<String, ExplainPathError> {
+    if requested_path.as_os_str().is_empty() {
+        return Err(ExplainPathError::EmptyPath);
+    }
+
+    let current_dir =
+        fs::canonicalize(current_dir).map_err(|_| ExplainPathError::PathOutsideRepository)?;
+    let worktree_root =
+        fs::canonicalize(worktree_root).map_err(|_| ExplainPathError::PathOutsideRepository)?;
+    let scanned_paths = files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut candidates = Vec::new();
+
+    if requested_path.is_absolute() {
+        push_explain_relative_candidate(&mut candidates, &worktree_root, requested_path)?;
+    } else {
+        push_explain_relative_candidate(
+            &mut candidates,
+            &worktree_root,
+            &current_dir.join(requested_path),
+        )?;
+        push_explain_relative_candidate(
+            &mut candidates,
+            &worktree_root,
+            &worktree_root.join(requested_path),
+        )?;
+    }
+
+    candidates.sort();
+    candidates.dedup();
+
+    if candidates.is_empty() {
+        return Err(ExplainPathError::PathOutsideRepository);
+    }
+
+    choose_explain_candidate(&scanned_paths, &candidates)
+}
+
+fn push_explain_relative_candidate(
+    candidates: &mut Vec<String>,
+    worktree_root: &Path,
+    candidate: &Path,
+) -> Result<(), ExplainPathError> {
+    let candidate = lexically_normalize(candidate);
+    let Ok(relative) = candidate.strip_prefix(worktree_root) else {
+        return Ok(());
+    };
+    let relative = portable_relative_path(relative)?;
+
+    if relative.is_empty() {
+        return Err(ExplainPathError::EmptyPath);
+    }
+
+    candidates.push(relative);
+    Ok(())
+}
+
+fn choose_explain_candidate(
+    scanned_paths: &BTreeSet<&str>,
+    candidates: &[String],
+) -> Result<String, ExplainPathError> {
+    let scanned_matches = candidates
+        .iter()
+        .filter(|candidate| scanned_paths.contains(candidate.as_str()))
+        .collect::<Vec<_>>();
+
+    match scanned_matches.as_slice() {
+        [candidate] => Ok((*candidate).clone()),
+        [first, second, ..] => Err(ExplainPathError::AmbiguousPath {
+            first: (*first).clone(),
+            second: (*second).clone(),
+        }),
+        [] => Err(ExplainPathError::NotCurrentFile),
+    }
+}
+
+fn portable_relative_path(path: &Path) -> Result<String, ExplainPathError> {
+    let mut parts = Vec::new();
+
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => {
+                let part = part
+                    .to_str()
+                    .ok_or(ExplainPathError::UnsupportedPathEncoding)?;
+                parts.push(part.to_owned());
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
+                return Err(ExplainPathError::PathOutsideRepository);
+            }
+        }
+    }
+
+    Ok(parts.join("/"))
+}
+
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(_) | Component::Prefix(_) | Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+
+    normalized
+}
+
+fn write_explain_git_error(
+    f: &mut fmt::Formatter<'_>,
+    source: &git::GitHistoryError,
+) -> fmt::Result {
+    match source {
+        git::GitHistoryError::NotRepository { .. } => write!(
+            f,
+            "path is not a readable Git worktree; run explain from inside a repository with local history"
+        ),
+        git::GitHistoryError::OpenRepository { .. } => write!(
+            f,
+            "failed to open Git repository from the current worktree; ensure local Git metadata is readable"
+        ),
+        git::GitHistoryError::MissingHead { .. } => write!(
+            f,
+            "Git repository does not have a commit at HEAD; create an initial commit before explaining hotspot scores"
+        ),
+        git::GitHistoryError::ShallowRepository { .. } => write!(
+            f,
+            "Git repository has shallow history; fetch complete local history before running explain so metrics are not based on incomplete commits"
+        ),
+        git::GitHistoryError::BareRepository { .. } => write!(
+            f,
+            "Git repository has no worktree; hotspot score explanation requires a local worktree"
+        ),
+        git::GitHistoryError::HeadNotCommit { source, .. } => {
+            write!(f, "Git HEAD does not resolve to a commit: {source}")
+        }
+        git::GitHistoryError::Git { context, source } => {
+            write!(f, "failed to traverse Git history while {context}: {source}")
+        }
+        git::GitHistoryError::UnsupportedAuthorIdentity { commit_id } => write!(
+            f,
+            "commit {commit_id} has an author name or email that is not valid UTF-8"
+        ),
+        git::GitHistoryError::UnsupportedPathEncoding { commit_id } => write!(
+            f,
+            "commit {commit_id} changed a path that is not valid UTF-8"
+        ),
+    }
+}
+
+fn write_explain_persistence_error(
+    f: &mut fmt::Formatter<'_>,
+    action: &str,
+    source: &storage::index::IndexError,
+) -> fmt::Result {
+    write_persistence_error(f, action, source, "explain")
 }
 
 fn write_hotspots_git_error(
@@ -751,6 +1141,15 @@ fn write_hotspots_persistence_error(
     action: &str,
     source: &storage::index::IndexError,
 ) -> fmt::Result {
+    write_persistence_error(f, action, source, "hotspots")
+}
+
+fn write_persistence_error(
+    f: &mut fmt::Formatter<'_>,
+    action: &str,
+    source: &storage::index::IndexError,
+    rerun_command: &str,
+) -> fmt::Result {
     write!(
         f,
         "failed to {action} in local Hotpath index (.hotpath/index.db): "
@@ -770,11 +1169,11 @@ fn write_hotspots_persistence_error(
         ),
         storage::index::IndexError::CorruptDatabase { .. } => write!(
             f,
-            "the index is unreadable or corrupt; remove .hotpath/index.db and rerun hotspots"
+            "the index is unreadable or corrupt; remove .hotpath/index.db and rerun {rerun_command}"
         ),
         storage::index::IndexError::CorruptMetadata { .. } => write!(
             f,
-            "the index schema metadata is invalid; remove .hotpath/index.db and rerun hotspots"
+            "the index schema metadata is invalid; remove .hotpath/index.db and rerun {rerun_command}"
         ),
         storage::index::IndexError::UnsafeIndexDir { .. } => write!(
             f,
@@ -1398,6 +1797,20 @@ mod tests {
         );
     }
 
+    fn assert_sanitized_actionable_explain_error(
+        error: ExplainCommandError,
+        absolute_path: &Path,
+        expected: &str,
+    ) {
+        let message = error.to_string();
+
+        assert_eq!(message, expected);
+        assert!(
+            !message.contains(&absolute_path.display().to_string()),
+            "explain persistence error leaked absolute path: {message}"
+        );
+    }
+
     fn scan_warning_record(code: &'static str, path: Option<&str>) -> ScanWarning {
         scan_warning(
             code,
@@ -1474,6 +1887,22 @@ mod tests {
             Err(error) if symlink_setup_should_skip(&error) => Err(error),
             Err(error) => panic!("unexpected symlink setup error: {error}"),
         }
+    }
+
+    #[cfg(unix)]
+    fn non_utf8_path_component() -> PathBuf {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        PathBuf::from(OsString::from_vec(vec![0xff]))
+    }
+
+    #[cfg(windows)]
+    fn non_utf8_path_component() -> PathBuf {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        PathBuf::from(OsString::from_wide(&[0xd800]))
     }
 
     #[test]
@@ -1602,6 +2031,118 @@ mod tests {
             &path,
             "failed to persist Git analysis in local Hotpath index (.hotpath/index.db): could not update .hotpath/index.db; ensure the index is writable",
         );
+    }
+
+    #[test]
+    fn explain_path_error_messages_cover_empty_and_unsupported_encoding() {
+        let fixture = Fixture::new("explain-empty-path");
+        fixture.write("src/lib.rs", "pub fn lib() {}\n");
+        let files = scanned_records(&fixture.path);
+
+        let empty_error =
+            normalize_explain_file_path(&fixture.path, &fixture.path, Path::new(""), &files)
+                .expect_err("empty explain path should fail before matching scan records");
+
+        assert_eq!(empty_error, ExplainPathError::EmptyPath);
+        assert_eq!(
+            empty_error.to_string(),
+            "explain requires a non-empty file path"
+        );
+
+        let encoding_error = portable_relative_path(&non_utf8_path_component())
+            .expect_err("non-UTF-8 path component should fail");
+
+        assert_eq!(encoding_error, ExplainPathError::UnsupportedPathEncoding);
+        assert_eq!(
+            encoding_error.to_string(),
+            "requested path is not valid UTF-8 and cannot be rendered as a portable repository-relative path"
+        );
+    }
+
+    #[test]
+    fn explain_persistence_error_messages_are_sanitized_and_actionable() {
+        let path = absolute_index_path();
+
+        assert_sanitized_actionable_explain_error(
+            ExplainCommandError::PersistScan(storage::index::IndexError::CorruptDatabase {
+                path: path.clone(),
+                source: sqlite_error(),
+            }),
+            &path,
+            "failed to persist scan results in local Hotpath index (.hotpath/index.db): the index is unreadable or corrupt; remove .hotpath/index.db and rerun explain",
+        );
+        assert_sanitized_actionable_explain_error(
+            ExplainCommandError::PersistScan(storage::index::IndexError::CorruptMetadata {
+                path: path.clone(),
+                message: "schema metadata row is malformed".to_owned(),
+            }),
+            &path,
+            "failed to persist scan results in local Hotpath index (.hotpath/index.db): the index schema metadata is invalid; remove .hotpath/index.db and rerun explain",
+        );
+        assert_sanitized_actionable_explain_error(
+            ExplainCommandError::PersistGitAnalysis(
+                storage::index::IndexError::PersistGitAnalysis {
+                    path: path.clone(),
+                    source: sqlite_error(),
+                },
+            ),
+            &path,
+            "failed to persist Git analysis in local Hotpath index (.hotpath/index.db): could not update .hotpath/index.db; ensure the index is writable",
+        );
+    }
+
+    #[test]
+    fn explain_git_error_messages_cover_non_cli_history_failures() {
+        let cases = [
+            (
+                git::GitHistoryError::OpenRepository {
+                    path: PathBuf::from("repo"),
+                    source: git_error("config is unreadable"),
+                },
+                "failed to open Git repository from the current worktree; ensure local Git metadata is readable",
+            ),
+            (
+                git::GitHistoryError::BareRepository {
+                    path: PathBuf::from("repo.git"),
+                },
+                "Git repository has no worktree; hotspot score explanation requires a local worktree",
+            ),
+            (
+                git::GitHistoryError::HeadNotCommit {
+                    path: PathBuf::from("repo"),
+                    source: git_error("object is a tree"),
+                },
+                "Git HEAD does not resolve to a commit: object is a tree",
+            ),
+            (
+                git::GitHistoryError::Git {
+                    context: "walking reachable commits",
+                    source: git_error("revwalk failed"),
+                },
+                "failed to traverse Git history while walking reachable commits: revwalk failed",
+            ),
+            (
+                git::GitHistoryError::UnsupportedAuthorIdentity {
+                    commit_id: "abc123".to_owned(),
+                },
+                "commit abc123 has an author name or email that is not valid UTF-8",
+            ),
+            (
+                git::GitHistoryError::UnsupportedPathEncoding {
+                    commit_id: "def456".to_owned(),
+                },
+                "commit def456 changed a path that is not valid UTF-8",
+            ),
+        ];
+
+        for (source, expected) in cases {
+            assert!(
+                ExplainCommandError::from(source)
+                    .to_string()
+                    .starts_with(expected),
+                "expected explain Git error to start with '{expected}'"
+            );
+        }
     }
 
     #[test]
