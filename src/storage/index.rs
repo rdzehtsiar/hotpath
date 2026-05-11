@@ -6,7 +6,9 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, types::Type, Connection, OpenFlags, OptionalExtension, Row, Transaction};
+use rusqlite::{
+    params, types::Type, Connection, OpenFlags, OptionalExtension, Row, Statement, Transaction,
+};
 
 use crate::{ContentKind, FileRecord, FileWarning, ScanReport, ScanWarning, SCAN_SCHEMA_VERSION};
 
@@ -247,17 +249,93 @@ impl IndexStore {
             })?;
         let scan_run_id = transaction.last_insert_rowid();
 
-        persist_scan_warnings(&transaction, &index_path, scan_run_id, &scan.warnings)?;
-
-        for file in &scan.files {
-            let file_id = persist_file(&transaction, &index_path, repo_id, scan_run_id, file)?;
-            persist_file_warnings(
+        {
+            let mut scan_warning_insert = prepare_statement(
                 &transaction,
                 &index_path,
-                file_id,
-                scan_run_id,
-                &file.warnings,
+                "INSERT INTO scan_warnings (
+                    scan_run_id,
+                    warning_order,
+                    code,
+                    path,
+                    message
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5);",
             )?;
+            persist_scan_warnings(
+                &mut scan_warning_insert,
+                &index_path,
+                scan_run_id,
+                &scan.warnings,
+            )?;
+        }
+
+        {
+            let mut file_upsert = prepare_statement(
+                &transaction,
+                &index_path,
+                "INSERT INTO files (
+                    repo_id,
+                    path,
+                    byte_size,
+                    extension,
+                    language,
+                    line_count,
+                    content_kind,
+                    is_vendor,
+                    is_generated,
+                    is_symlink,
+                    classification,
+                    scan_run_id
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                ON CONFLICT(repo_id, path) DO UPDATE SET
+                    byte_size = excluded.byte_size,
+                    extension = excluded.extension,
+                    language = excluded.language,
+                    line_count = excluded.line_count,
+                    content_kind = excluded.content_kind,
+                    is_vendor = excluded.is_vendor,
+                    is_generated = excluded.is_generated,
+                    is_symlink = excluded.is_symlink,
+                    classification = excluded.classification,
+                    scan_run_id = excluded.scan_run_id;",
+            )?;
+            let mut file_id_query = prepare_statement(
+                &transaction,
+                &index_path,
+                "SELECT id FROM files WHERE repo_id = ?1 AND path = ?2;",
+            )?;
+            let mut file_warning_insert = prepare_statement(
+                &transaction,
+                &index_path,
+                "INSERT INTO file_warnings (
+                    file_id,
+                    scan_run_id,
+                    warning_order,
+                    code,
+                    message
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5);",
+            )?;
+
+            for file in &scan.files {
+                let file_id = persist_file(
+                    &mut file_upsert,
+                    &mut file_id_query,
+                    &index_path,
+                    repo_id,
+                    scan_run_id,
+                    file,
+                )?;
+                persist_file_warnings(
+                    &mut file_warning_insert,
+                    &index_path,
+                    file_id,
+                    scan_run_id,
+                    &file.warnings,
+                )?;
+            }
         }
 
         delete_stale_files(&transaction, &index_path, repo_id, scan_run_id)?;
@@ -538,8 +616,22 @@ fn next_run_key(
     Ok(format!("scan-{next_run_number:016}"))
 }
 
+fn prepare_statement<'transaction>(
+    transaction: &'transaction Transaction<'_>,
+    index_path: &Path,
+    sql: &str,
+) -> Result<Statement<'transaction>, IndexError> {
+    transaction
+        .prepare(sql)
+        .map_err(|source| IndexError::PersistScan {
+            path: index_path.to_path_buf(),
+            source,
+        })
+}
+
 fn persist_file(
-    transaction: &Transaction<'_>,
+    file_upsert: &mut Statement<'_>,
+    file_id_query: &mut Statement<'_>,
     index_path: &Path,
     repo_id: i64,
     scan_run_id: i64,
@@ -548,60 +640,28 @@ fn persist_file(
     let byte_size = optional_u64_to_i64(file.byte_size, index_path, "byte_size")?;
     let line_count = optional_u64_to_i64(file.line_count, index_path, "line_count")?;
 
-    transaction
-        .execute(
-            "INSERT INTO files (
-                repo_id,
-                path,
-                byte_size,
-                extension,
-                language,
-                line_count,
-                content_kind,
-                is_vendor,
-                is_generated,
-                is_symlink,
-                classification,
-                scan_run_id
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-            ON CONFLICT(repo_id, path) DO UPDATE SET
-                byte_size = excluded.byte_size,
-                extension = excluded.extension,
-                language = excluded.language,
-                line_count = excluded.line_count,
-                content_kind = excluded.content_kind,
-                is_vendor = excluded.is_vendor,
-                is_generated = excluded.is_generated,
-                is_symlink = excluded.is_symlink,
-                classification = excluded.classification,
-                scan_run_id = excluded.scan_run_id;",
-            params![
-                repo_id,
-                &file.path,
-                byte_size,
-                file.extension.as_deref(),
-                file.language,
-                line_count,
-                content_kind_to_index(file.content),
-                file.is_vendor,
-                file.is_generated,
-                file.is_symlink,
-                file.classification,
-                scan_run_id,
-            ],
-        )
+    file_upsert
+        .execute(params![
+            repo_id,
+            &file.path,
+            byte_size,
+            file.extension.as_deref(),
+            file.language,
+            line_count,
+            content_kind_to_index(file.content),
+            file.is_vendor,
+            file.is_generated,
+            file.is_symlink,
+            file.classification,
+            scan_run_id,
+        ])
         .map_err(|source| IndexError::PersistScan {
             path: index_path.to_path_buf(),
             source,
         })?;
 
-    transaction
-        .query_row(
-            "SELECT id FROM files WHERE repo_id = ?1 AND path = ?2;",
-            params![repo_id, &file.path],
-            |row| row.get(0),
-        )
+    file_id_query
+        .query_row(params![repo_id, &file.path], |row| row.get(0))
         .map_err(|source| IndexError::PersistScan {
             path: index_path.to_path_buf(),
             source,
@@ -609,31 +669,21 @@ fn persist_file(
 }
 
 fn persist_scan_warnings(
-    transaction: &Transaction<'_>,
+    scan_warning_insert: &mut Statement<'_>,
     index_path: &Path,
     scan_run_id: i64,
     warnings: &[ScanWarning],
 ) -> Result<(), IndexError> {
     for (index, warning) in warnings.iter().enumerate() {
         let warning_order = warning_order_to_i64(index, index_path)?;
-        transaction
-            .execute(
-                "INSERT INTO scan_warnings (
-                    scan_run_id,
-                    warning_order,
-                    code,
-                    path,
-                    message
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5);",
-                params![
-                    scan_run_id,
-                    warning_order,
-                    warning.code,
-                    warning.path.as_deref(),
-                    &warning.message,
-                ],
-            )
+        scan_warning_insert
+            .execute(params![
+                scan_run_id,
+                warning_order,
+                warning.code,
+                warning.path.as_deref(),
+                &warning.message,
+            ])
             .map_err(|source| IndexError::PersistScan {
                 path: index_path.to_path_buf(),
                 source,
@@ -644,7 +694,7 @@ fn persist_scan_warnings(
 }
 
 fn persist_file_warnings(
-    transaction: &Transaction<'_>,
+    file_warning_insert: &mut Statement<'_>,
     index_path: &Path,
     file_id: i64,
     scan_run_id: i64,
@@ -652,24 +702,14 @@ fn persist_file_warnings(
 ) -> Result<(), IndexError> {
     for (index, warning) in warnings.iter().enumerate() {
         let warning_order = warning_order_to_i64(index, index_path)?;
-        transaction
-            .execute(
-                "INSERT INTO file_warnings (
-                    file_id,
-                    scan_run_id,
-                    warning_order,
-                    code,
-                    message
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5);",
-                params![
-                    file_id,
-                    scan_run_id,
-                    warning_order,
-                    warning.code,
-                    &warning.message,
-                ],
-            )
+        file_warning_insert
+            .execute(params![
+                file_id,
+                scan_run_id,
+                warning_order,
+                warning.code,
+                &warning.message,
+            ])
             .map_err(|source| IndexError::PersistScan {
                 path: index_path.to_path_buf(),
                 source,
@@ -2970,10 +3010,20 @@ mod tests {
             .persist_scan(&first)
             .expect("first scan should persist");
 
-        let invalid_second = scan_report(vec![
-            scan_file("src/a.rs", Some(10), Some("Rust"), ContentKind::Text),
+        let mut updated = scan_file("src/a.rs", Some(10), Some("Rust"), ContentKind::Text);
+        updated.warnings.push(FileWarning {
+            code: "line_count_skipped",
+            message: "test warning".to_owned(),
+        });
+        let mut invalid_second = scan_report(vec![
+            updated,
             scan_file("../invalid.rs", Some(1), Some("Rust"), ContentKind::Text),
         ]);
+        invalid_second.warnings.push(ScanWarning {
+            code: "walk_error",
+            path: Some("blocked".to_owned()),
+            message: "test scan warning".to_owned(),
+        });
         let error = store
             .persist_scan(&invalid_second)
             .expect_err("invalid second scan should fail");
@@ -2996,6 +3046,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("src/a.rs", Some(1)), ("src/b.rs", Some(2))]
         );
+
+        let connection = Connection::open(store.path()).expect("index should reopen");
+        assert_eq!(table_count(&connection, "scan_runs"), 1);
+        assert_eq!(table_count(&connection, "files"), 2);
+        assert_eq!(table_count(&connection, "scan_warnings"), 0);
+        assert_eq!(table_count(&connection, "file_warnings"), 0);
     }
 
     #[test]
