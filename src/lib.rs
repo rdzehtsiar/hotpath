@@ -2,19 +2,25 @@
 
 use std::collections::BTreeMap;
 use std::env;
-use std::error::Error;
+use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
-use ignore::{DirEntry, WalkBuilder};
+use ignore::{DirEntry, Error as IgnoreError, WalkBuilder};
 use serde::Serialize;
 
 #[cfg(test)]
 const BINARY_SAMPLE_BYTES: usize = 8 * 1024;
 const MAX_TEXT_READ_BYTES: u64 = 8 * 1024 * 1024;
 const SCAN_SCHEMA_VERSION: &str = "hotpath.scan.v1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedPath {
+    value: String,
+    used_replacement: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -27,6 +33,13 @@ pub enum ContentKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FileWarning {
     pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScanWarning {
+    pub code: &'static str,
+    pub path: Option<String>,
     pub message: String,
 }
 
@@ -61,6 +74,7 @@ pub struct FlagSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WarningSummary {
     pub total_warnings: u64,
+    pub scan_warnings: u64,
     pub unreadable_warnings: u64,
     pub skipped_warnings: u64,
 }
@@ -80,15 +94,22 @@ pub struct ScanReport {
     pub status: &'static str,
     pub file_walking: &'static str,
     pub classification: &'static str,
+    pub warnings: Vec<ScanWarning>,
     pub files: Vec<FileRecord>,
 }
 
 impl ScanReport {
+    #[cfg(test)]
     fn from_files(files: Vec<FileRecord>) -> Self {
+        Self::from_parts(Vec::new(), files)
+    }
+
+    fn from_parts(warnings: Vec<ScanWarning>, files: Vec<FileRecord>) -> Self {
         Self {
             status: "ok",
             file_walking: "implemented",
             classification: "implemented",
+            warnings,
             files,
         }
     }
@@ -108,11 +129,24 @@ impl ScanReport {
             },
             warnings: WarningSummary {
                 total_warnings: 0,
+                scan_warnings: self.warnings.len() as u64,
                 unreadable_warnings: 0,
                 skipped_warnings: 0,
             },
             languages: BTreeMap::new(),
         };
+
+        summary.warnings.total_warnings += summary.warnings.scan_warnings;
+
+        for warning in &self.warnings {
+            if is_unreadable_warning(warning.code) {
+                summary.warnings.unreadable_warnings += 1;
+            }
+
+            if is_skipped_warning(warning.code) {
+                summary.warnings.skipped_warnings += 1;
+            }
+        }
 
         for file in &self.files {
             summary.total_bytes += file.byte_size.unwrap_or(0);
@@ -156,6 +190,7 @@ impl ScanReport {
 struct ScanJsonReport<'a> {
     schema_version: &'static str,
     summary: ScanSummary,
+    warnings: &'a [ScanWarning],
     files: &'a [FileRecord],
 }
 
@@ -166,7 +201,9 @@ pub enum ScanError {
         path: PathBuf,
         source: std::io::Error,
     },
-    Walk(ignore::Error),
+    RootNotDirectory {
+        path: PathBuf,
+    },
     RelativePath {
         root: PathBuf,
         path: PathBuf,
@@ -181,9 +218,15 @@ impl fmt::Display for ScanError {
                 write!(f, "failed to determine the current directory: {source}")
             }
             Self::Root { path, source } => {
-                write!(f, "failed to read scan root '{}': {source}", path.display())
+                write!(
+                    f,
+                    "failed to access scan root '{}': {source}",
+                    path.display()
+                )
             }
-            Self::Walk(source) => write!(f, "failed while walking repository files: {source}"),
+            Self::RootNotDirectory { path } => {
+                write!(f, "scan root '{}' is not a directory", path.display())
+            }
             Self::RelativePath { root, path } => write!(
                 f,
                 "failed to make '{}' relative to scan root '{}'",
@@ -195,20 +238,13 @@ impl fmt::Display for ScanError {
     }
 }
 
-impl Error for ScanError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
+impl StdError for ScanError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::CurrentDir(source) | Self::Root { source, .. } => Some(source),
-            Self::Walk(source) => Some(source),
-            Self::RelativePath { .. } => None,
+            Self::RootNotDirectory { .. } | Self::RelativePath { .. } => None,
             Self::Json(source) => Some(source),
         }
-    }
-}
-
-impl From<ignore::Error> for ScanError {
-    fn from(source: ignore::Error) -> Self {
-        Self::Walk(source)
     }
 }
 
@@ -225,11 +261,28 @@ pub fn scan_current_dir() -> Result<ScanReport, ScanError> {
 }
 
 pub fn scan_repository(root: impl AsRef<Path>) -> Result<ScanReport, ScanError> {
-    let root = root.as_ref();
-    let root = fs::canonicalize(root).map_err(|source| ScanError::Root {
-        path: root.to_path_buf(),
+    let requested_root = root.as_ref();
+    let root = fs::canonicalize(requested_root).map_err(|source| ScanError::Root {
+        path: requested_root.to_path_buf(),
         source,
     })?;
+    let metadata = fs::metadata(&root).map_err(|source| ScanError::Root {
+        path: requested_root.to_path_buf(),
+        source,
+    })?;
+
+    if !metadata.is_dir() {
+        return Err(ScanError::RootNotDirectory {
+            path: requested_root.to_path_buf(),
+        });
+    }
+
+    fs::read_dir(&root).map_err(|source| ScanError::Root {
+        path: requested_root.to_path_buf(),
+        source,
+    })?;
+
+    let mut warnings = Vec::new();
     let mut files = Vec::new();
 
     for entry in WalkBuilder::new(&root)
@@ -243,18 +296,39 @@ pub fn scan_repository(root: impl AsRef<Path>) -> Result<ScanReport, ScanError> 
         .filter_entry(|entry| !is_git_entry(entry))
         .build()
     {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                warnings.push(scan_warning_from_walk_error(&root, &error));
+                continue;
+            }
+        };
+
+        if let Some(error) = entry.error() {
+            warnings.push(scan_warning_from_entry_error(&root, &entry, error));
+        }
 
         if !is_walked_file(&entry) {
+            if entry.file_type().is_none() {
+                warnings.push(scan_warning(
+                    "unsupported_file_type",
+                    normalized_warning_path(&root, entry.path()),
+                    "filesystem entry type is unavailable; entry skipped".to_owned(),
+                ));
+            }
+
             continue;
         }
 
         files.push(classify_file(&root, entry.path())?);
     }
 
+    warnings.sort_by(|left, right| {
+        (&left.path, left.code, &left.message).cmp(&(&right.path, right.code, &right.message))
+    });
     files.sort_by(|left, right| left.path.cmp(&right.path));
 
-    Ok(ScanReport::from_files(files))
+    Ok(ScanReport::from_parts(warnings, files))
 }
 
 pub fn scan_summary() -> Result<String, ScanError> {
@@ -269,6 +343,7 @@ fn render_json(scan: &ScanReport) -> Result<String, ScanError> {
     Ok(serde_json::to_string_pretty(&ScanJsonReport {
         schema_version: SCAN_SCHEMA_VERSION,
         summary: scan.summary(),
+        warnings: &scan.warnings,
         files: &scan.files,
     })?)
 }
@@ -287,23 +362,136 @@ fn is_walked_file(entry: &DirEntry) -> bool {
     })
 }
 
+fn scan_warning(code: &'static str, path: Option<String>, message: String) -> ScanWarning {
+    ScanWarning {
+        code,
+        path,
+        message,
+    }
+}
+
+fn scan_warning_from_walk_error(root: &Path, error: &IgnoreError) -> ScanWarning {
+    let code = if error.is_io() {
+        "walk_io_error"
+    } else {
+        "walk_error"
+    };
+
+    scan_warning(
+        code,
+        ignore_error_path(error).and_then(|path| normalized_warning_path(root, path)),
+        format!(
+            "failed while walking repository entry: {}",
+            ignore_error_message(error)
+        ),
+    )
+}
+
+fn scan_warning_from_entry_error(
+    root: &Path,
+    entry: &DirEntry,
+    error: &IgnoreError,
+) -> ScanWarning {
+    scan_warning(
+        "ignore_parse_error",
+        ignore_error_path(error)
+            .and_then(|path| normalized_warning_path(root, path))
+            .or_else(|| normalized_warning_path(root, entry.path())),
+        format!(
+            "failed to apply ignore rules: {}",
+            ignore_error_message(error)
+        ),
+    )
+}
+
+fn ignore_error_path(error: &IgnoreError) -> Option<&Path> {
+    match error {
+        IgnoreError::Partial(errors) => errors.iter().find_map(ignore_error_path),
+        IgnoreError::WithLineNumber { err, .. } | IgnoreError::WithDepth { err, .. } => {
+            ignore_error_path(err)
+        }
+        IgnoreError::WithPath { path, .. } => Some(path),
+        IgnoreError::Loop { child, .. } => Some(child),
+        IgnoreError::Io(_)
+        | IgnoreError::Glob { .. }
+        | IgnoreError::UnrecognizedFileType(_)
+        | IgnoreError::InvalidDefinition => None,
+    }
+}
+
+fn ignore_error_message(error: &IgnoreError) -> String {
+    match error {
+        IgnoreError::Partial(errors) => match errors.as_slice() {
+            [] => "unknown partial error".to_owned(),
+            [error] => ignore_error_message(error),
+            errors => format!("multiple errors occurred ({} errors)", errors.len()),
+        },
+        IgnoreError::WithLineNumber { line, err } => {
+            format!("line {line}: {}", ignore_error_message(err))
+        }
+        IgnoreError::WithPath { err, .. } | IgnoreError::WithDepth { err, .. } => {
+            ignore_error_message(err)
+        }
+        IgnoreError::Loop { .. } => "filesystem loop detected".to_owned(),
+        IgnoreError::Io(error) => io_error_message(error),
+        IgnoreError::Glob {
+            glob: Some(glob),
+            err,
+        } => {
+            format!("error parsing glob '{glob}': {err}")
+        }
+        IgnoreError::Glob { glob: None, err } => err.to_owned(),
+        IgnoreError::UnrecognizedFileType(file_type) => {
+            format!("unrecognized file type: {file_type}")
+        }
+        IgnoreError::InvalidDefinition => {
+            "invalid file type definition; expected type:glob".to_owned()
+        }
+    }
+}
+
+fn io_error_message(error: &std::io::Error) -> String {
+    match error.raw_os_error() {
+        Some(code) => format!("{:?} (os error {code})", error.kind()),
+        None => format!("{:?}", error.kind()),
+    }
+}
+
+fn normalized_warning_path(root: &Path, path: &Path) -> Option<String> {
+    normalized_relative_path(root, path).ok().and_then(|path| {
+        if path.value.is_empty() {
+            None
+        } else {
+            Some(path.value)
+        }
+    })
+}
+
 fn classify_file(root: &Path, path: &Path) -> Result<FileRecord, ScanError> {
     let relative_path = normalized_relative_path(root, path)?;
     let mut record = FileRecord {
         byte_size: None,
-        extension: file_extension(&relative_path),
-        language: language_guess(&relative_path),
+        extension: file_extension(&relative_path.value),
+        language: language_guess(&relative_path.value),
         line_count: None,
-        is_vendor: is_vendor_path(&relative_path),
-        is_generated: is_generated_path(&relative_path),
+        is_vendor: is_vendor_path(&relative_path.value),
+        is_generated: is_generated_path(&relative_path.value),
         content: ContentKind::Unknown,
         is_symlink: fs::symlink_metadata(path)
             .map(|metadata| metadata.file_type().is_symlink())
             .unwrap_or(false),
         classification: "implemented",
         warnings: Vec::new(),
-        path: relative_path,
+        path: relative_path.value,
     };
+
+    if relative_path.used_replacement {
+        record.warnings.push(file_warning(
+            "unsupported_path_encoding",
+            "file path is not valid UTF-8; replacement characters were used in portable output"
+                .to_owned(),
+        ));
+    }
 
     if record.is_symlink {
         let target = match fs::canonicalize(path) {
@@ -519,12 +707,22 @@ fn render_summary(scan: &ScanReport) -> String {
     );
 
     if scan_summary.warnings.total_warnings > 0 {
-        summary.push_str(&format!(
-            "\nwarnings: {} (unreadable {}, skipped {})",
-            scan_summary.warnings.total_warnings,
-            scan_summary.warnings.unreadable_warnings,
-            scan_summary.warnings.skipped_warnings
-        ));
+        if scan_summary.warnings.scan_warnings > 0 {
+            summary.push_str(&format!(
+                "\nwarnings: {} (scan {}, unreadable {}, skipped {})",
+                scan_summary.warnings.total_warnings,
+                scan_summary.warnings.scan_warnings,
+                scan_summary.warnings.unreadable_warnings,
+                scan_summary.warnings.skipped_warnings
+            ));
+        } else {
+            summary.push_str(&format!(
+                "\nwarnings: {} (unreadable {}, skipped {})",
+                scan_summary.warnings.total_warnings,
+                scan_summary.warnings.unreadable_warnings,
+                scan_summary.warnings.skipped_warnings
+            ));
+        }
     }
 
     summary.push_str("\nlanguages:");
@@ -543,25 +741,37 @@ fn render_summary(scan: &ScanReport) -> String {
 fn is_unreadable_warning(code: &str) -> bool {
     matches!(
         code,
-        "metadata_failed" | "read_failed" | "symlink_target_unreadable"
+        "metadata_failed" | "read_failed" | "symlink_target_unreadable" | "walk_io_error"
     )
 }
 
 fn is_skipped_warning(code: &str) -> bool {
-    matches!(code, "line_count_skipped" | "symlink_target_outside_root")
+    matches!(
+        code,
+        "line_count_skipped"
+            | "symlink_target_outside_root"
+            | "unsupported_file_type"
+            | "walk_error"
+            | "walk_io_error"
+    )
 }
 
-fn normalized_relative_path(root: &Path, path: &Path) -> Result<String, ScanError> {
+fn normalized_relative_path(root: &Path, path: &Path) -> Result<NormalizedPath, ScanError> {
     let relative = path
         .strip_prefix(root)
         .map_err(|_| ScanError::RelativePath {
             root: root.to_path_buf(),
             path: path.to_path_buf(),
         })?;
+    let mut used_replacement = false;
     let parts = relative
         .components()
         .filter_map(|component| match component {
-            Component::Normal(part) => Some(part.to_string_lossy()),
+            Component::Normal(part) => {
+                let text = part.to_string_lossy();
+                used_replacement |= text.contains('\u{FFFD}');
+                Some(text.into_owned())
+            }
             Component::CurDir => None,
             Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
                 unreachable!("stripped repository-relative paths cannot contain root components")
@@ -569,7 +779,10 @@ fn normalized_relative_path(root: &Path, path: &Path) -> Result<String, ScanErro
         })
         .collect::<Vec<_>>();
 
-    Ok(parts.join("/"))
+    Ok(NormalizedPath {
+        value: parts.join("/"),
+        used_replacement,
+    })
 }
 
 #[cfg(test)]
@@ -650,6 +863,14 @@ mod tests {
         let json = render_json(scan).expect("json should render");
 
         serde_json::from_str(&json).expect("json should parse")
+    }
+
+    fn scan_warning_record(code: &'static str, path: Option<&str>) -> ScanWarning {
+        scan_warning(
+            code,
+            path.map(ToOwned::to_owned),
+            "test scan warning".to_owned(),
+        )
     }
 
     fn record(
@@ -736,6 +957,34 @@ mod tests {
     }
 
     #[test]
+    fn scan_rejects_missing_roots_with_actionable_error() {
+        let fixture = Fixture::new("missing-root");
+        let missing = fixture.path.join("missing");
+        let error = scan_repository(&missing).expect_err("missing root should fail");
+
+        match error {
+            ScanError::Root { path, source } => {
+                assert_eq!(path, missing);
+                assert_eq!(source.kind(), io::ErrorKind::NotFound);
+            }
+            error => panic!("expected root access error, got {error:?}"),
+        }
+    }
+
+    #[test]
+    fn scan_rejects_non_directory_roots() {
+        let fixture = Fixture::new("file-root");
+        fixture.write("not-a-directory.rs", "");
+        let root_file = fixture.path.join("not-a-directory.rs");
+        let error = scan_repository(&root_file).expect_err("file root should fail");
+
+        match error {
+            ScanError::RootNotDirectory { path } => assert_eq!(path, root_file),
+            error => panic!("expected non-directory root error, got {error:?}"),
+        }
+    }
+
+    #[test]
     fn scan_respects_gitignore_patterns() {
         let fixture = Fixture::new("gitignore");
         fixture.write(".gitignore", "ignored/\n*.log\n");
@@ -744,6 +993,59 @@ mod tests {
         fixture.write("notes.log", "");
 
         assert_eq!(scanned_paths(&fixture.path), vec![".gitignore", "keep.rs"]);
+    }
+
+    #[test]
+    fn ignore_parse_errors_are_scan_warnings_without_aborting() {
+        let fixture = Fixture::new("bad-gitignore");
+        fixture.write(".gitignore", "{foo\n");
+        fixture.write("keep.rs", "");
+
+        let report = scan_repository(&fixture.path).expect("scan should return partial results");
+        let warning = report
+            .warnings
+            .iter()
+            .find(|warning| warning.code == "ignore_parse_error" || warning.code == "walk_error")
+            .expect("scan should report malformed ignore file");
+
+        assert!(report.files.iter().any(|file| file.path == "keep.rs"));
+        assert!(warning.message.contains("glob") || warning.message.contains("ignore"));
+        assert!(warning
+            .path
+            .as_deref()
+            .is_none_or(|path| { !path.contains(&fixture.path.display().to_string()) }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directories_are_scan_warnings_without_aborting() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new("unreadable-directory");
+        fixture.write("keep.rs", "");
+        fixture.write("blocked/secret.rs", "");
+        let blocked = fixture.path.join("blocked");
+        let original_permissions = fs::metadata(&blocked)
+            .expect("blocked directory metadata should be readable")
+            .permissions();
+        let mut denied_permissions = original_permissions.clone();
+        denied_permissions.set_mode(0);
+        fs::set_permissions(&blocked, denied_permissions)
+            .expect("blocked directory permissions should be changed");
+
+        let report = scan_repository(&fixture.path).expect("scan should return partial results");
+
+        fs::set_permissions(&blocked, original_permissions)
+            .expect("blocked directory permissions should be restored");
+
+        assert!(report.files.iter().any(|file| file.path == "keep.rs"));
+        assert!(!report
+            .files
+            .iter()
+            .any(|file| file.path == "blocked/secret.rs"));
+        assert!(report.warnings.iter().any(|warning| {
+            warning.code == "walk_io_error" && warning.path.as_deref() == Some("blocked")
+        }));
     }
 
     #[test]
@@ -1057,6 +1359,41 @@ mod tests {
     }
 
     #[test]
+    fn summary_reports_scan_warning_counts() {
+        let scan = ScanReport::from_parts(
+            vec![scan_warning_record("walk_io_error", Some("blocked"))],
+            vec![record(
+                "src/lib.rs",
+                Some(10),
+                Some("Rust"),
+                ContentKind::Text,
+            )],
+        );
+
+        let summary = render_summary(&scan);
+
+        assert!(summary.contains("warnings: 1 (scan 1, unreadable 1, skipped 1)"));
+    }
+
+    #[test]
+    fn summary_counts_unsupported_file_type_scan_warning_as_skipped() {
+        let scan = ScanReport::from_parts(
+            vec![scan_warning_record(
+                "unsupported_file_type",
+                Some("unknown-entry"),
+            )],
+            Vec::new(),
+        );
+
+        let summary = scan.summary();
+
+        assert_eq!(summary.warnings.total_warnings, 1);
+        assert_eq!(summary.warnings.scan_warnings, 1);
+        assert_eq!(summary.warnings.unreadable_warnings, 0);
+        assert_eq!(summary.warnings.skipped_warnings, 1);
+    }
+
+    #[test]
     fn json_reports_schema_version_and_summary_totals() {
         let mut generated = record(
             "dist/app.generated.js",
@@ -1089,10 +1426,38 @@ mod tests {
         assert_eq!(value["summary"]["flags"]["generated_files"], 1);
         assert_eq!(value["summary"]["flags"]["vendor_files"], 1);
         assert_eq!(value["summary"]["warnings"]["total_warnings"], 1);
+        assert_eq!(value["summary"]["warnings"]["scan_warnings"], 0);
         assert_eq!(value["summary"]["warnings"]["unreadable_warnings"], 1);
         assert_eq!(value["summary"]["warnings"]["skipped_warnings"], 0);
         assert_eq!(value["summary"]["languages"]["JavaScript"], 1);
         assert_eq!(value["summary"]["languages"]["Rust"], 1);
+    }
+
+    #[test]
+    fn json_reports_scan_warnings_without_absolute_paths() {
+        let scan = ScanReport::from_parts(
+            vec![scan_warning_record("walk_io_error", Some("blocked"))],
+            Vec::new(),
+        );
+
+        let value = json_value(&scan);
+
+        assert_eq!(value["schema_version"], "hotpath.scan.v1");
+        assert!(value
+            .as_object()
+            .expect("scan JSON should be an object")
+            .contains_key("warnings"));
+        assert!(value["summary"]["warnings"]
+            .as_object()
+            .expect("summary warnings should be an object")
+            .contains_key("scan_warnings"));
+        assert_eq!(value["summary"]["warnings"]["total_warnings"], 1);
+        assert_eq!(value["summary"]["warnings"]["scan_warnings"], 1);
+        assert_eq!(value["summary"]["warnings"]["unreadable_warnings"], 1);
+        assert_eq!(value["summary"]["warnings"]["skipped_warnings"], 1);
+        assert_eq!(value["warnings"][0]["code"], "walk_io_error");
+        assert_eq!(value["warnings"][0]["path"], "blocked");
+        assert_eq!(value["warnings"][0]["message"], "test scan warning");
     }
 
     #[test]
@@ -1133,7 +1498,7 @@ mod tests {
 
         assert_eq!(
             json,
-            "{\n  \"schema_version\": \"hotpath.scan.v1\",\n  \"summary\": {\n    \"total_files\": 1,\n    \"total_bytes\": 10,\n    \"content\": {\n      \"text_files\": 1,\n      \"binary_files\": 0,\n      \"unknown_files\": 0\n    },\n    \"flags\": {\n      \"generated_files\": 0,\n      \"vendor_files\": 0\n    },\n    \"warnings\": {\n      \"total_warnings\": 0,\n      \"unreadable_warnings\": 0,\n      \"skipped_warnings\": 0\n    },\n    \"languages\": {\n      \"Rust\": 1\n    }\n  },\n  \"files\": [\n    {\n      \"path\": \"src/lib.rs\",\n      \"byte_size\": 10,\n      \"extension\": \"rs\",\n      \"language\": \"Rust\",\n      \"line_count\": 1,\n      \"is_vendor\": false,\n      \"is_generated\": false,\n      \"content\": \"text\",\n      \"is_symlink\": false,\n      \"classification\": \"implemented\",\n      \"warnings\": []\n    }\n  ]\n}"
+            "{\n  \"schema_version\": \"hotpath.scan.v1\",\n  \"summary\": {\n    \"total_files\": 1,\n    \"total_bytes\": 10,\n    \"content\": {\n      \"text_files\": 1,\n      \"binary_files\": 0,\n      \"unknown_files\": 0\n    },\n    \"flags\": {\n      \"generated_files\": 0,\n      \"vendor_files\": 0\n    },\n    \"warnings\": {\n      \"total_warnings\": 0,\n      \"scan_warnings\": 0,\n      \"unreadable_warnings\": 0,\n      \"skipped_warnings\": 0\n    },\n    \"languages\": {\n      \"Rust\": 1\n    }\n  },\n  \"warnings\": [],\n  \"files\": [\n    {\n      \"path\": \"src/lib.rs\",\n      \"byte_size\": 10,\n      \"extension\": \"rs\",\n      \"language\": \"Rust\",\n      \"line_count\": 1,\n      \"is_vendor\": false,\n      \"is_generated\": false,\n      \"content\": \"text\",\n      \"is_symlink\": false,\n      \"classification\": \"implemented\",\n      \"warnings\": []\n    }\n  ]\n}"
         );
     }
 

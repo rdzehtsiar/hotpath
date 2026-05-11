@@ -288,6 +288,33 @@ fn scan_json_output_is_stable_across_runs() {
 }
 
 #[test]
+fn scan_json_reports_scan_warning_fields_end_to_end() {
+    let fixture = Fixture::new("json-scan-warning");
+    fixture.write(".gitignore", "{foo\n");
+    fixture.write("keep.rs", "");
+
+    let (_, value) = scan_json(&fixture.path);
+    let warnings = value["warnings"]
+        .as_array()
+        .expect("top-level warnings should be an array");
+    let warning = warnings
+        .iter()
+        .find(|warning| warning["code"] == "ignore_parse_error")
+        .expect("malformed .gitignore should produce a scan warning");
+
+    assert_eq!(value["schema_version"], "hotpath.scan.v1");
+    assert!(warning["path"].is_string() || warning["path"].is_null());
+    assert!(warning["message"]
+        .as_str()
+        .expect("scan warning message should be a string")
+        .contains("glob"));
+    assert_eq!(value["summary"]["warnings"]["total_warnings"], 1);
+    assert_eq!(value["summary"]["warnings"]["scan_warnings"], 1);
+    assert_eq!(value["summary"]["warnings"]["unreadable_warnings"], 0);
+    assert_eq!(value["summary"]["warnings"]["skipped_warnings"], 0);
+}
+
+#[test]
 fn scan_summary_and_default_cli_report_concise_totals() {
     let fixture = Fixture::new("summary");
     fixture.write("src/lib.rs", "fn lib() {}\n");
