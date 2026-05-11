@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -7,6 +8,10 @@ use std::path::{Path, PathBuf};
 use git2::{
     Delta, Diff, DiffFindOptions, DiffOptions, ErrorClass, ErrorCode, Oid, Patch, Repository, Sort,
 };
+
+const RECENT_CHURN_WINDOW_DAYS: i64 = 90;
+const SECONDS_PER_DAY: i64 = 86_400;
+const RECENT_CHURN_WINDOW_SECONDS: i64 = RECENT_CHURN_WINDOW_DAYS * SECONDS_PER_DAY;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A raw repository-relative file change observed in one reachable commit.
@@ -40,6 +45,39 @@ pub enum GitChangeKind {
     Renamed,
     Copied,
     TypeChanged,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+/// Aggregated churn and ownership metrics for one repository-relative path.
+pub struct GitFileMetrics {
+    /// Repository-relative path using `/` separators.
+    pub path: String,
+    /// Number of distinct commits that touched this path.
+    pub commits_per_file: u64,
+    /// Total added lines across all observed file changes for this path.
+    pub total_churn_added: u64,
+    /// Total deleted lines across all observed file changes for this path.
+    pub total_churn_deleted: u64,
+    /// Added lines in the 90-day window relative to the HEAD commit time.
+    pub recent_churn_added: u64,
+    /// Deleted lines in the 90-day window relative to the HEAD commit time.
+    pub recent_churn_deleted: u64,
+    /// Number of distinct exact author identities that touched this path.
+    pub author_count: u64,
+    /// Author identity with the most file-touching commits for this path.
+    pub dominant_owner: Option<String>,
+    /// Dominant owner's share of file-touching commits for this path.
+    pub dominant_owner_share: Option<f64>,
+    /// First observed commit id for this path by commit time, then commit id.
+    pub first_commit_id: Option<String>,
+    /// First observed committer timestamp for this path.
+    pub first_commit_time: Option<i64>,
+    /// Last observed commit id for this path by commit time, then commit id.
+    pub last_commit_id: Option<String>,
+    /// Last observed committer timestamp for this path.
+    pub last_commit_time: Option<i64>,
+    /// Whole days between first observed commit time and HEAD commit time.
+    pub file_age_days: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -220,6 +258,40 @@ pub fn file_changes_from_head(
     Ok(changes)
 }
 
+/// Aggregate raw file changes into deterministic per-file Git metrics.
+///
+/// `head_commit_time` is the committer timestamp of `HEAD` in seconds since the
+/// Unix epoch. Recent churn uses the documented 90-day window relative to that
+/// timestamp rather than the machine clock.
+pub fn file_metrics_from_changes(
+    changes: &[GitFileChange],
+    head_commit_time: i64,
+) -> Vec<GitFileMetrics> {
+    let recent_threshold = head_commit_time.saturating_sub(RECENT_CHURN_WINDOW_SECONDS);
+    let mut by_path = BTreeMap::<String, FileMetricAccumulator>::new();
+
+    for change in changes {
+        let accumulator = by_path
+            .entry(change.path.clone())
+            .or_insert_with(|| FileMetricAccumulator::new(change.path.clone()));
+
+        accumulator.total_churn_added += change.added_lines;
+        accumulator.total_churn_deleted += change.deleted_lines;
+
+        if change.commit_time >= recent_threshold {
+            accumulator.recent_churn_added += change.added_lines;
+            accumulator.recent_churn_deleted += change.deleted_lines;
+        }
+
+        accumulator.record_touch(change);
+    }
+
+    by_path
+        .into_values()
+        .map(|accumulator| accumulator.into_metrics(head_commit_time))
+        .collect()
+}
+
 fn head_commit<'repo>(
     repository: &'repo Repository,
     worktree_path: &Path,
@@ -378,5 +450,123 @@ fn change_kind(delta: Delta) -> Option<GitChangeKind> {
         | Delta::Untracked
         | Delta::Unreadable
         | Delta::Conflicted => None,
+    }
+}
+
+#[derive(Debug)]
+struct FileMetricAccumulator {
+    path: String,
+    total_churn_added: u64,
+    total_churn_deleted: u64,
+    recent_churn_added: u64,
+    recent_churn_deleted: u64,
+    commits: BTreeSet<String>,
+    author_touch_counts: BTreeMap<String, u64>,
+    first_commit: Option<CommitPoint>,
+    last_commit: Option<CommitPoint>,
+}
+
+impl FileMetricAccumulator {
+    fn new(path: String) -> Self {
+        Self {
+            path,
+            total_churn_added: 0,
+            total_churn_deleted: 0,
+            recent_churn_added: 0,
+            recent_churn_deleted: 0,
+            commits: BTreeSet::new(),
+            author_touch_counts: BTreeMap::new(),
+            first_commit: None,
+            last_commit: None,
+        }
+    }
+
+    fn record_touch(&mut self, change: &GitFileChange) {
+        let point = CommitPoint {
+            id: change.commit_id.clone(),
+            time: change.commit_time,
+        };
+
+        if self.commits.insert(change.commit_id.clone()) {
+            *self
+                .author_touch_counts
+                .entry(change.author.clone())
+                .or_insert(0) += 1;
+            self.record_commit_point(point);
+        }
+    }
+
+    fn record_commit_point(&mut self, point: CommitPoint) {
+        if self
+            .first_commit
+            .as_ref()
+            .is_none_or(|first| point.sort_key() < first.sort_key())
+        {
+            self.first_commit = Some(point.clone());
+        }
+
+        if self
+            .last_commit
+            .as_ref()
+            .is_none_or(|last| point.sort_key() > last.sort_key())
+        {
+            self.last_commit = Some(point);
+        }
+    }
+
+    fn into_metrics(self, head_commit_time: i64) -> GitFileMetrics {
+        let commits_per_file = self.commits.len() as u64;
+        let author_count = self.author_touch_counts.len() as u64;
+        let dominant = self.author_touch_counts.iter().max_by(
+            |(left_author, left_count), (right_author, right_count)| {
+                left_count
+                    .cmp(right_count)
+                    .then_with(|| right_author.cmp(left_author))
+            },
+        );
+        let dominant_owner = dominant.map(|(author, _count)| author.clone());
+        let dominant_owner_share = dominant.map(|(_author, count)| {
+            let count = *count as f64;
+
+            count / commits_per_file as f64
+        });
+        let first_commit = self.first_commit;
+        let last_commit = self.last_commit;
+        let file_age_days = first_commit.as_ref().map(|commit| {
+            if commit.time >= head_commit_time {
+                0
+            } else {
+                ((head_commit_time - commit.time) / SECONDS_PER_DAY) as u64
+            }
+        });
+
+        GitFileMetrics {
+            path: self.path,
+            commits_per_file,
+            total_churn_added: self.total_churn_added,
+            total_churn_deleted: self.total_churn_deleted,
+            recent_churn_added: self.recent_churn_added,
+            recent_churn_deleted: self.recent_churn_deleted,
+            author_count,
+            dominant_owner,
+            dominant_owner_share,
+            first_commit_id: first_commit.as_ref().map(|commit| commit.id.clone()),
+            first_commit_time: first_commit.as_ref().map(|commit| commit.time),
+            last_commit_id: last_commit.as_ref().map(|commit| commit.id.clone()),
+            last_commit_time: last_commit.as_ref().map(|commit| commit.time),
+            file_age_days,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CommitPoint {
+    id: String,
+    time: i64,
+}
+
+impl CommitPoint {
+    fn sort_key(&self) -> (i64, &str) {
+        (self.time, self.id.as_str())
     }
 }

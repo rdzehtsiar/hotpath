@@ -4,7 +4,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use hotpath::git::{file_changes_from_head, GitChangeKind, GitFileChange, GitHistoryError};
+use hotpath::git::{
+    file_changes_from_head, file_metrics_from_changes, GitChangeKind, GitFileChange,
+    GitHistoryError,
+};
 
 mod support;
 
@@ -182,6 +185,142 @@ fn git_history_reports_rename_destination_path_conservatively() {
 }
 
 #[test]
+fn git_file_metrics_report_exact_fixture_values() {
+    let fixture = GitFixture::new("file-metrics");
+    let ada = GitIdentity::new("Ada Lovelace", "ada@example.invalid");
+    let ben = GitIdentity::new("Ben Bitdiddle", "ben@example.invalid");
+    let cara = GitIdentity::new("Cara Committer", "cara@example.invalid");
+
+    fixture.write("src/lib.rs", "one\ntwo\n");
+    let first_src = fixture.commit(CommitOptions::new(
+        "Add source",
+        ada.clone(),
+        "2024-01-01T00:00:00 +0000",
+    ));
+
+    fixture.write("src/lib.rs", "one\nthree\nfour\n");
+    fixture.commit(CommitOptions::new(
+        "Rewrite source line",
+        ben,
+        "2024-01-15T00:00:00 +0000",
+    ));
+
+    fixture.write("src/lib.rs", "one\nthree\nfour\nfive\n");
+    let last_src = fixture.commit(CommitOptions::new(
+        "Extend source",
+        ada,
+        "2024-03-01T00:00:00 +0000",
+    ));
+
+    fixture.write("README.md", "readme\n");
+    let readme = fixture.commit(CommitOptions::new(
+        "Add readme",
+        cara,
+        "2024-04-10T00:00:00 +0000",
+    ));
+
+    let changes = file_changes_from_head(fixture.path()).expect("history should be readable");
+    let metrics = file_metrics_from_changes(&changes, 1_712_707_200);
+
+    assert_eq!(metrics.len(), 2);
+    assert_eq!(metrics[0].path, "README.md");
+    assert_eq!(metrics[0].commits_per_file, 1);
+    assert_eq!(metrics[0].total_churn_added, 1);
+    assert_eq!(metrics[0].total_churn_deleted, 0);
+    assert_eq!(metrics[0].recent_churn_added, 1);
+    assert_eq!(metrics[0].recent_churn_deleted, 0);
+    assert_eq!(metrics[0].author_count, 1);
+    assert_eq!(
+        metrics[0].dominant_owner.as_deref(),
+        Some("Cara Committer <cara@example.invalid>")
+    );
+    assert_eq!(metrics[0].dominant_owner_share, Some(1.0));
+    assert_eq!(metrics[0].first_commit_id.as_deref(), Some(readme.as_str()));
+    assert_eq!(metrics[0].first_commit_time, Some(1_712_707_200));
+    assert_eq!(metrics[0].last_commit_id.as_deref(), Some(readme.as_str()));
+    assert_eq!(metrics[0].last_commit_time, Some(1_712_707_200));
+    assert_eq!(metrics[0].file_age_days, Some(0));
+
+    assert_eq!(metrics[1].path, "src/lib.rs");
+    assert_eq!(metrics[1].commits_per_file, 3);
+    assert_eq!(metrics[1].total_churn_added, 5);
+    assert_eq!(metrics[1].total_churn_deleted, 1);
+    assert_eq!(metrics[1].recent_churn_added, 3);
+    assert_eq!(metrics[1].recent_churn_deleted, 1);
+    assert_eq!(metrics[1].author_count, 2);
+    assert_eq!(
+        metrics[1].dominant_owner.as_deref(),
+        Some("Ada Lovelace <ada@example.invalid>")
+    );
+    assert_eq!(metrics[1].dominant_owner_share, Some(2.0 / 3.0));
+    assert_eq!(
+        metrics[1].first_commit_id.as_deref(),
+        Some(first_src.as_str())
+    );
+    assert_eq!(metrics[1].first_commit_time, Some(1_704_067_200));
+    assert_eq!(
+        metrics[1].last_commit_id.as_deref(),
+        Some(last_src.as_str())
+    );
+    assert_eq!(metrics[1].last_commit_time, Some(1_709_251_200));
+    assert_eq!(metrics[1].file_age_days, Some(100));
+}
+
+#[test]
+fn git_file_metrics_break_dominant_owner_ties_by_author_identity() {
+    let changes = vec![
+        raw_change(
+            "b",
+            "Zed Zed <zed@example.invalid>",
+            200,
+            "src/lib.rs",
+            1,
+            0,
+        ),
+        raw_change(
+            "a",
+            "Ada Ada <ada@example.invalid>",
+            100,
+            "src/lib.rs",
+            1,
+            0,
+        ),
+    ];
+
+    let metrics = file_metrics_from_changes(&changes, 200);
+
+    assert_eq!(metrics.len(), 1);
+    assert_eq!(
+        metrics[0].dominant_owner.as_deref(),
+        Some("Ada Ada <ada@example.invalid>")
+    );
+    assert_eq!(metrics[0].dominant_owner_share, Some(0.5));
+}
+
+#[test]
+fn git_file_metrics_clamp_age_when_commit_time_is_after_head_time() {
+    let head_time = 1_700_000_000;
+    let future_time = head_time + 86_400;
+    let changes = vec![raw_change(
+        "future",
+        "Skewed Author <skew@example.invalid>",
+        future_time,
+        "future.txt",
+        3,
+        1,
+    )];
+
+    let metrics = file_metrics_from_changes(&changes, head_time);
+
+    assert_eq!(metrics.len(), 1);
+    assert_eq!(metrics[0].first_commit_time, Some(future_time));
+    assert_eq!(metrics[0].last_commit_time, Some(future_time));
+    assert_eq!(metrics[0].file_age_days, Some(0));
+    assert_eq!(metrics[0].recent_churn_added, 3);
+    assert_eq!(metrics[0].recent_churn_deleted, 1);
+}
+
+#[test]
 fn git_history_errors_when_path_is_not_a_git_repository() {
     let fixture = TempDir::new("not-git");
 
@@ -218,6 +357,27 @@ fn change_summary(changes: &[GitFileChange]) -> Vec<ChangeSummary<'_>> {
             )
         })
         .collect()
+}
+
+fn raw_change(
+    commit_id: &str,
+    author: &str,
+    commit_time: i64,
+    path: &str,
+    added_lines: u64,
+    deleted_lines: u64,
+) -> GitFileChange {
+    GitFileChange {
+        commit_id: commit_id.to_owned(),
+        parent_count: 1,
+        is_merge: false,
+        author: author.to_owned(),
+        commit_time,
+        path: path.to_owned(),
+        change_kind: GitChangeKind::Modified,
+        added_lines,
+        deleted_lines,
+    }
 }
 
 #[derive(Debug)]
