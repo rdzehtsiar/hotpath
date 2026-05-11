@@ -94,6 +94,13 @@ fn scan_json(current_dir: &Path) -> (String, Value) {
     (stdout, value)
 }
 
+fn parse_json(current_dir: &Path) -> (String, Value) {
+    let stdout = successful_stdout(&["parse", "--json"], current_dir);
+    let value = serde_json::from_str(&stdout).expect("parse JSON should parse");
+
+    (stdout, value)
+}
+
 fn expected_doctor_stdout() -> &'static str {
     concat!(
         "Hotpath doctor\n",
@@ -650,6 +657,97 @@ fn scan_rejects_conflicting_output_flags_before_persisting() {
     assert!(stderr.contains("--summary"));
     assert!(stderr.contains("--json"));
     assert!(!fixture.path.join(".hotpath").exists());
+}
+
+#[test]
+fn parse_summary_command_exists_and_persists_scan() {
+    let fixture = Fixture::new("parse-summary");
+    fixture.write("README.md", "# Fixture\n");
+    fixture.write("src/lib.rs", "pub fn lib() {}\n");
+
+    let stdout = successful_stdout(&["parse"], &fixture.path);
+
+    assert_eq!(
+        stdout,
+        concat!(
+            "Hotpath parse summary\n",
+            "total files   2\n",
+            "candidates    1\n",
+            "pending       1\n",
+            "skipped       1\n",
+            "symbols       0\n",
+            "imports       0\n",
+        )
+    );
+    assert!(fixture.path.join(".hotpath").join("index.db").is_file());
+}
+
+#[test]
+fn parse_json_reports_schema_and_skips_unsupported_files_end_to_end() {
+    let fixture = Fixture::new("parse-json");
+    fixture.write("README.md", "# Fixture\n");
+    fixture.write("src/lib.rs", "pub fn lib() {}\n");
+    fixture.write_bytes("assets/logo.bin", &[0x89, b'P', b'N', b'G', 0, 1, 2, 3]);
+
+    let (_, value) = parse_json(&fixture.path);
+    let files = value["files"].as_array().expect("files should be an array");
+
+    assert_eq!(value["schema_version"], "hotpath.parse.v1");
+    assert_eq!(value["summary"]["total_files"], 3);
+    assert_eq!(value["summary"]["candidate_files"], 1);
+    assert_eq!(value["summary"]["pending_files"], 1);
+    assert_eq!(value["summary"]["skipped_files"], 2);
+    assert_eq!(value["summary"]["symbol_count"], 0);
+    assert_eq!(value["summary"]["import_count"], 0);
+    assert_eq!(value["summary"]["warning_count"], 0);
+    assert_eq!(value["warnings"], Value::Array(Vec::new()));
+    assert_eq!(value["symbols"], Value::Array(Vec::new()));
+    assert_eq!(value["imports"], Value::Array(Vec::new()));
+    assert_json_strings_do_not_contain_path(&value, &fixture.path);
+
+    assert_eq!(
+        files
+            .iter()
+            .map(|file| file["path"].as_str().expect("path should be a string"))
+            .collect::<Vec<_>>(),
+        vec!["README.md", "assets/logo.bin", "src/lib.rs"]
+    );
+
+    let rust = file_by_path(&value, "src/lib.rs");
+    assert_eq!(rust["language"], "Rust");
+    assert_eq!(rust["content"], "text");
+    assert_eq!(rust["status"], "pending");
+    assert_eq!(rust["reason"], "parser_extraction_pending");
+    assert_eq!(rust["symbol_count"], 0);
+    assert_eq!(rust["import_count"], 0);
+
+    let markdown = file_by_path(&value, "README.md");
+    assert_eq!(markdown["language"], "Markdown");
+    assert_eq!(markdown["content"], "text");
+    assert_eq!(markdown["status"], "skipped");
+    assert_eq!(markdown["reason"], "unsupported_language");
+
+    let binary = file_by_path(&value, "assets/logo.bin");
+    assert_eq!(binary["language"], Value::Null);
+    assert_eq!(binary["content"], "binary");
+    assert_eq!(binary["status"], "skipped");
+    assert_eq!(binary["reason"], "unsupported_content");
+
+    let persisted = IndexStore::open(&fixture.path)
+        .expect("index should open")
+        .latest_scan()
+        .expect("latest scan should read")
+        .expect("latest scan should exist");
+
+    assert_eq!(persisted.run.files_observed, Some(3));
+    assert_eq!(
+        persisted
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["README.md", "assets/logo.bin", "src/lib.rs"]
+    );
 }
 
 #[test]

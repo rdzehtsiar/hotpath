@@ -19,6 +19,7 @@ pub mod storage;
 const BINARY_SAMPLE_BYTES: usize = 8 * 1024;
 const MAX_TEXT_READ_BYTES: u64 = 8 * 1024 * 1024;
 pub const SCAN_SCHEMA_VERSION: &str = "hotpath.scan.v1";
+pub const PARSE_SCHEMA_VERSION: &str = "hotpath.parse.v1";
 pub const DEFAULT_HOTSPOTS_LIMIT: usize = 10;
 const SUMMARY_LABEL_WIDTH: usize = 12;
 
@@ -149,6 +150,101 @@ impl ScanReport {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParseFileStatus {
+    Pending,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParseFileReason {
+    ParserExtractionPending,
+    UnsupportedContent,
+    UnsupportedLanguage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ParseWarning {
+    pub code: &'static str,
+    pub path: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ParseFileRecord {
+    pub path: String,
+    pub language: Option<&'static str>,
+    pub content: ContentKind,
+    pub status: ParseFileStatus,
+    pub reason: Option<ParseFileReason>,
+    pub symbol_count: u64,
+    pub import_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ParseSymbolRecord {
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+    pub start_line: u64,
+    pub end_line: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ParseImportRecord {
+    pub path: String,
+    pub target: String,
+    pub kind: String,
+    pub line: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ParseSummary {
+    pub total_files: u64,
+    pub candidate_files: u64,
+    pub pending_files: u64,
+    pub skipped_files: u64,
+    pub symbol_count: u64,
+    pub import_count: u64,
+    pub warning_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseReport {
+    pub warnings: Vec<ParseWarning>,
+    pub files: Vec<ParseFileRecord>,
+    pub symbols: Vec<ParseSymbolRecord>,
+    pub imports: Vec<ParseImportRecord>,
+}
+
+impl ParseReport {
+    fn summary(&self) -> ParseSummary {
+        ParseSummary {
+            total_files: self.files.len() as u64,
+            candidate_files: self
+                .files
+                .iter()
+                .filter(|file| file.status == ParseFileStatus::Pending)
+                .count() as u64,
+            pending_files: self
+                .files
+                .iter()
+                .filter(|file| file.status == ParseFileStatus::Pending)
+                .count() as u64,
+            skipped_files: self
+                .files
+                .iter()
+                .filter(|file| file.status == ParseFileStatus::Skipped)
+                .count() as u64,
+            symbol_count: self.symbols.len() as u64,
+            import_count: self.imports.len() as u64,
+            warning_count: self.warnings.len() as u64,
+        }
+    }
+}
+
 fn initial_scan_summary(total_files: usize, scan_warnings: usize) -> ScanSummary {
     ScanSummary {
         total_files: total_files as u64,
@@ -227,6 +323,16 @@ struct ScanJsonReport<'a> {
     summary: ScanSummary,
     warnings: &'a [ScanWarning],
     files: &'a [FileRecord],
+}
+
+#[derive(Debug, Serialize)]
+struct ParseJsonReport<'a> {
+    schema_version: &'static str,
+    summary: ParseSummary,
+    warnings: &'a [ParseWarning],
+    files: &'a [ParseFileRecord],
+    symbols: &'a [ParseSymbolRecord],
+    imports: &'a [ParseImportRecord],
 }
 
 #[derive(Debug)]
@@ -607,6 +713,29 @@ pub fn scan_json() -> Result<String, ScanError> {
     render_json(&scan_current_dir_and_persist()?)
 }
 
+pub fn parse_summary() -> Result<String, ScanError> {
+    Ok(render_parse_summary(&parse_current_dir_and_persist()?))
+}
+
+pub fn parse_json() -> Result<String, ScanError> {
+    render_parse_json(&parse_current_dir_and_persist()?)
+}
+
+pub fn parse_scan_report(scan: &ScanReport) -> ParseReport {
+    let mut warnings = parse_warnings_from_scan(scan);
+
+    warnings.sort_by(|left, right| {
+        (&left.path, left.code, &left.message).cmp(&(&right.path, right.code, &right.message))
+    });
+
+    ParseReport {
+        warnings,
+        files: scan.files.iter().map(parse_file_from_scan_file).collect(),
+        symbols: Vec::new(),
+        imports: Vec::new(),
+    }
+}
+
 pub fn hotspots(options: HotspotsOptions) -> Result<String, HotspotsCommandError> {
     let root = env::current_dir().map_err(HotspotsCommandError::CurrentDir)?;
     let analysis = git::analyze_from_head_at(&root)?;
@@ -748,6 +877,60 @@ fn scan_current_dir_and_persist() -> Result<ScanReport, ScanError> {
     Ok(report)
 }
 
+fn parse_current_dir_and_persist() -> Result<ParseReport, ScanError> {
+    Ok(parse_scan_report(&scan_current_dir_and_persist()?))
+}
+
+fn parse_warnings_from_scan(scan: &ScanReport) -> Vec<ParseWarning> {
+    let scan_warnings = scan.warnings.iter().map(|warning| ParseWarning {
+        code: warning.code,
+        path: warning.path.clone(),
+        message: warning.message.clone(),
+    });
+    let file_warnings = scan.files.iter().flat_map(|file| {
+        file.warnings.iter().map(|warning| ParseWarning {
+            code: warning.code,
+            path: Some(file.path.clone()),
+            message: warning.message.clone(),
+        })
+    });
+
+    scan_warnings.chain(file_warnings).collect()
+}
+
+fn parse_file_from_scan_file(file: &FileRecord) -> ParseFileRecord {
+    let (status, reason) = if file.content != ContentKind::Text {
+        (
+            ParseFileStatus::Skipped,
+            Some(ParseFileReason::UnsupportedContent),
+        )
+    } else if is_parse_candidate_language(file.language) {
+        (
+            ParseFileStatus::Pending,
+            Some(ParseFileReason::ParserExtractionPending),
+        )
+    } else {
+        (
+            ParseFileStatus::Skipped,
+            Some(ParseFileReason::UnsupportedLanguage),
+        )
+    };
+
+    ParseFileRecord {
+        path: file.path.clone(),
+        language: file.language,
+        content: file.content,
+        status,
+        reason,
+        symbol_count: 0,
+        import_count: 0,
+    }
+}
+
+fn is_parse_candidate_language(language: Option<&str>) -> bool {
+    matches!(language, Some("Rust"))
+}
+
 fn ranked_hotspot_scores_from_scan_and_git(
     files: &[FileRecord],
     git_metrics: &[git::GitFileMetrics],
@@ -814,6 +997,17 @@ fn render_json(scan: &ScanReport) -> Result<String, ScanError> {
         summary: scan.summary(),
         warnings: &scan.warnings,
         files: &scan.files,
+    })?)
+}
+
+fn render_parse_json(report: &ParseReport) -> Result<String, ScanError> {
+    Ok(serde_json::to_string_pretty(&ParseJsonReport {
+        schema_version: PARSE_SCHEMA_VERSION,
+        summary: report.summary(),
+        warnings: &report.warnings,
+        files: &report.files,
+        symbols: &report.symbols,
+        imports: &report.imports,
     })?)
 }
 
@@ -1733,6 +1927,35 @@ fn render_summary(scan: &ScanReport) -> String {
     summary
 }
 
+fn render_parse_summary(report: &ParseReport) -> String {
+    let parse_summary = report.summary();
+
+    let mut summary = format!(
+        "Hotpath parse summary\n{:<SUMMARY_LABEL_WIDTH$}  {}\n{:<SUMMARY_LABEL_WIDTH$}  {}\n{:<SUMMARY_LABEL_WIDTH$}  {}\n{:<SUMMARY_LABEL_WIDTH$}  {}\n{:<SUMMARY_LABEL_WIDTH$}  {}\n{:<SUMMARY_LABEL_WIDTH$}  {}",
+        "total files",
+        parse_summary.total_files,
+        "candidates",
+        parse_summary.candidate_files,
+        "pending",
+        parse_summary.pending_files,
+        "skipped",
+        parse_summary.skipped_files,
+        "symbols",
+        parse_summary.symbol_count,
+        "imports",
+        parse_summary.import_count
+    );
+
+    if parse_summary.warning_count > 0 {
+        summary.push_str(&format!(
+            "\n{:<SUMMARY_LABEL_WIDTH$}  {}",
+            "warnings", parse_summary.warning_count
+        ));
+    }
+
+    summary
+}
+
 fn is_unreadable_warning(code: &str) -> bool {
     matches!(
         code,
@@ -1858,6 +2081,12 @@ mod tests {
         let json = render_json(scan).expect("json should render");
 
         serde_json::from_str(&json).expect("json should parse")
+    }
+
+    fn parse_json_value(report: &ParseReport) -> serde_json::Value {
+        let json = render_parse_json(report).expect("parse json should render");
+
+        serde_json::from_str(&json).expect("parse json should parse")
     }
 
     fn raw_score_metrics_with_size(
@@ -2985,5 +3214,55 @@ mod tests {
 
         assert_eq!(warning["code"], "read_failed");
         assert_eq!(warning["message"], "failed to open file contents: denied");
+    }
+
+    #[test]
+    fn parse_json_reports_stable_fields() {
+        let report = parse_scan_report(&ScanReport::from_files(vec![FileRecord {
+            path: "src/lib.rs".to_owned(),
+            byte_size: Some(10),
+            extension: Some("rs".to_owned()),
+            language: Some("Rust"),
+            line_count: Some(1),
+            is_vendor: false,
+            is_generated: false,
+            content: ContentKind::Text,
+            is_symlink: false,
+            classification: "implemented",
+            warnings: Vec::new(),
+        }]));
+        let json = render_parse_json(&report).expect("parse json should render");
+
+        assert_eq!(
+            json,
+            "{\n  \"schema_version\": \"hotpath.parse.v1\",\n  \"summary\": {\n    \"total_files\": 1,\n    \"candidate_files\": 1,\n    \"pending_files\": 1,\n    \"skipped_files\": 0,\n    \"symbol_count\": 0,\n    \"import_count\": 0,\n    \"warning_count\": 0\n  },\n  \"warnings\": [],\n  \"files\": [\n    {\n      \"path\": \"src/lib.rs\",\n      \"language\": \"Rust\",\n      \"content\": \"text\",\n      \"status\": \"pending\",\n      \"reason\": \"parser_extraction_pending\",\n      \"symbol_count\": 0,\n      \"import_count\": 0\n    }\n  ],\n  \"symbols\": [],\n  \"imports\": []\n}"
+        );
+    }
+
+    #[test]
+    fn parse_report_marks_unsupported_files_as_skipped() {
+        let report = parse_scan_report(&ScanReport::from_files(vec![
+            record("README.md", Some(20), Some("Markdown"), ContentKind::Text),
+            record("assets/logo.bin", Some(8), None, ContentKind::Binary),
+            record("src/lib.rs", Some(10), Some("Rust"), ContentKind::Text),
+        ]));
+        let value = parse_json_value(&report);
+        let files = value["files"].as_array().expect("files should be an array");
+
+        assert_eq!(value["summary"]["total_files"], 3);
+        assert_eq!(value["summary"]["candidate_files"], 1);
+        assert_eq!(value["summary"]["pending_files"], 1);
+        assert_eq!(value["summary"]["skipped_files"], 2);
+        assert_eq!(value["symbols"], serde_json::Value::Array(Vec::new()));
+        assert_eq!(value["imports"], serde_json::Value::Array(Vec::new()));
+        assert_eq!(files[0]["path"], "README.md");
+        assert_eq!(files[0]["status"], "skipped");
+        assert_eq!(files[0]["reason"], "unsupported_language");
+        assert_eq!(files[1]["path"], "assets/logo.bin");
+        assert_eq!(files[1]["status"], "skipped");
+        assert_eq!(files[1]["reason"], "unsupported_content");
+        assert_eq!(files[2]["path"], "src/lib.rs");
+        assert_eq!(files[2]["status"], "pending");
+        assert_eq!(files[2]["reason"], "parser_extraction_pending");
     }
 }

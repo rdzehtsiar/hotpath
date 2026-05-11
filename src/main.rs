@@ -17,6 +17,9 @@ enum Commands {
     /// Scan a repository and print an early placeholder report.
     Scan(ScanArgs),
 
+    /// Build a deterministic parser scaffold report for scanned files.
+    Parse(ParseArgs),
+
     /// Explain hotspot scoring for one current file.
     Explain(ExplainArgs),
 
@@ -68,6 +71,13 @@ struct ScanArgs {
     json: bool,
 }
 
+#[derive(Debug, Args)]
+struct ParseArgs {
+    /// Print a machine-readable JSON parse scaffold report.
+    #[arg(long)]
+    json: bool,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -75,6 +85,8 @@ fn main() -> ExitCode {
         Commands::Scan(args) if args.json => hotpath::scan_json().map_err(Into::into),
         Commands::Scan(args) if args.summary => hotpath::scan_summary().map_err(Into::into),
         Commands::Scan(_) => hotpath::scan_summary().map_err(Into::into),
+        Commands::Parse(args) if args.json => hotpath::parse_json().map_err(Into::into),
+        Commands::Parse(_) => hotpath::parse_summary().map_err(Into::into),
         Commands::Explain(args) => hotpath::explain(&args.path).map_err(Into::into),
         Commands::ExplainGit(args) => {
             hotpath::explain_git_and_persist(&args.path).map_err(Into::into)
