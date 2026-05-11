@@ -3,7 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 
 use git2::{
     Delta, Diff, DiffFindOptions, DiffOptions, ErrorClass, ErrorCode, Oid, Patch, Repository, Sort,
@@ -121,6 +122,17 @@ pub enum GitHistoryError {
     },
 }
 
+#[derive(Debug)]
+/// Errors that can occur while explaining Git metrics for one file.
+pub enum GitExplainError {
+    History(GitHistoryError),
+    BareRepository,
+    EmptyPath,
+    PathOutsideRepository,
+    UnsupportedPathEncoding,
+    AmbiguousPath { first: String, second: String },
+}
+
 impl fmt::Display for GitHistoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -173,24 +185,56 @@ impl StdError for GitHistoryError {
     }
 }
 
+impl fmt::Display for GitExplainError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::History(source) => write!(f, "{source}"),
+            Self::BareRepository => write!(
+                f,
+                "Git repository has no worktree; explain-git requires a local worktree"
+            ),
+            Self::EmptyPath => write!(f, "explain-git requires a non-empty file path"),
+            Self::PathOutsideRepository => write!(
+                f,
+                "requested path is outside the Git worktree; pass a repository-relative path or a path under the current worktree"
+            ),
+            Self::UnsupportedPathEncoding => write!(
+                f,
+                "requested path is not valid UTF-8 and cannot be rendered as a portable repository-relative path"
+            ),
+            Self::AmbiguousPath { first, second } => write!(
+                f,
+                "requested path is ambiguous inside this worktree; it could refer to '{first}' or '{second}'"
+            ),
+        }
+    }
+}
+
+impl StdError for GitExplainError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::History(source) => Some(source),
+            Self::BareRepository
+            | Self::EmptyPath
+            | Self::PathOutsideRepository
+            | Self::UnsupportedPathEncoding
+            | Self::AmbiguousPath { .. } => None,
+        }
+    }
+}
+
+impl From<GitHistoryError> for GitExplainError {
+    fn from(source: GitHistoryError) -> Self {
+        Self::History(source)
+    }
+}
+
 /// Return deterministic raw file change events for commits reachable from `HEAD`.
 pub fn file_changes_from_head(
     worktree_path: impl AsRef<Path>,
 ) -> Result<Vec<GitFileChange>, GitHistoryError> {
     let worktree_path = worktree_path.as_ref();
-    let repository = Repository::discover(worktree_path).map_err(|source| {
-        if source.code() == ErrorCode::NotFound || source.class() == ErrorClass::Repository {
-            GitHistoryError::NotRepository {
-                path: worktree_path.to_path_buf(),
-                source,
-            }
-        } else {
-            GitHistoryError::OpenRepository {
-                path: worktree_path.to_path_buf(),
-                source,
-            }
-        }
-    })?;
+    let repository = open_repository(worktree_path)?;
     let head_commit = head_commit(&repository, worktree_path)?;
     let commits = reachable_commits(&repository, head_commit.id())?;
     let mut changes = Vec::new();
@@ -267,6 +311,54 @@ pub fn file_changes_from_head(
     });
 
     Ok(changes)
+}
+
+/// Explain local Git history metrics and co-changes for one requested file.
+///
+/// The requested path may be repository-relative or relative to the current
+/// process directory. Output is deterministic and uses repository-relative
+/// paths with `/` separators.
+pub fn explain_file_from_head(requested_path: impl AsRef<Path>) -> Result<String, GitExplainError> {
+    explain_file_from_head_at(Path::new("."), requested_path)
+}
+
+/// Explain local Git history metrics and co-changes from a specific worktree
+/// context. This is useful for tests and for callers running from subdirs.
+pub fn explain_file_from_head_at(
+    worktree_path: impl AsRef<Path>,
+    requested_path: impl AsRef<Path>,
+) -> Result<String, GitExplainError> {
+    let worktree_path = worktree_path.as_ref();
+    let requested_path = requested_path.as_ref();
+    let repository = open_repository(worktree_path)?;
+    let head_commit = head_commit(&repository, worktree_path)?;
+    let head_commit_time = head_commit.time().seconds();
+    let workdir = repository
+        .workdir()
+        .ok_or(GitExplainError::BareRepository)?
+        .to_path_buf();
+    let changes = file_changes_from_head(worktree_path)?;
+    let metrics = file_metrics_from_changes(&changes, head_commit_time);
+    let metric_paths = metrics
+        .iter()
+        .map(|metric| metric.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let path =
+        normalize_requested_file_path(worktree_path, &workdir, requested_path, &metric_paths)?;
+    let metric = metrics.iter().find(|metric| metric.path == path);
+    let file_changes = changes
+        .iter()
+        .filter(|change| change.path == path)
+        .collect::<Vec<_>>();
+    let co_changes = co_changes_for_path(&path, &co_changes_from_changes(&changes));
+
+    Ok(render_file_explanation(
+        &path,
+        head_commit_time,
+        metric,
+        &file_changes,
+        &co_changes,
+    ))
 }
 
 /// Aggregate raw file changes into deterministic per-file Git metrics.
@@ -350,6 +442,22 @@ pub fn co_changes_from_changes(changes: &[GitFileChange]) -> Vec<GitCoChange> {
     });
 
     co_changes
+}
+
+fn open_repository(worktree_path: &Path) -> Result<Repository, GitHistoryError> {
+    Repository::discover(worktree_path).map_err(|source| {
+        if source.code() == ErrorCode::NotFound || source.class() == ErrorClass::Repository {
+            GitHistoryError::NotRepository {
+                path: worktree_path.to_path_buf(),
+                source,
+            }
+        } else {
+            GitHistoryError::OpenRepository {
+                path: worktree_path.to_path_buf(),
+                source,
+            }
+        }
+    })
 }
 
 fn head_commit<'repo>(
@@ -511,6 +619,293 @@ fn change_kind(delta: Delta) -> Option<GitChangeKind> {
         | Delta::Unreadable
         | Delta::Conflicted => None,
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelatedCoChange {
+    path: String,
+    commit_count: u64,
+}
+
+fn co_changes_for_path(path: &str, co_changes: &[GitCoChange]) -> Vec<RelatedCoChange> {
+    let mut related = co_changes
+        .iter()
+        .filter_map(|co_change| {
+            if co_change.left_path == path {
+                Some(RelatedCoChange {
+                    path: co_change.right_path.clone(),
+                    commit_count: co_change.commit_count,
+                })
+            } else if co_change.right_path == path {
+                Some(RelatedCoChange {
+                    path: co_change.left_path.clone(),
+                    commit_count: co_change.commit_count,
+                })
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    related.sort_by(|left, right| {
+        right
+            .commit_count
+            .cmp(&left.commit_count)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+
+    related
+}
+
+fn render_file_explanation(
+    path: &str,
+    head_commit_time: i64,
+    metric: Option<&GitFileMetrics>,
+    file_changes: &[&GitFileChange],
+    co_changes: &[RelatedCoChange],
+) -> String {
+    let mut output = format!(
+        "Hotpath Git explanation\npath: {path}\nhistory scope: local commits reachable from HEAD\nHEAD committer timestamp: {head_commit_time} (Unix seconds)"
+    );
+
+    output.push_str("\n\nraw changes");
+    if file_changes.is_empty() {
+        output.push_str("\n  none");
+    } else {
+        for change in file_changes {
+            output.push_str(&format!(
+                "\n  {}  {}  +{} -{}  {}  commit_time {}",
+                short_commit_id(&change.commit_id),
+                change_kind_label(change.change_kind),
+                change.added_lines,
+                change.deleted_lines,
+                change.author,
+                change.commit_time
+            ));
+        }
+    }
+
+    output.push_str("\n\nraw metrics");
+    if let Some(metric) = metric {
+        let recent_churn = metric.recent_churn_added + metric.recent_churn_deleted;
+        let total_churn = metric.total_churn_added + metric.total_churn_deleted;
+
+        output.push_str(&format!(
+            "\n  commits per file: {}\n  total churn: {} added, {} deleted, {} combined\n  recent churn (90 days): {} added, {} deleted, {} combined\n  author count: {}",
+            metric.commits_per_file,
+            metric.total_churn_added,
+            metric.total_churn_deleted,
+            total_churn,
+            metric.recent_churn_added,
+            metric.recent_churn_deleted,
+            recent_churn,
+            metric.author_count
+        ));
+
+        if let (Some(owner), Some(share)) = (&metric.dominant_owner, metric.dominant_owner_share) {
+            output.push_str(&format!(
+                "\n  dominant owner: {owner} ({:.2}% of file-touching commits)",
+                share * 100.0
+            ));
+        } else {
+            output.push_str("\n  dominant owner: unavailable");
+        }
+
+        output.push_str(&format!(
+            "\n  first observed commit: {}\n  last observed commit: {}\n  file age: {}",
+            observed_commit(metric.first_commit_id.as_deref(), metric.first_commit_time),
+            observed_commit(metric.last_commit_id.as_deref(), metric.last_commit_time),
+            metric
+                .file_age_days
+                .map(|days| format!("{days} days"))
+                .unwrap_or_else(|| "unavailable".to_owned())
+        ));
+    } else {
+        output.push_str(
+            "\n  commits per file: 0\n  total churn: 0 added, 0 deleted, 0 combined\n  recent churn (90 days): 0 added, 0 deleted, 0 combined\n  author count: 0\n  dominant owner: unavailable\n  first observed commit: unavailable\n  last observed commit: unavailable\n  file age: unavailable",
+        );
+    }
+
+    output.push_str("\n\nco-changes");
+    if co_changes.is_empty() {
+        output.push_str("\n  none");
+    } else {
+        for co_change in co_changes {
+            output.push_str(&format!(
+                "\n  {}  {}",
+                co_change.commit_count, co_change.path
+            ));
+        }
+    }
+
+    output.push_str(
+        "\n\ncalculation notes\n  - Uses local Git history reachable from HEAD only.\n  - Root commits are diffed against the empty tree; merge commits are diffed against their first parent.\n  - Recent churn uses the 90-day window before the HEAD committer timestamp.\n  - A commit counts once per file for commit counts, authorship, ownership, and co-change pairs.\n  - Co-change rows count commits that touched the requested path and the listed path.",
+    );
+    output.push_str(
+        "\n\nlimitations\n  - Rename handling is conservative: the rename commit counts for the destination path, but earlier history remains under the old path.\n  - Binary changes or unavailable line statistics contribute 0 line churn.\n  - Author identity is the exact commit author string; .mailmap, bot detection, and identity merging are not applied.\n  - File age is clamped to 0 days if commit timestamps place the first observed file touch after HEAD.\n  - Results are advisory and are not persisted to the Hotpath index.",
+    );
+
+    output
+}
+
+fn observed_commit(commit_id: Option<&str>, commit_time: Option<i64>) -> String {
+    match (commit_id, commit_time) {
+        (Some(commit_id), Some(commit_time)) => {
+            format!(
+                "{} at commit_time {commit_time}",
+                short_commit_id(commit_id)
+            )
+        }
+        _ => "unavailable".to_owned(),
+    }
+}
+
+fn short_commit_id(commit_id: &str) -> &str {
+    commit_id.get(..12).unwrap_or(commit_id)
+}
+
+fn change_kind_label(change_kind: GitChangeKind) -> &'static str {
+    match change_kind {
+        GitChangeKind::Added => "added",
+        GitChangeKind::Modified => "modified",
+        GitChangeKind::Deleted => "deleted",
+        GitChangeKind::Renamed => "renamed",
+        GitChangeKind::Copied => "copied",
+        GitChangeKind::TypeChanged => "type_changed",
+    }
+}
+
+fn normalize_requested_file_path(
+    worktree_path: &Path,
+    workdir: &Path,
+    requested_path: &Path,
+    metric_paths: &BTreeSet<&str>,
+) -> Result<String, GitExplainError> {
+    if requested_path.as_os_str().is_empty() {
+        return Err(GitExplainError::EmptyPath);
+    }
+
+    let workdir = fs::canonicalize(workdir).map_err(|_| GitExplainError::PathOutsideRepository)?;
+    let worktree_path =
+        fs::canonicalize(worktree_path).map_err(|_| GitExplainError::PathOutsideRepository)?;
+    let mut candidates = Vec::new();
+
+    if requested_path.is_absolute() {
+        push_relative_candidate(&mut candidates, &workdir, requested_path)?;
+    } else {
+        push_relative_candidate(
+            &mut candidates,
+            &workdir,
+            &worktree_path.join(requested_path),
+        )?;
+        push_relative_candidate(&mut candidates, &workdir, &workdir.join(requested_path))?;
+    }
+
+    candidates.sort();
+    candidates.dedup();
+
+    if candidates.is_empty() {
+        return Err(GitExplainError::PathOutsideRepository);
+    }
+
+    choose_requested_candidate(&workdir, &candidates, metric_paths)
+}
+
+fn push_relative_candidate(
+    candidates: &mut Vec<String>,
+    workdir: &Path,
+    candidate: &Path,
+) -> Result<(), GitExplainError> {
+    let candidate = lexically_normalize(candidate);
+    let Ok(relative) = candidate.strip_prefix(workdir) else {
+        return Ok(());
+    };
+    let relative = portable_relative_path(relative)?;
+
+    if relative.is_empty() {
+        return Err(GitExplainError::EmptyPath);
+    }
+
+    candidates.push(relative);
+    Ok(())
+}
+
+fn choose_requested_candidate(
+    workdir: &Path,
+    candidates: &[String],
+    metric_paths: &BTreeSet<&str>,
+) -> Result<String, GitExplainError> {
+    let metric_matches = candidates
+        .iter()
+        .filter(|candidate| metric_paths.contains(candidate.as_str()))
+        .collect::<Vec<_>>();
+
+    match metric_matches.as_slice() {
+        [candidate] => return Ok((*candidate).clone()),
+        [first, second, ..] => {
+            return Err(GitExplainError::AmbiguousPath {
+                first: (*first).clone(),
+                second: (*second).clone(),
+            });
+        }
+        [] => {}
+    }
+
+    let existing_matches = candidates
+        .iter()
+        .filter(|candidate| workdir.join(candidate).exists())
+        .collect::<Vec<_>>();
+
+    match existing_matches.as_slice() {
+        [candidate] => Ok((*candidate).clone()),
+        [first, second, ..] => Err(GitExplainError::AmbiguousPath {
+            first: (*first).clone(),
+            second: (*second).clone(),
+        }),
+        [] => candidates
+            .first()
+            .cloned()
+            .ok_or(GitExplainError::PathOutsideRepository),
+    }
+}
+
+fn portable_relative_path(path: &Path) -> Result<String, GitExplainError> {
+    let mut parts = Vec::new();
+
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => {
+                let part = part
+                    .to_str()
+                    .ok_or(GitExplainError::UnsupportedPathEncoding)?;
+                parts.push(part.to_owned());
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
+                return Err(GitExplainError::PathOutsideRepository);
+            }
+        }
+    }
+
+    Ok(parts.join("/"))
+}
+
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(_) | Component::Prefix(_) | Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+
+    normalized
 }
 
 #[derive(Debug)]

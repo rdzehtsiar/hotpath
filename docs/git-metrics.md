@@ -215,9 +215,9 @@ skew as a limitation where the age is explained.
 
 ## Current Implementation Status
 
-These semantics define the target behavior for the first Git metrics
-implementation. Current Hotpath scans do not calculate or persist these Git
-metrics yet, and `hotpath explain-git` is not implemented.
+These semantics define the target behavior for Git metrics. `hotpath
+explain-git` is an early, non-stable command that computes local `HEAD` Git
+history. Current Hotpath scans do not persist Git metrics to the index yet.
 
 Future implementation work should add deterministic fixture repositories and
 focused tests that cover commit counting, recent churn windows, exact author
