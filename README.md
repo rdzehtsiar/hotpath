@@ -33,6 +33,15 @@ The repository currently contains private planning material and early project sc
 
 Expect the crate layout, commands, data model, scoring formulas, output formats, and documentation to change as the product contract and first implementation milestones are built.
 
+## Product Contract
+
+The public contract for Hotpath is documented in:
+
+- [Product contract](docs/product-contract.md)
+- [Privacy](docs/privacy.md)
+- [Scoring principles](docs/scoring.md)
+- [Limitations](docs/limitations.md)
+
 ## Product Principles
 
 - fully offline by default
