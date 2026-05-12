@@ -20,6 +20,8 @@ pub mod graph;
 pub mod parse;
 pub mod scoring;
 pub mod storage;
+#[cfg(test)]
+mod test_support;
 
 pub use complexity::{
     ComplexityFileRecord, ComplexityReport, ComplexitySummary, ComplexitySymbolRecord,
@@ -1028,7 +1030,7 @@ fn context_current_dir_and_persist(
         .persist_scan(&scan)
         .map_err(ContextCommandError::PersistScan)?;
 
-    Ok(context::estimate_context(&scan.files, options))
+    Ok(estimate_context(&scan.files, options))
 }
 
 fn diff_risk_report(range: &str) -> Result<DiffRiskReport, DiffCommandError> {
@@ -2839,7 +2841,7 @@ mod tests {
         generated.is_generated = true;
         let mut vendor = context_text("vendor/lib.rs", 12);
         vendor.is_vendor = true;
-        let report = context::estimate_context(
+        let report = estimate_context(
             &[context_text("src/lib.rs", 12), generated, vendor],
             ContextOptions {
                 exclude_generated: true,
@@ -2856,7 +2858,7 @@ mod tests {
 
     #[test]
     fn context_rendering_reports_over_budget_and_empty_groups() {
-        let report = context::estimate_context(
+        let report = estimate_context(
             &[record("image.png", Some(10), None, ContentKind::Binary)],
             ContextOptions {
                 exclude_generated: false,
@@ -2869,7 +2871,7 @@ mod tests {
             "budget: within budget by 1 tokens (budget 1, estimated 0)\n\ngroups\n  group path  estimated tokens  bytes  files\n  none"
         ));
 
-        let report = context::estimate_context(
+        let report = estimate_context(
             &[context_text("src/lib.rs", 8)],
             ContextOptions {
                 exclude_generated: false,
@@ -2884,8 +2886,7 @@ mod tests {
 
     #[test]
     fn context_json_serializes_report_schema_pretty_printed() {
-        let report =
-            context::estimate_context(&[context_text("src/lib.rs", 4)], ContextOptions::default());
+        let report = estimate_context(&[context_text("src/lib.rs", 4)], ContextOptions::default());
         let json = serde_json::to_string_pretty(&report).expect("context JSON should render");
 
         assert!(json.starts_with("{\n  \"schema_version\": \"hotpath.context.v1\","));

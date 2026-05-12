@@ -325,7 +325,7 @@ fn max_option(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ContentKind, ParseFileRecord, ParseImportRecord, ParseSymbolRecord};
+    use crate::{test_support, ContentKind, ParseFileRecord, ParseImportRecord, ParseSymbolRecord};
 
     fn parse_report(symbols: Vec<ParseSymbolRecord>) -> ParseReport {
         parse_report_with_imports(symbols, Vec::new())
@@ -400,16 +400,6 @@ mod tests {
         }
     }
 
-    fn import(path: &str, target: &str, kind: &str) -> ParseImportRecord {
-        ParseImportRecord {
-            path: path.to_owned(),
-            target: target.to_owned(),
-            kind: kind.to_owned(),
-            start_line: 1,
-            end_line: 1,
-        }
-    }
-
     #[test]
     fn report_derives_lengths_large_symbols_and_summary() {
         let report = report_from_parse(&parse_report(vec![
@@ -446,7 +436,7 @@ mod tests {
         let report = report_from_parse(&parse_report_with_files(
             vec![file("src/lib.rs", 0, 1), file("src/child.rs", 0, 0)],
             Vec::new(),
-            vec![import("src/lib.rs", "child", "mod")],
+            vec![test_support::parse_import("src/lib.rs", "child", "mod")],
         ));
 
         assert_eq!(report.summary.dependency_edge_count, 1);

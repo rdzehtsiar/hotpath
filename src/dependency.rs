@@ -383,7 +383,7 @@ fn looks_like_windows_absolute_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ContentKind;
+    use crate::{test_support, ContentKind};
 
     fn file(path: &str, language: &'static str) -> ParseFileRecord {
         ParseFileRecord {
@@ -394,16 +394,6 @@ mod tests {
             reason: None,
             symbol_count: 0,
             import_count: 0,
-        }
-    }
-
-    fn import(path: &str, target: &str, kind: &str) -> ParseImportRecord {
-        ParseImportRecord {
-            path: path.to_owned(),
-            target: target.to_owned(),
-            kind: kind.to_owned(),
-            start_line: 1,
-            end_line: 1,
         }
     }
 
@@ -438,10 +428,10 @@ mod tests {
                 file("src/models/mod.rs", "Rust"),
             ],
             vec![
-                import("src/lib.rs", "child", "mod"),
-                import("src/lib.rs", "crate::models::Widget", "use"),
-                import("src/lib.rs", "std::fmt", "use"),
-                import("src/lib.rs", "crate::{fmt, io}", "use"),
+                test_support::parse_import("src/lib.rs", "child", "mod"),
+                test_support::parse_import("src/lib.rs", "crate::models::Widget", "use"),
+                test_support::parse_import("src/lib.rs", "std::fmt", "use"),
+                test_support::parse_import("src/lib.rs", "crate::{fmt, io}", "use"),
             ],
         );
 
@@ -460,7 +450,7 @@ mod tests {
     fn leaves_nested_rust_mod_declarations_unresolved() {
         let mut report = report(
             vec![file("src/lib.rs", "Rust"), file("src/child.rs", "Rust")],
-            vec![import("src/lib.rs", "child", "mod")],
+            vec![test_support::parse_import("src/lib.rs", "child", "mod")],
         );
         report.imports[0].start_line = 2;
         report.imports[0].end_line = 2;
@@ -492,8 +482,8 @@ mod tests {
                 file("web/value.tsx", "TypeScript JSX"),
             ],
             vec![
-                import("src/lib.rs", "child", "mod"),
-                import("web/app.ts", "./value", "import"),
+                test_support::parse_import("src/lib.rs", "child", "mod"),
+                test_support::parse_import("web/app.ts", "./value", "import"),
             ],
         );
 
@@ -509,10 +499,10 @@ mod tests {
                 file("shared/util.ts", "TypeScript"),
             ],
             vec![
-                import("web/app.ts", "./components", "import"),
-                import("web/app.ts", "../shared/util", "import"),
-                import("web/app.ts", "../../outside", "import"),
-                import("web/app.ts", "react", "import"),
+                test_support::parse_import("web/app.ts", "./components", "import"),
+                test_support::parse_import("web/app.ts", "../shared/util", "import"),
+                test_support::parse_import("web/app.ts", "../../outside", "import"),
+                test_support::parse_import("web/app.ts", "react", "import"),
             ],
         );
 
