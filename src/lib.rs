@@ -11,11 +11,16 @@ use std::path::{Component, Path, PathBuf};
 use ignore::{DirEntry, Error as IgnoreError, WalkBuilder};
 use serde::Serialize;
 
+pub mod complexity;
 pub mod git;
 pub mod parse;
 pub mod scoring;
 pub mod storage;
 
+pub use complexity::{
+    ComplexityFileRecord, ComplexityReport, ComplexitySummary, ComplexitySymbolRecord,
+    COMPLEXITY_SCHEMA_VERSION,
+};
 pub use parse::{
     ParseFileReason, ParseFileRecord, ParseFileStatus, ParseImportRecord, ParseReport,
     ParseSummary, ParseSymbolRecord, ParseWarning,
@@ -287,7 +292,9 @@ impl fmt::Display for ScanError {
                 path.display(),
                 root.display()
             ),
-            Self::Index(source) => write!(f, "failed to persist scan results: {source}"),
+            Self::Index(source) => {
+                write_persistence_error(f, "persist scan results", source, "scan")
+            }
             Self::PersistSymbols(source) => {
                 write_persistence_error(f, "persist parser symbols", source, "parse")
             }
@@ -636,6 +643,18 @@ pub fn parse_json() -> Result<String, ScanError> {
     render_parse_json(&parse_current_dir_and_persist()?)
 }
 
+pub fn complexity_summary() -> Result<String, ScanError> {
+    Ok(complexity::render_summary(
+        &complexity_current_dir_and_persist()?,
+    ))
+}
+
+pub fn complexity_json() -> Result<String, ScanError> {
+    Ok(complexity::render_json(
+        &complexity_current_dir_and_persist()?,
+    )?)
+}
+
 pub fn parse_scan_report(scan: &ScanReport) -> ParseReport {
     parse::scaffold_report_from_scan(scan)
 }
@@ -792,6 +811,12 @@ fn parse_current_dir_and_persist() -> Result<ParseReport, ScanError> {
         .map_err(ScanError::PersistSymbols)?;
 
     Ok(report)
+}
+
+fn complexity_current_dir_and_persist() -> Result<ComplexityReport, ScanError> {
+    let report = parse_current_dir_and_persist()?;
+
+    Ok(complexity::report_from_parse(&report))
 }
 
 fn ranked_hotspot_scores_from_scan_and_git(

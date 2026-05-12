@@ -20,6 +20,9 @@ enum Commands {
     /// Parse supported scanned source files and print an early symbol report.
     Parse(ParseArgs),
 
+    /// Analyze parsed symbols and print a complexity report.
+    Complexity(ComplexityArgs),
+
     /// Explain hotspot scoring for one current file.
     Explain(ExplainArgs),
 
@@ -78,6 +81,13 @@ struct ParseArgs {
     json: bool,
 }
 
+#[derive(Debug, Args)]
+struct ComplexityArgs {
+    /// Print a machine-readable JSON complexity report.
+    #[arg(long)]
+    json: bool,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -87,6 +97,8 @@ fn main() -> ExitCode {
         Commands::Scan(_) => hotpath::scan_summary().map_err(Into::into),
         Commands::Parse(args) if args.json => hotpath::parse_json().map_err(Into::into),
         Commands::Parse(_) => hotpath::parse_summary().map_err(Into::into),
+        Commands::Complexity(args) if args.json => hotpath::complexity_json().map_err(Into::into),
+        Commands::Complexity(_) => hotpath::complexity_summary().map_err(Into::into),
         Commands::Explain(args) => hotpath::explain(&args.path).map_err(Into::into),
         Commands::ExplainGit(args) => {
             hotpath::explain_git_and_persist(&args.path).map_err(Into::into)
