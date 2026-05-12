@@ -235,9 +235,7 @@ pub(crate) fn report_from_scan(root: &Path, scan: &ScanReport) -> ParseReport {
         ));
     }
 
-    warnings.sort_by(|left, right| {
-        (&left.path, left.code, &left.message).cmp(&(&right.path, right.code, &right.message))
-    });
+    sort_parse_warnings(&mut warnings);
     symbols.sort_by(|left, right| {
         (
             &left.path,
@@ -282,9 +280,7 @@ pub(crate) fn report_from_scan(root: &Path, scan: &ScanReport) -> ParseReport {
 pub fn scaffold_report_from_scan(scan: &ScanReport) -> ParseReport {
     let mut warnings = parse_warnings_from_scan(scan);
 
-    warnings.sort_by(|left, right| {
-        (&left.path, left.code, &left.message).cmp(&(&right.path, right.code, &right.message))
-    });
+    sort_parse_warnings(&mut warnings);
 
     ParseReport {
         warnings,
@@ -316,6 +312,12 @@ fn parse_warnings_from_scan(scan: &ScanReport) -> Vec<ParseWarning> {
     });
 
     scan_warnings.chain(file_warnings).collect()
+}
+
+fn sort_parse_warnings(warnings: &mut [ParseWarning]) {
+    warnings.sort_by(|left, right| {
+        (&left.path, left.code, &left.message).cmp(&(&right.path, right.code, &right.message))
+    });
 }
 
 fn scaffold_file_record(file: &FileRecord) -> ParseFileRecord {
