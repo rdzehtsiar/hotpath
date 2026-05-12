@@ -38,8 +38,39 @@ enum Commands {
     /// Estimate the current codebase context budget.
     Context(ContextArgs),
 
+    /// Analyze diff risk for a committed base...head range.
+    Diff(DiffArgs),
+
+    /// Analyze pull request risk from explicit base and head refs.
+    Pr(PrArgs),
+
     /// Check the local Hotpath index health.
     Doctor,
+}
+
+#[derive(Debug, Args)]
+struct DiffArgs {
+    /// Triple-dot committed diff range to analyze, for example main...HEAD.
+    range: String,
+
+    /// Print a machine-readable JSON diff risk report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct PrArgs {
+    /// Base ref for the pull request comparison.
+    #[arg(long)]
+    base: String,
+
+    /// Head ref for the pull request comparison.
+    #[arg(long)]
+    head: String,
+
+    /// Print a machine-readable JSON diff risk report.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -156,6 +187,10 @@ fn main() -> ExitCode {
             args.json,
         )
         .map_err(Into::into),
+        Commands::Diff(args) => hotpath::diff_risk(&args.range, args.json).map_err(Into::into),
+        Commands::Pr(args) => {
+            hotpath::pr_risk(&args.base, &args.head, args.json).map_err(Into::into)
+        }
         Commands::Doctor => hotpath::doctor().map_err(Into::into),
     };
 

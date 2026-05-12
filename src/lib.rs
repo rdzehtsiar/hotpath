@@ -265,6 +265,31 @@ struct ParseJsonReport<'a> {
     imports: &'a [ParseImportRecord],
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct DiffRiskReport {
+    schema_version: &'static str,
+    range: diff::DiffRangeMetadata,
+    summary: DiffRiskSummary,
+    changed_files: Vec<diff::DiffChangedFile>,
+    architecture: diff::DiffArchitectureStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct DiffRiskSummary {
+    changed_file_count: u64,
+    touched_hotspot_count: u64,
+    touched_hotspots: Vec<TouchedHotspot>,
+    context_token_delta: i64,
+    architecture: diff::DiffArchitectureStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct TouchedHotspot {
+    rank: u64,
+    path: String,
+    score: f64,
+}
+
 #[derive(Debug)]
 pub enum ScanError {
     CurrentDir(std::io::Error),
@@ -424,6 +449,15 @@ pub enum HotspotsCommandError {
 }
 
 #[derive(Debug)]
+pub enum DiffCommandError {
+    CurrentDir(std::io::Error),
+    Diff(diff::DiffError),
+    Git(git::GitHistoryError),
+    Scan(ScanError),
+    Json(serde_json::Error),
+}
+
+#[derive(Debug)]
 pub enum ContextCommandError {
     CurrentDir(std::io::Error),
     Scan(ScanError),
@@ -559,6 +593,32 @@ impl StdError for HotspotsCommandError {
     }
 }
 
+impl fmt::Display for DiffCommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CurrentDir(source) => {
+                write!(f, "failed to determine the current directory: {source}")
+            }
+            Self::Diff(source) => write!(f, "{source}"),
+            Self::Git(source) => write_diff_git_error(f, source),
+            Self::Scan(source) => write!(f, "{source}"),
+            Self::Json(source) => write!(f, "failed to render diff JSON: {source}"),
+        }
+    }
+}
+
+impl StdError for DiffCommandError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::CurrentDir(source) => Some(source),
+            Self::Diff(source) => Some(source),
+            Self::Git(source) => Some(source),
+            Self::Scan(source) => Some(source),
+            Self::Json(source) => Some(source),
+        }
+    }
+}
+
 impl fmt::Display for ContextCommandError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -588,6 +648,30 @@ impl StdError for ContextCommandError {
 impl From<git::GitHistoryError> for HotspotsCommandError {
     fn from(source: git::GitHistoryError) -> Self {
         Self::Git(source)
+    }
+}
+
+impl From<diff::DiffError> for DiffCommandError {
+    fn from(source: diff::DiffError) -> Self {
+        Self::Diff(source)
+    }
+}
+
+impl From<git::GitHistoryError> for DiffCommandError {
+    fn from(source: git::GitHistoryError) -> Self {
+        Self::Git(source)
+    }
+}
+
+impl From<ScanError> for DiffCommandError {
+    fn from(source: ScanError) -> Self {
+        Self::Scan(source)
+    }
+}
+
+impl From<serde_json::Error> for DiffCommandError {
+    fn from(source: serde_json::Error) -> Self {
+        Self::Json(source)
     }
 }
 
@@ -781,6 +865,16 @@ pub fn hotspots(options: HotspotsOptions) -> Result<String, HotspotsCommandError
     ))
 }
 
+pub fn diff_risk(range: &str, json: bool) -> Result<String, DiffCommandError> {
+    let report = diff_risk_report(range)?;
+
+    render_diff_risk(&report, json)
+}
+
+pub fn pr_risk(base: &str, head: &str, json: bool) -> Result<String, DiffCommandError> {
+    diff_risk(&format!("{base}...{head}"), json)
+}
+
 pub fn explain(requested_path: impl AsRef<Path>) -> Result<String, ExplainCommandError> {
     let current_dir = env::current_dir().map_err(ExplainCommandError::CurrentDir)?;
     let analysis = git::analyze_from_head_at(&current_dir)?;
@@ -922,6 +1016,63 @@ fn context_current_dir_and_persist(
     Ok(context::estimate_context(&scan.files, options))
 }
 
+fn diff_risk_report(range: &str) -> Result<DiffRiskReport, DiffCommandError> {
+    let current_dir = env::current_dir().map_err(DiffCommandError::CurrentDir)?;
+    let core_report = diff::analyze_committed_tree_diff(&current_dir, range)?;
+    let analysis = git::analyze_from_head_at(&current_dir)?;
+    let scan = scan_repository(&analysis.worktree_root)?;
+    let ranked = ranked_hotspot_scores_from_scan_and_git(
+        &scan.files,
+        &analysis.file_metrics,
+        &analysis.co_changes,
+    );
+    let touched_hotspots = touched_hotspots(&core_report.changed_files, &scan.files, &ranked);
+
+    Ok(DiffRiskReport {
+        schema_version: core_report.schema_version,
+        range: core_report.range,
+        summary: DiffRiskSummary {
+            changed_file_count: core_report.summary.changed_files,
+            touched_hotspot_count: touched_hotspots.len() as u64,
+            touched_hotspots,
+            context_token_delta: core_report.summary.context_token_delta,
+            architecture: core_report.architecture,
+        },
+        changed_files: core_report.changed_files,
+        architecture: core_report.architecture,
+    })
+}
+
+fn touched_hotspots(
+    changed_files: &[diff::DiffChangedFile],
+    current_files: &[FileRecord],
+    ranked_scores: &[scoring::RankedHotspotScore],
+) -> Vec<TouchedHotspot> {
+    let changed_paths = changed_files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let current_paths = current_files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<BTreeSet<_>>();
+
+    ranked_scores
+        .iter()
+        .take(DEFAULT_HOTSPOTS_LIMIT)
+        .filter(|ranked_score| {
+            let path = ranked_score.score.path.as_str();
+
+            changed_paths.contains(path) && current_paths.contains(path)
+        })
+        .map(|ranked_score| TouchedHotspot {
+            rank: ranked_score.rank,
+            path: ranked_score.score.path.clone(),
+            score: ranked_score.score.value,
+        })
+        .collect()
+}
+
 fn ranked_hotspot_scores_from_scan_and_git(
     files: &[FileRecord],
     git_metrics: &[git::GitFileMetrics],
@@ -1043,6 +1194,72 @@ fn render_context(report: &ContextReport) -> String {
     );
 
     output
+}
+
+fn render_diff_risk(report: &DiffRiskReport, json: bool) -> Result<String, DiffCommandError> {
+    if json {
+        Ok(serde_json::to_string_pretty(report)?)
+    } else {
+        Ok(render_diff_risk_text(report))
+    }
+}
+
+fn render_diff_risk_text(report: &DiffRiskReport) -> String {
+    let mut output = format!(
+        "Hotpath diff risk\nrange: {}\nChanged files: {}\nTouched hotspots: {}\nArchitecture violations: {}\nContext growth: {:+} tokens",
+        report.range.requested,
+        report.summary.changed_file_count,
+        report.summary.touched_hotspot_count,
+        diff_architecture_label(report.summary.architecture),
+        report.summary.context_token_delta
+    );
+
+    output.push_str("\n\ntouched hotspots");
+    if report.summary.touched_hotspots.is_empty() {
+        output.push_str("\n  none");
+    } else {
+        for hotspot in &report.summary.touched_hotspots {
+            output.push_str(&format!(
+                "\n  #{}  {:.3}  {}",
+                hotspot.rank, hotspot.score, hotspot.path
+            ));
+        }
+    }
+
+    output.push_str("\n\nchanged files");
+    if report.changed_files.is_empty() {
+        output.push_str("\n  none");
+    } else {
+        for file in &report.changed_files {
+            output.push_str(&format!(
+                "\n  {}  {}  +{} -{}  {:+} tokens",
+                diff_change_kind_label(file.change_kind),
+                file.path,
+                file.added_lines,
+                file.deleted_lines,
+                file.context_token_delta
+            ));
+        }
+    }
+
+    output
+}
+
+fn diff_architecture_label(status: diff::DiffArchitectureStatus) -> &'static str {
+    match status {
+        diff::DiffArchitectureStatus::NotEvaluated => "not evaluated",
+    }
+}
+
+fn diff_change_kind_label(change_kind: diff::DiffChangeKind) -> &'static str {
+    match change_kind {
+        diff::DiffChangeKind::Added => "added",
+        diff::DiffChangeKind::Modified => "modified",
+        diff::DiffChangeKind::Deleted => "deleted",
+        diff::DiffChangeKind::Renamed => "renamed",
+        diff::DiffChangeKind::Copied => "copied",
+        diff::DiffChangeKind::TypeChanged => "type_changed",
+    }
 }
 
 fn has_active_context_output_filter(options: ContextOptions) -> bool {
@@ -1494,6 +1711,45 @@ fn write_hotspots_git_error(
         git::GitHistoryError::BareRepository { .. } => write!(
             f,
             "Git repository has no worktree; hotspot analysis requires a local worktree"
+        ),
+        git::GitHistoryError::HeadNotCommit { source, .. } => {
+            write!(f, "Git HEAD does not resolve to a commit: {source}")
+        }
+        git::GitHistoryError::Git { context, source } => {
+            write!(f, "failed to traverse Git history while {context}: {source}")
+        }
+        git::GitHistoryError::UnsupportedAuthorIdentity { commit_id } => write!(
+            f,
+            "commit {commit_id} has an author name or email that is not valid UTF-8"
+        ),
+        git::GitHistoryError::UnsupportedPathEncoding { commit_id } => write!(
+            f,
+            "commit {commit_id} changed a path that is not valid UTF-8"
+        ),
+    }
+}
+
+fn write_diff_git_error(f: &mut fmt::Formatter<'_>, source: &git::GitHistoryError) -> fmt::Result {
+    match source {
+        git::GitHistoryError::NotRepository { .. } => write!(
+            f,
+            "path is not a readable Git worktree; run diff from inside a repository with local history"
+        ),
+        git::GitHistoryError::OpenRepository { .. } => write!(
+            f,
+            "failed to open Git repository from the current worktree; ensure local Git metadata is readable"
+        ),
+        git::GitHistoryError::MissingHead { .. } => write!(
+            f,
+            "Git repository does not have a commit at HEAD; create an initial commit before analyzing a diff"
+        ),
+        git::GitHistoryError::ShallowRepository { .. } => write!(
+            f,
+            "Git repository has shallow history; fetch complete local history before running diff so metrics are not based on incomplete commits"
+        ),
+        git::GitHistoryError::BareRepository { .. } => write!(
+            f,
+            "Git repository has no worktree; diff analysis requires a local worktree"
         ),
         git::GitHistoryError::HeadNotCommit { source, .. } => {
             write!(f, "Git HEAD does not resolve to a commit: {source}")
