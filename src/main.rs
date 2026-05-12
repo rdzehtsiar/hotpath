@@ -35,6 +35,9 @@ enum Commands {
     /// Rank current files by advisory hotspot risk.
     Hotspots(HotspotsArgs),
 
+    /// Estimate the current codebase context budget.
+    Context(ContextArgs),
+
     /// Check the local Hotpath index health.
     Doctor,
 }
@@ -62,6 +65,25 @@ struct HotspotsArgs {
     exclude_generated: bool,
 
     /// Hide vendor files from the displayed rows.
+    #[arg(long)]
+    exclude_vendor: bool,
+}
+
+#[derive(Debug, Args)]
+struct ContextArgs {
+    /// Print a machine-readable JSON context report.
+    #[arg(long)]
+    json: bool,
+
+    /// Token budget to compare against the estimate. Accepts integers with optional k or m suffix.
+    #[arg(long, value_parser = parse_budget_tokens_arg)]
+    budget: Option<u64>,
+
+    /// Exclude generated files from the estimate.
+    #[arg(long)]
+    exclude_generated: bool,
+
+    /// Exclude vendor files from the estimate.
     #[arg(long)]
     exclude_vendor: bool,
 }
@@ -125,6 +147,15 @@ fn main() -> ExitCode {
             exclude_vendor: args.exclude_vendor,
         })
         .map_err(Into::into),
+        Commands::Context(args) => hotpath::context(
+            hotpath::ContextOptions {
+                exclude_generated: args.exclude_generated,
+                exclude_vendor: args.exclude_vendor,
+                budget_tokens: args.budget,
+            },
+            args.json,
+        )
+        .map_err(Into::into),
         Commands::Doctor => hotpath::doctor().map_err(Into::into),
     };
 
@@ -150,4 +181,8 @@ fn parse_positive_limit(value: &str) -> Result<usize, String> {
     } else {
         usize::try_from(limit).map_err(|_| "limit is too large".to_owned())
     }
+}
+
+fn parse_budget_tokens_arg(value: &str) -> Result<u64, String> {
+    hotpath::parse_budget_tokens(value).map_err(|error| error.to_string())
 }

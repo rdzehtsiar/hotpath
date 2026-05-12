@@ -423,6 +423,14 @@ pub enum HotspotsCommandError {
 }
 
 #[derive(Debug)]
+pub enum ContextCommandError {
+    CurrentDir(std::io::Error),
+    Scan(ScanError),
+    PersistScan(storage::index::IndexError),
+    Json(serde_json::Error),
+}
+
+#[derive(Debug)]
 pub enum ExplainCommandError {
     CurrentDir(std::io::Error),
     Git(git::GitHistoryError),
@@ -550,6 +558,32 @@ impl StdError for HotspotsCommandError {
     }
 }
 
+impl fmt::Display for ContextCommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CurrentDir(source) => {
+                write!(f, "failed to determine the current directory: {source}")
+            }
+            Self::Scan(source) => write!(f, "{source}"),
+            Self::PersistScan(source) => {
+                write_context_persistence_error(f, "persist scan results", source)
+            }
+            Self::Json(source) => write!(f, "failed to render context JSON: {source}"),
+        }
+    }
+}
+
+impl StdError for ContextCommandError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::CurrentDir(source) => Some(source),
+            Self::Scan(source) => Some(source),
+            Self::PersistScan(source) => Some(source),
+            Self::Json(source) => Some(source),
+        }
+    }
+}
+
 impl From<git::GitHistoryError> for HotspotsCommandError {
     fn from(source: git::GitHistoryError) -> Self {
         Self::Git(source)
@@ -559,6 +593,18 @@ impl From<git::GitHistoryError> for HotspotsCommandError {
 impl From<ScanError> for HotspotsCommandError {
     fn from(source: ScanError) -> Self {
         Self::Scan(source)
+    }
+}
+
+impl From<ScanError> for ContextCommandError {
+    fn from(source: ScanError) -> Self {
+        Self::Scan(source)
+    }
+}
+
+impl From<serde_json::Error> for ContextCommandError {
+    fn from(source: serde_json::Error) -> Self {
+        Self::Json(source)
     }
 }
 
@@ -678,6 +724,16 @@ pub fn graph_json(selector: &str) -> Result<String, ScanError> {
     Ok(graph::render_json(&graph_current_dir_and_persist(
         selector,
     )?)?)
+}
+
+pub fn context(options: ContextOptions, json: bool) -> Result<String, ContextCommandError> {
+    let report = context_current_dir_and_persist(options)?;
+
+    if json {
+        Ok(serde_json::to_string_pretty(&report)?)
+    } else {
+        Ok(render_context(&report))
+    }
 }
 
 pub fn parse_scan_report(scan: &ScanReport) -> ParseReport {
@@ -850,6 +906,21 @@ fn graph_current_dir_and_persist(selector: &str) -> Result<GraphReport, ScanErro
     Ok(graph::report_from_parse(selector, &report))
 }
 
+fn context_current_dir_and_persist(
+    options: ContextOptions,
+) -> Result<ContextReport, ContextCommandError> {
+    let root = env::current_dir().map_err(ContextCommandError::CurrentDir)?;
+    let scan = scan_repository(&root).map_err(ContextCommandError::Scan)?;
+    let mut index =
+        storage::index::IndexStore::open(&root).map_err(ContextCommandError::PersistScan)?;
+
+    index
+        .persist_scan(&scan)
+        .map_err(ContextCommandError::PersistScan)?;
+
+    Ok(context::estimate_context(&scan.files, options))
+}
+
 fn ranked_hotspot_scores_from_scan_and_git(
     files: &[FileRecord],
     git_metrics: &[git::GitFileMetrics],
@@ -928,6 +999,84 @@ fn render_parse_json(report: &ParseReport) -> Result<String, ScanError> {
         symbols: &report.symbols,
         imports: &report.imports,
     })?)
+}
+
+fn render_context(report: &ContextReport) -> String {
+    let mut output = format!(
+        "Hotpath context budget\nscope: current scanned UTF-8 text files from the working directory\nformula: estimated tokens = ceil(byte_size / 4) for UTF-8 text files\n\ntotal estimated tokens  {}\nincluded files          {}\nskipped files           {}\nincluded bytes          {}",
+        report.summary.estimated_tokens,
+        report.summary.included_files,
+        report.summary.skipped_files,
+        report.summary.included_bytes
+    );
+
+    if has_active_context_output_filter(report.options) {
+        output.push_str(&format!(
+            "\noutput filters: {}",
+            render_context_output_filters(report.options)
+        ));
+    }
+
+    if let Some(budget) = &report.budget {
+        output.push_str(&format!(
+            "\nbudget: {}",
+            render_context_budget_status(budget)
+        ));
+    }
+
+    output.push_str("\n\ngroups\n  group path  estimated tokens  bytes  files");
+
+    if report.groups.is_empty() {
+        output.push_str("\n  none");
+    } else {
+        for group in &report.groups {
+            output.push_str(&format!(
+                "\n  {}  {}  {}  {}",
+                group.path, group.estimated_tokens, group.byte_size, group.file_count
+            ));
+        }
+    }
+
+    output.push_str(
+        "\n\ncalculation notes\n  - Offline deterministic approximation; no source text leaves the local machine.\n  - Tokenizer-specific counts vary by model and language, so treat this as planning guidance.",
+    );
+
+    output
+}
+
+fn has_active_context_output_filter(options: ContextOptions) -> bool {
+    options.exclude_generated || options.exclude_vendor
+}
+
+fn render_context_output_filters(options: ContextOptions) -> String {
+    let mut filters = Vec::new();
+
+    if options.exclude_generated {
+        filters.push("exclude generated files");
+    }
+
+    if options.exclude_vendor {
+        filters.push("exclude vendor files");
+    }
+
+    filters.join(", ")
+}
+
+fn render_context_budget_status(budget: &ContextBudgetStatus) -> String {
+    match (budget.remaining_tokens, budget.over_budget_tokens) {
+        (Some(remaining), _) => format!(
+            "within budget by {remaining} tokens (budget {}, estimated {})",
+            budget.budget_tokens, budget.estimated_tokens
+        ),
+        (_, Some(over)) => format!(
+            "over budget by {over} tokens (budget {}, estimated {})",
+            budget.budget_tokens, budget.estimated_tokens
+        ),
+        (None, None) => format!(
+            "within budget by 0 tokens (budget {}, estimated {})",
+            budget.budget_tokens, budget.estimated_tokens
+        ),
+    }
 }
 
 fn render_hotspots(
@@ -1368,6 +1517,14 @@ fn write_hotspots_persistence_error(
     source: &storage::index::IndexError,
 ) -> fmt::Result {
     write_persistence_error(f, action, source, "hotspots")
+}
+
+fn write_context_persistence_error(
+    f: &mut fmt::Formatter<'_>,
+    action: &str,
+    source: &storage::index::IndexError,
+) -> fmt::Result {
+    write_persistence_error(f, action, source, "context")
 }
 
 fn write_persistence_error(
@@ -2092,6 +2249,20 @@ mod tests {
         );
     }
 
+    fn assert_sanitized_actionable_context_error(
+        error: ContextCommandError,
+        absolute_path: &Path,
+        expected: &str,
+    ) {
+        let message = error.to_string();
+
+        assert_eq!(message, expected);
+        assert!(
+            !message.contains(&absolute_path.display().to_string()),
+            "context persistence error leaked absolute path: {message}"
+        );
+    }
+
     fn scan_warning_record(code: &'static str, path: Option<&str>) -> ScanWarning {
         scan_warning(
             code,
@@ -2119,6 +2290,10 @@ mod tests {
             classification: "implemented",
             warnings: Vec::new(),
         }
+    }
+
+    fn context_text(path: &str, byte_size: u64) -> FileRecord {
+        record(path, Some(byte_size), None, ContentKind::Text)
     }
 
     #[cfg(unix)]
@@ -2335,6 +2510,91 @@ mod tests {
             &path,
             "failed to persist parser symbols in local Hotpath index (.hotpath/index.db): symbol path must be repository-relative; fix the input and rerun parse",
         );
+    }
+
+    #[test]
+    fn context_persistence_error_messages_are_sanitized_and_actionable() {
+        let path = absolute_index_path();
+
+        assert_sanitized_actionable_context_error(
+            ContextCommandError::PersistScan(storage::index::IndexError::CorruptDatabase {
+                path: path.clone(),
+                source: sqlite_error(),
+            }),
+            &path,
+            "failed to persist scan results in local Hotpath index (.hotpath/index.db): the index is unreadable or corrupt; remove .hotpath/index.db and rerun context",
+        );
+        assert_sanitized_actionable_context_error(
+            ContextCommandError::PersistScan(storage::index::IndexError::CorruptMetadata {
+                path: path.clone(),
+                message: "schema metadata row is malformed".to_owned(),
+            }),
+            &path,
+            "failed to persist scan results in local Hotpath index (.hotpath/index.db): the index schema metadata is invalid; remove .hotpath/index.db and rerun context",
+        );
+    }
+
+    #[test]
+    fn context_rendering_reports_summary_filters_budget_and_groups() {
+        let mut generated = context_text("dist/client.js", 8);
+        generated.is_generated = true;
+        let mut vendor = context_text("vendor/lib.rs", 12);
+        vendor.is_vendor = true;
+        let report = context::estimate_context(
+            &[context_text("src/lib.rs", 12), generated, vendor],
+            ContextOptions {
+                exclude_generated: true,
+                exclude_vendor: true,
+                budget_tokens: Some(5),
+            },
+        );
+
+        assert_eq!(
+            render_context(&report),
+            "Hotpath context budget\nscope: current scanned UTF-8 text files from the working directory\nformula: estimated tokens = ceil(byte_size / 4) for UTF-8 text files\n\ntotal estimated tokens  3\nincluded files          1\nskipped files           2\nincluded bytes          12\noutput filters: exclude generated files, exclude vendor files\nbudget: within budget by 2 tokens (budget 5, estimated 3)\n\ngroups\n  group path  estimated tokens  bytes  files\n  src  3  12  1\n\ncalculation notes\n  - Offline deterministic approximation; no source text leaves the local machine.\n  - Tokenizer-specific counts vary by model and language, so treat this as planning guidance."
+        );
+    }
+
+    #[test]
+    fn context_rendering_reports_over_budget_and_empty_groups() {
+        let report = context::estimate_context(
+            &[record("image.png", Some(10), None, ContentKind::Binary)],
+            ContextOptions {
+                exclude_generated: false,
+                exclude_vendor: false,
+                budget_tokens: Some(1),
+            },
+        );
+
+        assert!(render_context(&report).contains(
+            "budget: within budget by 1 tokens (budget 1, estimated 0)\n\ngroups\n  group path  estimated tokens  bytes  files\n  none"
+        ));
+
+        let report = context::estimate_context(
+            &[context_text("src/lib.rs", 8)],
+            ContextOptions {
+                exclude_generated: false,
+                exclude_vendor: false,
+                budget_tokens: Some(1),
+            },
+        );
+
+        assert!(render_context(&report)
+            .contains("budget: over budget by 1 tokens (budget 1, estimated 2)"));
+    }
+
+    #[test]
+    fn context_json_serializes_report_schema_pretty_printed() {
+        let report =
+            context::estimate_context(&[context_text("src/lib.rs", 4)], ContextOptions::default());
+        let json = serde_json::to_string_pretty(&report).expect("context JSON should render");
+
+        assert!(json.starts_with("{\n  \"schema_version\": \"hotpath.context.v1\","));
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("context JSON should parse");
+        assert_eq!(value["schema_version"], CONTEXT_SCHEMA_VERSION);
+        assert_eq!(value["summary"]["estimated_tokens"], 1);
+        assert_eq!(value["groups"][0]["path"], "src");
     }
 
     #[test]
