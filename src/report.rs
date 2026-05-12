@@ -3,6 +3,8 @@
 use std::env;
 use std::error::Error as StdError;
 use std::fmt;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 
@@ -87,6 +89,8 @@ pub enum ReportCommandError {
     PersistGitAnalysis(storage::index::IndexError),
     PersistHotspots(storage::index::IndexError),
     Json(serde_json::Error),
+    CreateHtmlOutput(std::io::Error),
+    WriteHtml(std::io::Error),
 }
 
 pub fn report_markdown() -> Result<String, ReportCommandError> {
@@ -99,6 +103,18 @@ pub fn report_json() -> Result<String, ReportCommandError> {
     let report = build_current_dir_report_and_persist()?;
 
     serde_json::to_string_pretty(&report).map_err(ReportCommandError::Json)
+}
+
+pub fn report_html(output_dir: &Path) -> Result<String, ReportCommandError> {
+    let current_dir = env::current_dir().map_err(ReportCommandError::CurrentDir)?;
+    let output_index_path = absolute_path(&current_dir, &output_dir.join("index.html"));
+    let report = build_report_and_persist(&current_dir, Some(&output_index_path))?;
+    let html = render_html(&report);
+
+    fs::create_dir_all(output_dir).map_err(ReportCommandError::CreateHtmlOutput)?;
+    fs::write(output_dir.join("index.html"), html).map_err(ReportCommandError::WriteHtml)?;
+
+    Ok("Wrote HTML report to index.html".to_owned())
 }
 
 pub fn render_markdown(report: &Report) -> String {
@@ -235,10 +251,184 @@ pub fn render_markdown(report: &Report) -> String {
     output
 }
 
+pub fn render_html(report: &Report) -> String {
+    let mut output = String::new();
+
+    output.push_str("<!doctype html>\n<html lang=\"en\">\n<head>\n");
+    output.push_str("<meta charset=\"utf-8\">\n");
+    output.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
+    output.push_str("<title>Hotpath Report</title>\n");
+    output.push_str("<style>\n");
+    output.push_str(":root{color-scheme:light;font-family:Inter,Segoe UI,Arial,sans-serif;color:#1f2933;background:#f7f8fa;}\n");
+    output.push_str("body{margin:0;padding:32px;}\n");
+    output.push_str("main{max-width:1120px;margin:0 auto;}\n");
+    output.push_str("h1{font-size:32px;margin:0 0 24px;}\n");
+    output.push_str("h2{font-size:20px;margin:32px 0 12px;border-bottom:1px solid #d8dde4;padding-bottom:6px;}\n");
+    output.push_str("p,li,td,th{font-size:14px;line-height:1.5;}\n");
+    output.push_str("ul{padding-left:20px;}\n");
+    output.push_str("table{width:100%;border-collapse:collapse;background:#fff;}\n");
+    output.push_str(
+        "th,td{border:1px solid #d8dde4;padding:8px;text-align:left;vertical-align:top;}\n",
+    );
+    output.push_str("th{text-align:left;background:#eef1f4;font-weight:600;}\n");
+    output.push_str("td.numeric,th.numeric{text-align:right;font-variant-numeric:tabular-nums;}\n");
+    output.push_str(".note{color:#52606d;}\n");
+    output.push_str("</style>\n</head>\n<body>\n<main>\n");
+    output.push_str("<h1>Hotpath Report</h1>\n");
+
+    output.push_str("<h2>Summary</h2>\n<ul>\n");
+    output.push_str(&format!(
+        "<li>Files scanned: {}</li>\n",
+        report.summary.scan.total_files
+    ));
+    output.push_str(&format!(
+        "<li>Text files: {}, binary files: {}, unknown files: {}</li>\n",
+        report.summary.scan.content.text_files,
+        report.summary.scan.content.binary_files,
+        report.summary.scan.content.unknown_files
+    ));
+    output.push_str(&format!(
+        "<li>Generated files: {}, vendor files: {}</li>\n",
+        report.summary.scan.flags.generated_files, report.summary.scan.flags.vendor_files
+    ));
+    output.push_str(&format!(
+        "<li>Scan warnings: {}</li>\n",
+        report.summary.scan.warnings.total_warnings
+    ));
+    output.push_str(&format!(
+        "<li>Hotspots ranked: {}</li>\n",
+        report.summary.hotspot_count
+    ));
+    output.push_str(&format!(
+        "<li>Context estimate: {} tokens across {} included files</li>\n",
+        report.summary.context_estimated_tokens, report.context.summary.included_files
+    ));
+    output.push_str(&format!(
+        "<li>Git HEAD: {}; metrics for {} files; {} co-change pairs; recent window {} days</li>\n",
+        html_escape(&report.summary.git.head_commit_id),
+        report.summary.git.file_metric_count,
+        report.summary.git.co_change_count,
+        report.summary.git.recent_window_days
+    ));
+    output.push_str("</ul>\n");
+
+    output.push_str("<h2>Top Hotspots</h2>\n");
+    if report.hotspots.is_empty() {
+        output.push_str("<p>No current files were ranked as hotspots.</p>\n");
+    } else {
+        output.push_str("<table>\n<thead><tr><th class=\"numeric\">Rank</th><th>Path</th><th class=\"numeric\">Score</th><th class=\"numeric\">Risk /10</th><th class=\"numeric\">Commits</th><th class=\"numeric\">Churn lines</th><th class=\"numeric\">Recent churn</th><th class=\"numeric\">Authors</th><th class=\"numeric\">Co-changed files</th></tr></thead>\n<tbody>\n");
+        for hotspot in report.hotspots.iter().take(10) {
+            output.push_str(&format!(
+                "<tr><td class=\"numeric\">{}</td><td>{}</td><td class=\"numeric\">{:.3}</td><td class=\"numeric\">{:.1}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td></tr>\n",
+                hotspot.rank,
+                html_escape(&hotspot.path),
+                hotspot.score,
+                risk_scale(hotspot.score),
+                optional_u64(hotspot.raw_metrics.commits_per_file),
+                optional_u64(hotspot.raw_metrics.total_churn_lines),
+                optional_u64(hotspot.raw_metrics.recent_churn_lines),
+                optional_u64(hotspot.raw_metrics.author_count),
+                optional_u64(hotspot.raw_metrics.co_changed_file_count)
+            ));
+        }
+        output.push_str("</tbody>\n</table>\n");
+        if report.hotspots.len() > 10 {
+            output.push_str(&format!(
+                "<p class=\"note\">Showing top 10 of {} ranked hotspots. JSON output includes all hotspot rows.</p>\n",
+                report.hotspots.len()
+            ));
+        }
+    }
+
+    output.push_str("<h2>Context Estimate</h2>\n<ul>\n");
+    output.push_str(&format!(
+        "<li>Estimated tokens: {}</li>\n",
+        report.context.summary.estimated_tokens
+    ));
+    output.push_str(&format!(
+        "<li>Included files: {}; skipped files: {}; included bytes: {}</li>\n",
+        report.context.summary.included_files,
+        report.context.summary.skipped_files,
+        report.context.summary.included_bytes
+    ));
+    output.push_str("</ul>\n");
+    if report.context.groups.is_empty() {
+        output.push_str("<p>Largest groups: none</p>\n");
+    } else {
+        output.push_str("<table>\n<thead><tr><th>Group</th><th class=\"numeric\">Tokens</th><th class=\"numeric\">Files</th></tr></thead>\n<tbody>\n");
+        for group in report.context.groups.iter().take(5) {
+            output.push_str(&format!(
+                "<tr><td>{}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td></tr>\n",
+                html_escape(&group.path),
+                group.estimated_tokens,
+                group.file_count
+            ));
+        }
+        output.push_str("</tbody>\n</table>\n");
+    }
+
+    output.push_str("<h2>Findings</h2>\n");
+    if report.findings.is_empty() {
+        output.push_str("<p>No advisory findings were produced.</p>\n");
+    } else {
+        output.push_str("<ul>\n");
+        for finding in report.findings.iter().take(10) {
+            output.push_str(&format!(
+                "<li>{}: {}</li>\n",
+                html_escape(finding.code),
+                html_escape(&finding.message)
+            ));
+        }
+        if report.findings.len() > 10 {
+            output.push_str(&format!(
+                "<li>{} additional findings are available in JSON output.</li>\n",
+                report.findings.len() - 10
+            ));
+        }
+        output.push_str("</ul>\n");
+    }
+
+    output.push_str("<h2>Calculation Notes</h2>\n<ul>\n");
+    output.push_str("<li>Hotpath runs locally and does not require network access or telemetry for this report.</li>\n");
+    output.push_str(
+        "<li>Hotspot scores are advisory decision-support signals, not proof of defects.</li>\n",
+    );
+    output.push_str(
+        "<li>Risk /10 is the internal 0.0-1.0 score multiplied by 10 for human reading.</li>\n",
+    );
+    if let Some(hotspot) = report.hotspots.first() {
+        output.push_str(&format!(
+            "<li>Formula version: {}.</li>\n",
+            html_escape(&hotspot.formula_version.id)
+        ));
+    }
+    output.push_str("<li>Scores use the reported formula version and available local scan and Git history metrics.</li>\n");
+    output.push_str("<li>Missing or incomplete local history can limit churn, ownership, and co-change signals.</li>\n");
+    output.push_str("</ul>\n");
+    output.push_str("</main>\n</body>\n</html>\n");
+
+    output
+}
+
 pub fn build_current_dir_report_and_persist() -> Result<Report, ReportCommandError> {
     let current_dir = env::current_dir().map_err(ReportCommandError::CurrentDir)?;
-    let analysis = git::analyze_from_head_at(&current_dir)?;
-    let scan = crate::scan_repository(&analysis.worktree_root)?;
+
+    build_report_and_persist(&current_dir, None)
+}
+
+fn build_report_and_persist(
+    current_dir: &Path,
+    excluded_report_path: Option<&Path>,
+) -> Result<Report, ReportCommandError> {
+    let analysis = git::analyze_from_head_at(current_dir)?;
+    let excluded_report_path = excluded_report_path
+        .and_then(|path| repository_relative_path(&analysis.worktree_root, path));
+    let mut scan = crate::scan_repository(&analysis.worktree_root)?;
+
+    if let Some(excluded_report_path) = excluded_report_path.as_deref() {
+        scan.files.retain(|file| file.path != excluded_report_path);
+    }
+
     let mut index = storage::index::IndexStore::open(&analysis.worktree_root)
         .map_err(ReportCommandError::PersistScan)?;
 
@@ -293,6 +483,47 @@ pub fn build_current_dir_report_and_persist() -> Result<Report, ReportCommandErr
         },
         findings,
     })
+}
+
+fn absolute_path(current_dir: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        lexically_normalize(path)
+    } else {
+        lexically_normalize(&current_dir.join(path))
+    }
+}
+
+fn repository_relative_path(root: &Path, path: &Path) -> Option<String> {
+    let root = lexically_normalize(root);
+    let path = lexically_normalize(path);
+    let relative = path.strip_prefix(root).ok()?;
+    let mut parts = Vec::new();
+
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_str()?),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+
+    Some(parts.join("/"))
+}
+
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+
+    normalized
 }
 
 impl From<&crate::scoring::RankedHotspotScore> for ReportHotspot {
@@ -365,6 +596,24 @@ fn markdown_text(value: &str) -> String {
     value.replace('\n', " ")
 }
 
+fn html_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            '\n' | '\r' => escaped.push(' '),
+            _ => escaped.push(character),
+        }
+    }
+
+    escaped
+}
+
 impl fmt::Display for ReportCommandError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -383,6 +632,10 @@ impl fmt::Display for ReportCommandError {
                 crate::write_persistence_error(f, "persist hotspot scores", source, "report")
             }
             Self::Json(source) => write!(f, "failed to render report JSON: {source}"),
+            Self::CreateHtmlOutput(source) => {
+                write!(f, "failed to create HTML report output directory: {source}")
+            }
+            Self::WriteHtml(source) => write!(f, "failed to write HTML report: {source}"),
         }
     }
 }
@@ -397,6 +650,7 @@ impl StdError for ReportCommandError {
             | Self::PersistGitAnalysis(source)
             | Self::PersistHotspots(source) => Some(source),
             Self::Json(source) => Some(source),
+            Self::CreateHtmlOutput(source) | Self::WriteHtml(source) => Some(source),
         }
     }
 }

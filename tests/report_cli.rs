@@ -61,6 +61,12 @@ fn report_markdown(current_dir: &Path) -> String {
     successful_stdout(&["report", "--markdown"], current_dir)
 }
 
+fn report_html(current_dir: &Path, output_dir: &Path) -> String {
+    let output_arg = output_dir.to_string_lossy().into_owned();
+
+    successful_stdout(&["report", "--html", &output_arg], current_dir)
+}
+
 #[test]
 fn report_json_is_deterministic_and_has_expected_schema() {
     let fixture = ranked_fixture("report-json-schema");
@@ -177,6 +183,90 @@ fn report_rejects_json_and_markdown_flags_together() {
     assert!(stderr.contains("--json"));
     assert!(stderr.contains("--markdown"));
     assert!(stderr.contains("cannot be used"));
+}
+
+#[test]
+fn report_html_writes_single_self_contained_escaped_file() {
+    let fixture = GitFixture::new("report-html-escaped");
+    let author = GitIdentity::new("HTML Author", "html@example.invalid");
+
+    fixture.write("src/a&b'quote.rs", "pub fn html_path() {}\n");
+    fixture.write("README.md", "# fixture\n");
+    fixture.commit(CommitOptions::new(
+        "Add escaped HTML paths",
+        author,
+        "2024-01-01T00:00:00 +0000",
+    ));
+
+    let output_dir = fixture.path().join("target").join("hotpath-html");
+    let stdout = report_html(fixture.path(), &output_dir);
+    let index_path = output_dir.join("index.html");
+    let html = fs::read_to_string(&index_path).expect("HTML report should be written");
+    let entries = fs::read_dir(&output_dir)
+        .expect("HTML output directory should be readable")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("HTML output entries should read");
+
+    assert_eq!(stdout, "Wrote HTML report to index.html\n");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].file_name(), "index.html");
+    assert!(html.starts_with("<!doctype html>\n<html lang=\"en\">\n"));
+    assert!(html.contains("<title>Hotpath Report</title>"));
+    assert!(html.contains("<h1>Hotpath Report</h1>"));
+    assert!(html.contains("<h2>Summary</h2>"));
+    assert!(html.contains("<h2>Top Hotspots</h2>"));
+    assert!(html.contains("<h2>Context Estimate</h2>"));
+    assert!(html.contains("<h2>Findings</h2>"));
+    assert!(html.contains("<h2>Calculation Notes</h2>"));
+    assert!(html.contains("src/a&amp;b&#39;quote.rs"));
+    assert!(!html.contains("src/a&b'quote.rs"));
+    assert!(!html.contains("<script"));
+    assert!(!html.contains("</script>"));
+    assert!(!html.contains("http://"));
+    assert!(!html.contains("https://"));
+    assert!(!html.contains("src=\""));
+    assert!(!html.contains("href=\""));
+    assert!(!contains_path(&html, fixture.path()));
+}
+
+#[test]
+fn report_html_is_deterministic_across_runs_and_has_no_path_leaks() {
+    let fixture = ranked_fixture("report-html-deterministic");
+    let output_dir = fixture.path().join("out").join("report");
+
+    let first_stdout = report_html(fixture.path(), &output_dir);
+    let first_html =
+        fs::read_to_string(output_dir.join("index.html")).expect("first HTML should read");
+    let second_stdout = report_html(fixture.path(), &output_dir);
+    let second_html =
+        fs::read_to_string(output_dir.join("index.html")).expect("second HTML should read");
+
+    assert_eq!(first_stdout, second_stdout);
+    assert_eq!(first_html, second_html);
+    assert!(first_html.contains("<td>src/risky.rs</td>"));
+    assert!(first_html.contains("Risk /10"));
+    assert!(first_html.contains("does not require network access or telemetry"));
+    assert!(!contains_path(&first_html, fixture.path()));
+}
+
+#[test]
+fn report_rejects_html_with_other_format_flags() {
+    let fixture = ranked_fixture("report-html-conflict");
+    let output_dir = fixture.path().join("html");
+    let output_arg = output_dir.to_string_lossy().into_owned();
+
+    let json_stderr = failed_stderr(&["report", "--json", "--html", &output_arg], fixture.path());
+    let markdown_stderr = failed_stderr(
+        &["report", "--markdown", "--html", &output_arg],
+        fixture.path(),
+    );
+
+    assert!(json_stderr.contains("--json"));
+    assert!(json_stderr.contains("--html"));
+    assert!(json_stderr.contains("cannot be used"));
+    assert!(markdown_stderr.contains("--markdown"));
+    assert!(markdown_stderr.contains("--html"));
+    assert!(markdown_stderr.contains("cannot be used"));
 }
 
 #[test]

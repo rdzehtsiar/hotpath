@@ -79,12 +79,16 @@ struct PrArgs {
 #[derive(Debug, Args)]
 struct ReportArgs {
     /// Print a machine-readable JSON report.
-    #[arg(long, conflicts_with = "markdown")]
+    #[arg(long, conflicts_with_all = ["markdown", "html"])]
     json: bool,
 
     /// Print a human-readable Markdown report.
-    #[arg(long, conflicts_with = "json")]
+    #[arg(long, conflicts_with_all = ["json", "html"])]
     markdown: bool,
+
+    /// Write a self-contained static HTML report to the output directory.
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["json", "markdown"])]
+    html: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -208,6 +212,11 @@ fn main() -> ExitCode {
         Commands::Report(args) if args.json => hotpath::report_json().map_err(Into::into),
         Commands::Report(args) if args.markdown => {
             hotpath::report::report_markdown().map_err(Into::into)
+        }
+        Commands::Report(args) if args.html.is_some() => {
+            let output_dir = args.html.expect("html path should be present");
+
+            hotpath::report::report_html(&output_dir).map_err(Into::into)
         }
         Commands::Report(_) => hotpath::report::report_markdown().map_err(Into::into),
         Commands::Doctor => hotpath::doctor().map_err(Into::into),
