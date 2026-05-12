@@ -23,6 +23,9 @@ enum Commands {
     /// Analyze parsed symbols and print a complexity report.
     Complexity(ComplexityArgs),
 
+    /// Show one-hop internal dependencies for a selected module.
+    Graph(GraphArgs),
+
     /// Explain hotspot scoring for one current file.
     Explain(ExplainArgs),
 
@@ -88,6 +91,17 @@ struct ComplexityArgs {
     json: bool,
 }
 
+#[derive(Debug, Args)]
+struct GraphArgs {
+    /// Repository-relative prefix or bare module name to graph.
+    #[arg(long)]
+    module: String,
+
+    /// Print a machine-readable JSON graph report.
+    #[arg(long)]
+    json: bool,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -99,6 +113,8 @@ fn main() -> ExitCode {
         Commands::Parse(_) => hotpath::parse_summary().map_err(Into::into),
         Commands::Complexity(args) if args.json => hotpath::complexity_json().map_err(Into::into),
         Commands::Complexity(_) => hotpath::complexity_summary().map_err(Into::into),
+        Commands::Graph(args) if args.json => hotpath::graph_json(&args.module).map_err(Into::into),
+        Commands::Graph(args) => hotpath::graph_summary(&args.module).map_err(Into::into),
         Commands::Explain(args) => hotpath::explain(&args.path).map_err(Into::into),
         Commands::ExplainGit(args) => {
             hotpath::explain_git_and_persist(&args.path).map_err(Into::into)

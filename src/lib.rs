@@ -14,6 +14,7 @@ use serde::Serialize;
 pub mod complexity;
 pub mod dependency;
 pub mod git;
+pub mod graph;
 pub mod parse;
 pub mod scoring;
 pub mod storage;
@@ -26,6 +27,7 @@ pub use dependency::{
     fan_metrics, resolve_dependencies, DependencyFanMetrics, FileDependencyFan,
     ResolvedDependencyEdge,
 };
+pub use graph::{GraphReport, GraphSummary, GRAPH_SCHEMA_VERSION};
 pub use parse::{
     ParseFileReason, ParseFileRecord, ParseFileStatus, ParseImportRecord, ParseReport,
     ParseSummary, ParseSymbolRecord, ParseWarning,
@@ -660,6 +662,18 @@ pub fn complexity_json() -> Result<String, ScanError> {
     )?)
 }
 
+pub fn graph_summary(selector: &str) -> Result<String, ScanError> {
+    Ok(graph::render_summary(&graph_current_dir_and_persist(
+        selector,
+    )?))
+}
+
+pub fn graph_json(selector: &str) -> Result<String, ScanError> {
+    Ok(graph::render_json(&graph_current_dir_and_persist(
+        selector,
+    )?)?)
+}
+
 pub fn parse_scan_report(scan: &ScanReport) -> ParseReport {
     parse::scaffold_report_from_scan(scan)
 }
@@ -822,6 +836,12 @@ fn complexity_current_dir_and_persist() -> Result<ComplexityReport, ScanError> {
     let report = parse_current_dir_and_persist()?;
 
     Ok(complexity::report_from_parse(&report))
+}
+
+fn graph_current_dir_and_persist(selector: &str) -> Result<GraphReport, ScanError> {
+    let report = parse_current_dir_and_persist()?;
+
+    Ok(graph::report_from_parse(selector, &report))
 }
 
 fn ranked_hotspot_scores_from_scan_and_git(
