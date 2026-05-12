@@ -379,24 +379,38 @@ fn run_app(terminal: &mut TuiTerminal, snapshot: &TuiSnapshot) -> io::Result<()>
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TuiView {
-    Overview,
-    Detail,
+    Hotspots,
+    FileDetail,
+    GitDetail,
+    ExplainScore,
 }
 
 impl TuiView {
     fn title(self) -> &'static str {
         match self {
-            Self::Overview => "Overview",
-            Self::Detail => "Detail",
+            Self::Hotspots => "Hotspots",
+            Self::FileDetail => "File Detail",
+            Self::GitDetail => "Git Detail",
+            Self::ExplainScore => "Explain Score",
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiAction {
-    DrillDown { from: TuiView, row_text: String },
-    ExplainScore { view: TuiView, row_text: String },
-    OpenEditor { command: String, row_text: String },
+    DrillDown {
+        from: TuiView,
+        to: TuiView,
+        path: String,
+    },
+    ExplainScore {
+        view: TuiView,
+        path: String,
+    },
+    OpenEditor {
+        command: String,
+        row_text: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -445,7 +459,9 @@ impl SearchState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiAppState {
     current_view: TuiView,
+    current_path: Option<String>,
     back_stack: Vec<TuiView>,
+    path_stack: Vec<Option<String>>,
     selections: BTreeMap<TuiView, ListSelection>,
     search: Option<SearchState>,
     status: Option<String>,
@@ -456,12 +472,16 @@ pub struct TuiAppState {
 impl Default for TuiAppState {
     fn default() -> Self {
         let mut selections = BTreeMap::new();
-        selections.insert(TuiView::Overview, ListSelection::default());
-        selections.insert(TuiView::Detail, ListSelection::default());
+        selections.insert(TuiView::Hotspots, ListSelection::default());
+        selections.insert(TuiView::FileDetail, ListSelection::default());
+        selections.insert(TuiView::GitDetail, ListSelection::default());
+        selections.insert(TuiView::ExplainScore, ListSelection::default());
 
         Self {
-            current_view: TuiView::Overview,
+            current_view: TuiView::Hotspots,
+            current_path: None,
             back_stack: Vec::new(),
+            path_stack: Vec::new(),
             selections,
             search: None,
             status: None,
@@ -474,6 +494,10 @@ impl Default for TuiAppState {
 impl TuiAppState {
     pub fn current_view(&self) -> TuiView {
         self.current_view
+    }
+
+    pub fn current_path(&self) -> Option<&str> {
+        self.current_path.as_deref()
     }
 
     pub fn selected_index(&self) -> usize {
@@ -574,8 +598,8 @@ fn reduce_key_with_editor<F>(
         KeyCode::Char('k') => {
             state.selection_for_current_view_mut().move_previous();
         }
-        KeyCode::Enter => drill_down(state, &rows),
-        KeyCode::Char('x') => explain_score(state, &rows),
+        KeyCode::Enter => drill_down(state, snapshot, &rows),
+        KeyCode::Char('x') => explain_score(state, snapshot, &rows),
         KeyCode::Char('e') => {
             let resolution = resolve_editor_from_env(|name| {
                 get_env(name).and_then(|value| value.into_string().ok())
@@ -593,6 +617,7 @@ fn reduce_escape(state: &mut TuiAppState) {
     }
 
     if let Some(previous) = state.back_stack.pop() {
+        state.current_path = state.path_stack.pop().flatten();
         state.current_view = previous;
         state.status = Some(format!("Back to {}", previous.title()));
     } else {
@@ -600,38 +625,81 @@ fn reduce_escape(state: &mut TuiAppState) {
     }
 }
 
-fn drill_down(state: &mut TuiAppState, rows: &[String]) {
+fn drill_down(state: &mut TuiAppState, snapshot: &TuiSnapshot, rows: &[String]) {
     let Some(row_text) = selected_row_text(state, rows) else {
         state.status = Some("No row selected".to_owned());
         return;
     };
 
     let from = state.current_view;
-    if from == TuiView::Detail {
-        state.status = Some("Already in detail view".to_owned());
-        return;
-    }
+    let next = match from {
+        TuiView::Hotspots => {
+            hotspot_path_from_row(snapshot, &row_text).map(|path| (TuiView::FileDetail, path))
+        }
+        TuiView::FileDetail => state
+            .current_path
+            .as_ref()
+            .filter(|path| {
+                is_git_detail_row(&row_text) && hotspot_for_path(snapshot, path).is_some()
+            })
+            .cloned()
+            .map(|path| (TuiView::GitDetail, path)),
+        TuiView::GitDetail | TuiView::ExplainScore => None,
+    };
 
-    state.back_stack.push(from);
-    state.current_view = TuiView::Detail;
+    let Some((to, path)) = next else {
+        state.status = Some("No drilldown available for this row".to_owned());
+        return;
+    };
+
+    push_view(state, to, Some(path.clone()));
     state.last_action = Some(TuiAction::DrillDown {
         from,
-        row_text: row_text.clone(),
+        to,
+        path: path.clone(),
     });
     state.status = Some(format!("Opened {row_text}"));
 }
 
-fn explain_score(state: &mut TuiAppState, rows: &[String]) {
+fn explain_score(state: &mut TuiAppState, snapshot: &TuiSnapshot, rows: &[String]) {
     let Some(row_text) = selected_row_text(state, rows) else {
         state.status = Some("No row selected".to_owned());
         return;
     };
 
+    let path = match state.current_view {
+        TuiView::Hotspots => hotspot_path_from_row(snapshot, &row_text),
+        TuiView::FileDetail | TuiView::GitDetail | TuiView::ExplainScore => {
+            state.current_path.clone()
+        }
+    };
+    let Some(path) = path.filter(|path| hotspot_for_path(snapshot, path).is_some()) else {
+        state.status = Some("No hotspot score available for this file".to_owned());
+        return;
+    };
+
+    let from = state.current_view;
+    if from != TuiView::ExplainScore {
+        push_view(state, TuiView::ExplainScore, Some(path.clone()));
+    }
     state.last_action = Some(TuiAction::ExplainScore {
-        view: state.current_view,
-        row_text: row_text.clone(),
+        view: from,
+        path: path.clone(),
     });
-    state.status = Some(format!("Explain score: {row_text}"));
+    state.status = Some(format!("Explain score: {path}"));
+}
+
+fn push_view(state: &mut TuiAppState, next_view: TuiView, next_path: Option<String>) {
+    if state.current_view == next_view && state.current_path == next_path {
+        return;
+    }
+
+    state.back_stack.push(state.current_view);
+    state.path_stack.push(state.current_path.clone());
+    state.current_view = next_view;
+    state.current_path = next_path;
+    state.selection_for_current_view_mut().selected = 0;
+    state.search = None;
 }
 
 fn resolve_editor_action(state: &mut TuiAppState, rows: &[String], resolution: EditorResolution) {
@@ -664,7 +732,7 @@ fn clamp_current_selection(state: &mut TuiAppState, snapshot: &TuiSnapshot) {
 }
 
 fn filtered_visible_rows(snapshot: &TuiSnapshot, state: &TuiAppState) -> Vec<String> {
-    let rows = visible_rows(snapshot, state.current_view);
+    let rows = visible_rows(snapshot, state.current_view, state.current_path.as_deref());
     let Some(search) = &state.search else {
         return rows;
     };
@@ -678,29 +746,244 @@ fn filtered_visible_rows(snapshot: &TuiSnapshot, state: &TuiAppState) -> Vec<Str
         .collect()
 }
 
-fn visible_rows(snapshot: &TuiSnapshot, view: TuiView) -> Vec<String> {
+fn visible_rows(snapshot: &TuiSnapshot, view: TuiView, path: Option<&str>) -> Vec<String> {
     match view {
-        TuiView::Overview => vec![
-            format!("Files: {}", snapshot.scan.summary.total_files),
-            format!("Hotspots: {}", snapshot.report.summary.hotspot_count),
-            format!("Symbols: {}", snapshot.symbols.summary.symbol_count),
-            format!("Dependencies: {}", snapshot.coupling.edges.len()),
-        ],
-        TuiView::Detail => snapshot
-            .report
-            .hotspots
-            .iter()
-            .map(|hotspot| {
-                format!(
-                    "#{rank} {path} score {score:.2}",
-                    rank = hotspot.rank,
-                    path = hotspot.path,
-                    score = hotspot.score
-                )
-            })
-            .chain(snapshot.scan.files.iter().map(|file| file.path.clone()))
-            .collect(),
+        TuiView::Hotspots => hotspot_rows(snapshot),
+        TuiView::FileDetail => path
+            .map(|path| file_detail_rows(snapshot, path))
+            .unwrap_or_else(|| vec!["No file selected.".to_owned()]),
+        TuiView::GitDetail => path
+            .map(|path| git_detail_rows(snapshot, path))
+            .unwrap_or_else(|| vec!["No file selected.".to_owned()]),
+        TuiView::ExplainScore => path
+            .map(|path| explain_score_rows(snapshot, path))
+            .unwrap_or_else(|| vec!["No file selected.".to_owned()]),
     }
+}
+
+fn hotspot_rows(snapshot: &TuiSnapshot) -> Vec<String> {
+    if snapshot.report.hotspots.is_empty() {
+        return vec!["No current files were ranked as hotspots.".to_owned()];
+    }
+
+    snapshot
+        .report
+        .hotspots
+        .iter()
+        .map(|hotspot| {
+            format!(
+                "#{rank} {path} score {score:.3}",
+                rank = hotspot.rank,
+                path = hotspot.path,
+                score = hotspot.score
+            )
+        })
+        .collect()
+}
+
+fn file_detail_rows(snapshot: &TuiSnapshot, path: &str) -> Vec<String> {
+    let mut rows = vec![format!("File: {path}")];
+
+    if let Some(file) = file_for_path(snapshot, path) {
+        rows.extend([
+            format!("Language: {}", file.language.unwrap_or("unknown")),
+            format!("Classification: {}", file.classification),
+            format!("Content: {:?}", file.content),
+            format!("Bytes: {}", optional_u64(file.byte_size)),
+            format!("Lines: {}", optional_u64(file.line_count)),
+            format!("Generated: {}", file.is_generated),
+            format!("Vendor: {}", file.is_vendor),
+            format!("Symlink: {}", file.is_symlink),
+        ]);
+        if !file.warnings.is_empty() {
+            rows.push(format!("Warnings: {:?}", file.warnings));
+        }
+    } else {
+        rows.push("Scan facts: file not present in current scan snapshot".to_owned());
+    }
+
+    if let Some(hotspot) = hotspot_for_path(snapshot, path) {
+        rows.extend([
+            format!("Hotspot score: {:.3}", hotspot.score),
+            format!("Rank: #{}", hotspot.rank),
+            "Git detail: press Enter".to_owned(),
+        ]);
+        rows.extend(
+            raw_metric_rows(hotspot)
+                .into_iter()
+                .map(|row| format!("Metric: {row}")),
+        );
+        rows.extend(limitation_rows(hotspot));
+    } else {
+        rows.push("Hotspot score: not ranked".to_owned());
+        rows.push("Limitations: no score explanation is available for this file".to_owned());
+    }
+
+    let symbols = symbols_for_path(snapshot, path);
+    if symbols.is_empty() {
+        rows.push("Related symbols: none".to_owned());
+    } else {
+        rows.push(format!("Related symbols: {}", symbols.len()));
+        rows.extend(symbols.into_iter().take(8).map(|symbol| {
+            format!(
+                "Symbol: {} {} lines {}-{}",
+                symbol.kind, symbol.name, symbol.start_line, symbol.end_line
+            )
+        }));
+    }
+
+    rows
+}
+
+fn git_detail_rows(snapshot: &TuiSnapshot, path: &str) -> Vec<String> {
+    let Some(hotspot) = hotspot_for_path(snapshot, path) else {
+        return vec![
+            format!("File: {path}"),
+            "Git metrics: no hotspot score raw metrics available".to_owned(),
+        ];
+    };
+
+    let raw = &hotspot.raw_metrics;
+    vec![
+        format!("File: {path}"),
+        format!("Commits: {}", optional_u64(raw.commits_per_file)),
+        format!("Total churn lines: {}", optional_u64(raw.total_churn_lines)),
+        format!(
+            "Recent churn lines ({} days): {}",
+            snapshot.report.summary.git.recent_window_days,
+            optional_u64(raw.recent_churn_lines)
+        ),
+        format!("Author count: {}", optional_u64(raw.author_count)),
+        format!(
+            "Dominant ownership: {}",
+            optional_percent(raw.dominant_owner_share)
+        ),
+        format!(
+            "Co-changed file count: {}",
+            optional_u64(raw.co_changed_file_count)
+        ),
+    ]
+}
+
+fn explain_score_rows(snapshot: &TuiSnapshot, path: &str) -> Vec<String> {
+    let Some(hotspot) = hotspot_for_path(snapshot, path) else {
+        return vec![
+            format!("File: {path}"),
+            "Score explanation: no hotspot score available".to_owned(),
+        ];
+    };
+
+    let mut rows = vec![
+        format!("File: {path}"),
+        format!("Score: {:.3}", hotspot.score),
+        format!("Formula: {}", hotspot.formula_version.id),
+        format!(
+            "Formula version: {}.{}",
+            hotspot.formula_version.major, hotspot.formula_version.minor
+        ),
+    ];
+    rows.extend(hotspot.weighted_terms.iter().map(|term| {
+        format!(
+            "Term: {} weight {:.2} input {} contribution {:.3}",
+            term.name,
+            term.weight,
+            optional_f64(term.normalized_input),
+            term.weighted_contribution
+        )
+    }));
+    rows.extend(limitation_rows(hotspot));
+
+    rows
+}
+
+fn raw_metric_rows(hotspot: &ReportHotspot) -> Vec<String> {
+    let raw = &hotspot.raw_metrics;
+    vec![
+        format!("bytes {}", optional_u64(raw.byte_size)),
+        format!("lines {}", optional_u64(raw.line_count)),
+        format!("commits {}", optional_u64(raw.commits_per_file)),
+        format!("total churn lines {}", optional_u64(raw.total_churn_lines)),
+        format!(
+            "recent churn lines {}",
+            optional_u64(raw.recent_churn_lines)
+        ),
+        format!("authors {}", optional_u64(raw.author_count)),
+        format!(
+            "dominant ownership {}",
+            optional_percent(raw.dominant_owner_share)
+        ),
+        format!(
+            "co-changed files {}",
+            optional_u64(raw.co_changed_file_count)
+        ),
+    ]
+}
+
+fn limitation_rows(hotspot: &ReportHotspot) -> Vec<String> {
+    if hotspot.limitations.is_empty() {
+        return vec!["Limitations: none recorded".to_owned()];
+    }
+
+    hotspot
+        .limitations
+        .iter()
+        .map(|limitation| format!("Limitation: {} - {}", limitation.code, limitation.message))
+        .collect()
+}
+
+fn hotspot_path_from_row(snapshot: &TuiSnapshot, row_text: &str) -> Option<String> {
+    snapshot
+        .report
+        .hotspots
+        .iter()
+        .find(|hotspot| {
+            row_text.starts_with(&format!("#{} {}", hotspot.rank, hotspot.path))
+                || row_text == hotspot.path
+        })
+        .map(|hotspot| hotspot.path.clone())
+}
+
+fn hotspot_for_path<'a>(snapshot: &'a TuiSnapshot, path: &str) -> Option<&'a ReportHotspot> {
+    snapshot
+        .report
+        .hotspots
+        .iter()
+        .find(|hotspot| hotspot.path == path)
+}
+
+fn file_for_path<'a>(snapshot: &'a TuiSnapshot, path: &str) -> Option<&'a FileRecord> {
+    snapshot.scan.files.iter().find(|file| file.path == path)
+}
+
+fn symbols_for_path<'a>(snapshot: &'a TuiSnapshot, path: &str) -> Vec<&'a ParseSymbolRecord> {
+    snapshot
+        .symbols
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.path == path)
+        .collect()
+}
+
+fn is_git_detail_row(row_text: &str) -> bool {
+    row_text == "Git detail: press Enter"
+}
+
+fn optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn optional_f64(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.3}"))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn optional_percent(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{:.1}%", value * 100.0))
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn visible_row_window(
@@ -739,7 +1022,10 @@ fn render(frame: &mut Frame<'_>, snapshot: &TuiSnapshot, state: &TuiAppState) {
             Span::raw(" local codebase intelligence"),
         ]),
         Line::raw(""),
-        Line::raw(format!("View: {}", state.current_view.title())),
+        Line::raw(match state.current_path() {
+            Some(path) => format!("View: {} - {}", state.current_view.title(), path),
+            None => format!("View: {}", state.current_view.title()),
+        }),
     ];
 
     if rows.is_empty() {
@@ -757,7 +1043,7 @@ fn render(frame: &mut Frame<'_>, snapshot: &TuiSnapshot, state: &TuiAppState) {
     let footer = match state.search_query() {
         Some(query) => format!("/{query}"),
         None => state.status().map(str::to_owned).unwrap_or_else(|| {
-            "j/k move, Enter drill down, / search, x explain, e editor, q quit".to_owned()
+            "j/k move, Enter drill down, / search, x explain, Esc back, e editor, q quit".to_owned()
         }),
     };
     body_lines.push(Line::raw(""));
@@ -842,6 +1128,10 @@ mod tests {
     use crate::context::{ContextSkippedReason, ContextSkippedRow, ContextSummary};
     use crate::parse::{ParseFileReason, ParseFileStatus};
     use crate::report::{ReportFindingLevel, ReportSummary};
+    use crate::scoring::{
+        FormulaVersion, NormalizedMetric, NormalizedScoreMetrics, RawScoreMetrics, ScoreLimitation,
+        WeightedTerm,
+    };
     use crate::{
         ContentKind, FileRecord, ParseFileRecord, ParseImportRecord, ParseSymbolRecord, ScanReport,
     };
@@ -863,7 +1153,7 @@ mod tests {
         reduce_test_key(&mut state, &snapshot, KeyCode::Char('j'), None);
         reduce_test_key(&mut state, &snapshot, KeyCode::Char('k'), None);
 
-        assert_eq!(state.selected_index(), 1);
+        assert_eq!(state.selected_index(), 0);
     }
 
     #[test]
@@ -873,18 +1163,21 @@ mod tests {
 
         reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
 
-        assert_eq!(state.current_view(), TuiView::Detail);
+        assert_eq!(state.current_view(), TuiView::FileDetail);
+        assert_eq!(state.current_path(), Some("src/lib.rs"));
         assert_eq!(
             state.last_action(),
             Some(&TuiAction::DrillDown {
-                from: TuiView::Overview,
-                row_text: "Files: 2".to_owned(),
+                from: TuiView::Hotspots,
+                to: TuiView::FileDetail,
+                path: "src/lib.rs".to_owned(),
             })
         );
 
         reduce_test_key(&mut state, &snapshot, KeyCode::Esc, None);
 
-        assert_eq!(state.current_view(), TuiView::Overview);
+        assert_eq!(state.current_view(), TuiView::Hotspots);
+        assert_eq!(state.current_path(), None);
         assert!(!state.should_exit());
     }
 
@@ -894,20 +1187,20 @@ mod tests {
         let mut state = TuiAppState::default();
 
         reduce_test_key(&mut state, &snapshot, KeyCode::Char('/'), None);
-        for character in "hot".chars() {
+        for character in "lib".chars() {
             reduce_test_key(&mut state, &snapshot, KeyCode::Char(character), None);
         }
 
-        assert_eq!(state.search_query(), Some("hot"));
+        assert_eq!(state.search_query(), Some("lib"));
         assert_eq!(
             filtered_visible_rows(&snapshot, &state),
-            vec!["Hotspots: 0"]
+            vec!["#1 src/lib.rs score 0.640"]
         );
 
         reduce_test_key(&mut state, &snapshot, KeyCode::Esc, None);
 
         assert_eq!(state.search_query(), None);
-        assert_eq!(state.current_view(), TuiView::Overview);
+        assert_eq!(state.current_view(), TuiView::Hotspots);
         assert!(!state.should_exit());
     }
 
@@ -932,7 +1225,7 @@ mod tests {
         reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
         reduce_test_key(&mut state, &snapshot, KeyCode::Esc, None);
 
-        assert_eq!(state.current_view(), TuiView::Overview);
+        assert_eq!(state.current_view(), TuiView::Hotspots);
         assert!(!state.should_exit());
     }
 
@@ -1008,7 +1301,7 @@ mod tests {
             state.last_action(),
             Some(&TuiAction::OpenEditor {
                 command: "vim".to_owned(),
-                row_text: "Files: 2".to_owned(),
+                row_text: "#1 src/lib.rs score 0.640".to_owned(),
             })
         );
     }
@@ -1018,16 +1311,102 @@ mod tests {
         let snapshot = test_snapshot();
         let mut state = TuiAppState::default();
 
-        reduce_test_key(&mut state, &snapshot, KeyCode::Char('j'), None);
         reduce_test_key(&mut state, &snapshot, KeyCode::Char('x'), None);
 
         assert_eq!(
             state.last_action(),
             Some(&TuiAction::ExplainScore {
-                view: TuiView::Overview,
-                row_text: "Hotspots: 0".to_owned(),
+                view: TuiView::Hotspots,
+                path: "src/lib.rs".to_owned(),
             })
         );
+        assert_eq!(state.current_view(), TuiView::ExplainScore);
+        assert_eq!(state.current_path(), Some("src/lib.rs"));
+    }
+
+    #[test]
+    fn hotspots_view_is_root_and_uses_ranked_hotspot_rows() {
+        let snapshot = test_snapshot();
+        let state = TuiAppState::default();
+
+        assert_eq!(state.current_view(), TuiView::Hotspots);
+        assert_eq!(
+            filtered_visible_rows(&snapshot, &state),
+            vec!["#1 src/lib.rs score 0.640"]
+        );
+    }
+
+    #[test]
+    fn file_detail_rows_include_scan_score_metrics_limitations_and_symbols() {
+        let snapshot = test_snapshot();
+        let rows = file_detail_rows(&snapshot, "src/lib.rs");
+
+        assert!(rows.contains(&"File: src/lib.rs".to_owned()));
+        assert!(rows.contains(&"Language: Rust".to_owned()));
+        assert!(rows.contains(&"Hotspot score: 0.640".to_owned()));
+        assert!(rows.contains(&"Metric: commits 7".to_owned()));
+        assert!(rows.contains(&"Metric: dominant ownership 57.0%".to_owned()));
+        assert!(rows.contains(&"Limitation: test.limit - fixture limitation".to_owned()));
+        assert!(rows.contains(&"Symbol: function run lines 1-1".to_owned()));
+    }
+
+    #[test]
+    fn file_detail_enter_on_git_row_opens_git_detail_without_self_history() {
+        let snapshot = test_snapshot();
+        let mut state = TuiAppState::default();
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
+        while filtered_visible_rows(&snapshot, &state)[state.selected_index()]
+            != "Git detail: press Enter"
+        {
+            reduce_test_key(&mut state, &snapshot, KeyCode::Char('j'), None);
+        }
+        reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
+
+        assert_eq!(state.current_view(), TuiView::GitDetail);
+        assert_eq!(state.current_path(), Some("src/lib.rs"));
+        assert_eq!(
+            state.last_action(),
+            Some(&TuiAction::DrillDown {
+                from: TuiView::FileDetail,
+                to: TuiView::GitDetail,
+                path: "src/lib.rs".to_owned(),
+            })
+        );
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
+        reduce_test_key(&mut state, &snapshot, KeyCode::Esc, None);
+        assert_eq!(state.current_view(), TuiView::FileDetail);
+    }
+
+    #[test]
+    fn git_detail_rows_use_existing_raw_score_metrics() {
+        let snapshot = test_snapshot();
+
+        assert_eq!(
+            git_detail_rows(&snapshot, "src/lib.rs"),
+            vec![
+                "File: src/lib.rs",
+                "Commits: 7",
+                "Total churn lines: 120",
+                "Recent churn lines (90 days): 30",
+                "Author count: 3",
+                "Dominant ownership: 57.0%",
+                "Co-changed file count: 4",
+            ]
+        );
+    }
+
+    #[test]
+    fn explain_score_rows_include_formula_and_weighted_terms() {
+        let snapshot = test_snapshot();
+        let rows = explain_score_rows(&snapshot, "src/lib.rs");
+
+        assert!(rows.contains(&"Formula: hotpath.score.v1".to_owned()));
+        assert!(rows.contains(&"Formula version: 1.0".to_owned()));
+        assert!(rows
+            .contains(&"Term: churn_score weight 0.35 input 0.600 contribution 0.210".to_owned()));
+        assert!(rows.contains(&"Limitation: test.limit - fixture limitation".to_owned()));
     }
 
     #[test]
@@ -1131,8 +1510,63 @@ mod tests {
             imports: Vec::new(),
         };
         let complexity = complexity::report_from_parse(&parse);
+        let report = report_with_hotspots(&scan);
 
-        TuiSnapshot::from_parts(empty_report(&scan), scan, parse, complexity)
+        TuiSnapshot::from_parts(report, scan, parse, complexity)
+    }
+
+    fn report_with_hotspots(scan: &ScanReport) -> Report {
+        let mut report = empty_report(scan);
+        report.summary.hotspot_count = 1;
+        report.summary.git.file_metric_count = 1;
+        report.summary.git.co_change_count = 3;
+        report.hotspots = vec![ReportHotspot {
+            rank: 1,
+            path: "src/lib.rs".to_owned(),
+            score: 0.64,
+            formula_version: FormulaVersion::current(),
+            raw_metrics: RawScoreMetrics {
+                path: "src/lib.rs".to_owned(),
+                byte_size: Some(10),
+                line_count: Some(1),
+                commits_per_file: Some(7),
+                total_churn_lines: Some(120),
+                recent_churn_lines: Some(30),
+                author_count: Some(3),
+                dominant_owner_share: Some(0.57),
+                co_changed_file_count: Some(4),
+            },
+            normalized_metrics: NormalizedScoreMetrics {
+                size: Some(0.1),
+                churn: Some(0.6),
+                recent_churn: Some(0.3),
+                ownership: Some(0.5),
+                coupling: Some(0.4),
+            },
+            weighted_terms: vec![
+                WeightedTerm {
+                    name: "churn_score".to_owned(),
+                    metric: NormalizedMetric::Churn,
+                    formula_version: FormulaVersion::current(),
+                    weight: 0.35,
+                    normalized_input: Some(0.6),
+                    weighted_contribution: 0.21,
+                },
+                WeightedTerm {
+                    name: "size_score".to_owned(),
+                    metric: NormalizedMetric::Size,
+                    formula_version: FormulaVersion::current(),
+                    weight: 0.20,
+                    normalized_input: Some(0.1),
+                    weighted_contribution: 0.02,
+                },
+            ],
+            limitations: vec![ScoreLimitation {
+                code: "test.limit".to_owned(),
+                message: "fixture limitation".to_owned(),
+            }],
+        }];
+        report
     }
 
     fn empty_report(scan: &ScanReport) -> Report {
