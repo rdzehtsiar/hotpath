@@ -10,21 +10,11 @@ use crate::{ContentKind, FileRecord};
 
 pub const CONTEXT_SCHEMA_VERSION: &str = "hotpath.context.v1";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ContextOptions {
     pub exclude_generated: bool,
     pub exclude_vendor: bool,
     pub budget_tokens: Option<u64>,
-}
-
-impl Default for ContextOptions {
-    fn default() -> Self {
-        Self {
-            exclude_generated: false,
-            exclude_vendor: false,
-            budget_tokens: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -234,7 +224,7 @@ fn included_byte_size(file: &FileRecord) -> Result<u64, ContextSkippedReason> {
 }
 
 fn estimate_tokens(byte_size: u64) -> u64 {
-    byte_size / 4 + u64::from(byte_size % 4 != 0)
+    byte_size / 4 + u64::from(!byte_size.is_multiple_of(4))
 }
 
 fn context_group_path(path: &str) -> String {
