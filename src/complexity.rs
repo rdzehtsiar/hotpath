@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::{ParseFileStatus, ParseReport};
+use crate::{dependency, ParseFileStatus, ParseReport};
 
 pub const COMPLEXITY_SCHEMA_VERSION: &str = "hotpath.complexity.v1";
 const LARGE_SYMBOL_LINE_THRESHOLD: u64 = 80;
@@ -19,6 +19,9 @@ pub struct ComplexitySummary {
     pub large_symbol_count: u64,
     pub max_cyclomatic_complexity: u64,
     pub max_nesting_depth: u64,
+    pub dependency_edge_count: u64,
+    pub max_fan_in: u64,
+    pub max_fan_out: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -31,6 +34,8 @@ pub struct ComplexityFileRecord {
     pub large_symbol_count: u64,
     pub max_cyclomatic_complexity: Option<u64>,
     pub max_nesting_depth: Option<u64>,
+    pub fan_in: u64,
+    pub fan_out: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -76,18 +81,30 @@ struct RankedSymbolKey<'a> {
 
 pub fn report_from_parse(report: &ParseReport) -> ComplexityReport {
     let parse_summary = report.summary();
+    let dependency_edges = dependency::resolve_dependencies(report);
+    let fan_metrics = dependency::fan_metrics(&report.files, &dependency_edges);
     let mut files = report
         .files
         .iter()
-        .map(|file| ComplexityFileRecord {
-            path: file.path.clone(),
-            language: file.language,
-            status: file.status,
-            symbol_count: file.symbol_count,
-            function_method_count: 0,
-            large_symbol_count: 0,
-            max_cyclomatic_complexity: None,
-            max_nesting_depth: None,
+        .map(|file| {
+            let fan = fan_metrics
+                .by_path
+                .get(&file.path)
+                .copied()
+                .unwrap_or_default();
+
+            ComplexityFileRecord {
+                path: file.path.clone(),
+                language: file.language,
+                status: file.status,
+                symbol_count: file.symbol_count,
+                function_method_count: 0,
+                large_symbol_count: 0,
+                max_cyclomatic_complexity: None,
+                max_nesting_depth: None,
+                fan_in: fan.fan_in,
+                fan_out: fan.fan_out,
+            }
         })
         .collect::<Vec<_>>();
     let file_positions = files
@@ -162,6 +179,9 @@ pub fn report_from_parse(report: &ParseReport) -> ComplexityReport {
             large_symbol_count,
             max_cyclomatic_complexity,
             max_nesting_depth,
+            dependency_edge_count: fan_metrics.dependency_edge_count,
+            max_fan_in: fan_metrics.max_fan_in,
+            max_fan_out: fan_metrics.max_fan_out,
         },
         files,
         symbols,
@@ -179,7 +199,7 @@ pub fn render_json(report: &ComplexityReport) -> Result<String, serde_json::Erro
 
 pub fn render_summary(report: &ComplexityReport) -> String {
     let mut summary = format!(
-        "Hotpath complexity summary\n{:<17}  {}\n{:<17}  {}\n{:<17}  {}\n{:<17}  {}\n{:<17}  {}\n{:<17}  {}\n{:<17}  {}",
+        "Hotpath complexity summary\n{:<17}  {}\n{:<17}  {}\n{:<17}  {}\n{:<17}  {}\n{:<17}  {}\n{:<17}  {}\n{:<17}  {}\n{:<17}  {}\n{:<17}  {}\n{:<17}  {}",
         "total files",
         report.summary.total_files,
         "parsed files",
@@ -193,7 +213,13 @@ pub fn render_summary(report: &ComplexityReport) -> String {
         "max cyclomatic",
         report.summary.max_cyclomatic_complexity,
         "max nesting",
-        report.summary.max_nesting_depth
+        report.summary.max_nesting_depth,
+        "dependency edges",
+        report.summary.dependency_edge_count,
+        "max fan-in",
+        report.summary.max_fan_in,
+        "max fan-out",
+        report.summary.max_fan_out
     );
 
     summary.push_str("\n\nmost complex function/method symbols");
@@ -299,22 +325,56 @@ fn max_option(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ContentKind, ParseFileRecord, ParseSymbolRecord};
+    use crate::{ContentKind, ParseFileRecord, ParseImportRecord, ParseSymbolRecord};
 
     fn parse_report(symbols: Vec<ParseSymbolRecord>) -> ParseReport {
-        ParseReport {
-            warnings: Vec::new(),
-            files: vec![ParseFileRecord {
+        parse_report_with_imports(symbols, Vec::new())
+    }
+
+    fn parse_report_with_imports(
+        symbols: Vec<ParseSymbolRecord>,
+        imports: Vec<ParseImportRecord>,
+    ) -> ParseReport {
+        parse_report_with_files(
+            vec![ParseFileRecord {
                 path: "src/lib.rs".to_owned(),
                 language: Some("Rust"),
                 content: ContentKind::Text,
                 status: ParseFileStatus::Parsed,
                 reason: None,
                 symbol_count: symbols.len() as u64,
-                import_count: 0,
+                import_count: imports
+                    .iter()
+                    .filter(|import| import.path == "src/lib.rs")
+                    .count() as u64,
             }],
             symbols,
-            imports: Vec::new(),
+            imports,
+        )
+    }
+
+    fn parse_report_with_files(
+        files: Vec<ParseFileRecord>,
+        symbols: Vec<ParseSymbolRecord>,
+        imports: Vec<ParseImportRecord>,
+    ) -> ParseReport {
+        ParseReport {
+            warnings: Vec::new(),
+            files,
+            symbols,
+            imports,
+        }
+    }
+
+    fn file(path: &str, symbol_count: u64, import_count: u64) -> ParseFileRecord {
+        ParseFileRecord {
+            path: path.to_owned(),
+            language: Some("Rust"),
+            content: ContentKind::Text,
+            status: ParseFileStatus::Parsed,
+            reason: None,
+            symbol_count,
+            import_count,
         }
     }
 
@@ -340,6 +400,16 @@ mod tests {
         }
     }
 
+    fn import(path: &str, target: &str, kind: &str) -> ParseImportRecord {
+        ParseImportRecord {
+            path: path.to_owned(),
+            target: target.to_owned(),
+            kind: kind.to_owned(),
+            start_line: 1,
+            end_line: 1,
+        }
+    }
+
     #[test]
     fn report_derives_lengths_large_symbols_and_summary() {
         let report = report_from_parse(&parse_report(vec![
@@ -355,15 +425,39 @@ mod tests {
         assert_eq!(report.summary.large_symbol_count, 2);
         assert_eq!(report.summary.max_cyclomatic_complexity, 7);
         assert_eq!(report.summary.max_nesting_depth, 3);
+        assert_eq!(report.summary.dependency_edge_count, 0);
+        assert_eq!(report.summary.max_fan_in, 0);
+        assert_eq!(report.summary.max_fan_out, 0);
         assert_eq!(report.files[0].function_method_count, 2);
         assert_eq!(report.files[0].large_symbol_count, 2);
         assert_eq!(report.files[0].max_cyclomatic_complexity, Some(7));
         assert_eq!(report.files[0].max_nesting_depth, Some(3));
+        assert_eq!(report.files[0].fan_in, 0);
+        assert_eq!(report.files[0].fan_out, 0);
         assert_eq!(report.symbols[0].length_lines, 90);
         assert_eq!(report.symbols[0].function_length_lines, None);
         assert_eq!(report.symbols[1].length_lines, 5);
         assert_eq!(report.symbols[1].function_length_lines, Some(5));
         assert!(report.symbols[2].is_large_symbol);
+    }
+
+    #[test]
+    fn report_derives_file_fan_metrics_from_resolved_dependencies() {
+        let report = report_from_parse(&parse_report_with_files(
+            vec![file("src/lib.rs", 0, 1), file("src/child.rs", 0, 0)],
+            Vec::new(),
+            vec![import("src/lib.rs", "child", "mod")],
+        ));
+
+        assert_eq!(report.summary.dependency_edge_count, 1);
+        assert_eq!(report.summary.max_fan_in, 1);
+        assert_eq!(report.summary.max_fan_out, 1);
+        assert_eq!(report.files[0].path, "src/lib.rs");
+        assert_eq!(report.files[0].fan_in, 0);
+        assert_eq!(report.files[0].fan_out, 1);
+        assert_eq!(report.files[1].path, "src/child.rs");
+        assert_eq!(report.files[1].fan_in, 1);
+        assert_eq!(report.files[1].fan_out, 0);
     }
 
     #[test]

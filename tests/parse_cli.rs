@@ -244,6 +244,32 @@ fn parse_json_persists_symbols_without_dependency_edges() {
 }
 
 #[test]
+fn parse_json_persists_resolved_internal_dependency_edges() {
+    let fixture = Fixture::new("parse-json-dependencies");
+    fixture.write(
+        "src/lib.rs",
+        concat!(
+            "mod child;\n",
+            "use crate::models::Widget;\n",
+            "use std::fmt;\n"
+        ),
+    );
+    fixture.write("src/child.rs", "pub fn child() {}\n");
+    fixture.write("src/models/mod.rs", "pub struct Widget;\n");
+    fixture.write("web/app.ts", "import { value } from \"./value\";\n");
+    fixture.write("web/value.ts", "export const value = 1;\n");
+
+    let (_, value) = parse_json(&fixture.path);
+
+    assert_eq!(value["summary"]["import_count"], 4);
+    let store = IndexStore::open(&fixture.path).expect("index should open");
+    assert_eq!(
+        store.dependency_count().expect("dependencies should count"),
+        3
+    );
+}
+
+#[test]
 fn parse_json_language_fixture_snapshot_is_stable() {
     let fixture = Fixture::new("parse-language-snapshot");
     fixture.write(

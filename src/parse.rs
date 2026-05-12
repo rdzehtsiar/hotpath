@@ -472,9 +472,11 @@ fn walk_rust(node: Node<'_>, state: &mut ExtractionState<'_>) {
                 walk_children_rust(node, state);
                 return;
             };
-            state
-                .imports
-                .push(import_record(state.path, &name, "mod", node));
+            if !has_body(node) {
+                state
+                    .imports
+                    .push(import_record(state.path, &name, "mod", node));
+            }
             record_symbol_and_walk(node, state, name, "module", true, false, walk_rust);
             return;
         }
@@ -1042,6 +1044,10 @@ fn descendant_kind(node: Node<'_>, kind: &str) -> bool {
         .any(|child| child.kind() == kind || descendant_kind(child, kind))
 }
 
+fn has_body(node: Node<'_>) -> bool {
+    node.child_by_field_name("body").is_some()
+}
+
 fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).collect()
@@ -1147,6 +1153,27 @@ fn free() {}
         assert_eq!(render.nesting_depth, 1);
         assert_eq!(render.cyclomatic_complexity, Some(4));
         assert_eq!(render.max_control_flow_nesting, Some(3));
+    }
+
+    #[test]
+    fn rust_inline_modules_are_symbols_not_dependency_imports() {
+        let source = r#"
+mod inline {
+    pub fn child() {}
+}
+
+mod external;
+"#;
+
+        let extraction = extraction(SupportedLanguage::Rust, source);
+
+        assert!(extraction.parsed);
+        assert_eq!(import_targets(&extraction), vec!["external"]);
+        assert_eq!(symbol(&extraction, "inline", "module").start_line, 2);
+        assert_eq!(
+            symbol(&extraction, "child", "function").parent.as_deref(),
+            Some("inline")
+        );
     }
 
     #[test]

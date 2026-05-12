@@ -15,8 +15,8 @@ use serde::Serialize;
 use crate::git::{GitCoChange, GitFileMetrics};
 use crate::scoring::{NormalizedScoreMetrics, RankedHotspotScore, ScoreLimitation, WeightedTerm};
 use crate::{
-    ContentKind, FileRecord, FileWarning, ParseReport, ParseSymbolRecord, ScanReport, ScanWarning,
-    SCAN_SCHEMA_VERSION,
+    dependency, ContentKind, FileRecord, FileWarning, ParseReport, ParseSymbolRecord, ScanReport,
+    ScanWarning, SCAN_SCHEMA_VERSION,
 };
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 2;
@@ -932,6 +932,47 @@ impl IndexStore {
             }
         }
 
+        replace_dependencies_for_report(&transaction, &index_path, repo_id, &file_ids, report)?;
+
+        transaction
+            .commit()
+            .map_err(|source| IndexError::PersistSymbols {
+                path: index_path,
+                source,
+            })?;
+
+        Ok(())
+    }
+
+    pub fn persist_dependencies(&mut self, report: &ParseReport) -> Result<(), IndexError> {
+        let index_path = self.path.clone();
+        let transaction =
+            self.connection
+                .transaction()
+                .map_err(|source| IndexError::PersistSymbols {
+                    path: index_path.clone(),
+                    source,
+                })?;
+        let repo_id = ensure_repo_for_symbols(&transaction, &index_path)?;
+        let mut file_ids = BTreeMap::new();
+
+        for file in &report.files {
+            if file_ids.contains_key(&file.path) {
+                continue;
+            }
+
+            let file_id = current_file_id_for_symbols(
+                &transaction,
+                &index_path,
+                repo_id,
+                &file.path,
+                "parse file",
+            )?;
+            file_ids.insert(file.path.clone(), file_id);
+        }
+
+        replace_dependencies_for_report(&transaction, &index_path, repo_id, &file_ids, report)?;
+
         transaction
             .commit()
             .map_err(|source| IndexError::PersistSymbols {
@@ -1522,6 +1563,92 @@ fn symbol_file_id(
             message: format!(
                 "symbol '{}' refers to '{}', which is not in the current parse file scope",
                 symbol.name, symbol.path
+            ),
+        })
+}
+
+fn replace_dependencies_for_report(
+    transaction: &Transaction<'_>,
+    index_path: &Path,
+    repo_id: i64,
+    file_ids: &BTreeMap<String, i64>,
+    report: &ParseReport,
+) -> Result<(), IndexError> {
+    {
+        let mut delete = transaction
+            .prepare("DELETE FROM dependencies WHERE source_file_id = ?1;")
+            .map_err(|source| IndexError::PersistSymbols {
+                path: index_path.to_path_buf(),
+                source,
+            })?;
+
+        for file_id in file_ids.values() {
+            delete
+                .execute(params![file_id])
+                .map_err(|source| IndexError::PersistSymbols {
+                    path: index_path.to_path_buf(),
+                    source,
+                })?;
+        }
+    }
+
+    let edges = dependency::resolve_dependencies(report);
+    if edges.is_empty() {
+        return Ok(());
+    }
+
+    let mut insert = transaction
+        .prepare(
+            "INSERT INTO dependencies (
+                repo_id,
+                source_file_id,
+                target_file_id,
+                target_path,
+                kind,
+                symbol_name,
+                weight
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, NULL, 1.0);",
+        )
+        .map_err(|source| IndexError::PersistSymbols {
+            path: index_path.to_path_buf(),
+            source,
+        })?;
+
+    for edge in edges {
+        let source_file_id = dependency_file_id(file_ids, index_path, "source", &edge.source_path)?;
+        let target_file_id = dependency_file_id(file_ids, index_path, "target", &edge.target_path)?;
+
+        insert
+            .execute(params![
+                repo_id,
+                source_file_id,
+                target_file_id,
+                &edge.target_path,
+                &edge.kind,
+            ])
+            .map_err(|source| IndexError::PersistSymbols {
+                path: index_path.to_path_buf(),
+                source,
+            })?;
+    }
+
+    Ok(())
+}
+
+fn dependency_file_id(
+    file_ids: &BTreeMap<String, i64>,
+    index_path: &Path,
+    label: &str,
+    path: &str,
+) -> Result<i64, IndexError> {
+    file_ids
+        .get(path)
+        .copied()
+        .ok_or_else(|| IndexError::InvalidSymbolData {
+            path: index_path.to_path_buf(),
+            message: format!(
+                "parser dependency {label} '{path}' is not in the current parse file scope"
             ),
         })
 }
@@ -3968,7 +4095,8 @@ mod tests {
 
     use crate::scoring::{calculate_hotspot_score, rank_hotspot_scores, RawScoreMetrics};
     use crate::{
-        FileWarning, ParseFileRecord, ParseFileStatus, ParseReport, ParseSymbolRecord, ScanWarning,
+        FileWarning, ParseFileRecord, ParseFileStatus, ParseImportRecord, ParseReport,
+        ParseSymbolRecord, ScanWarning,
     };
 
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4194,11 +4322,19 @@ mod tests {
     }
 
     fn parse_report(files: Vec<ParseFileRecord>, symbols: Vec<ParseSymbolRecord>) -> ParseReport {
+        parse_report_with_imports(files, symbols, Vec::new())
+    }
+
+    fn parse_report_with_imports(
+        files: Vec<ParseFileRecord>,
+        symbols: Vec<ParseSymbolRecord>,
+        imports: Vec<ParseImportRecord>,
+    ) -> ParseReport {
         ParseReport {
             warnings: Vec::new(),
             files,
             symbols,
-            imports: Vec::new(),
+            imports,
         }
     }
 
@@ -4233,6 +4369,16 @@ mod tests {
             parent: parent.map(ToOwned::to_owned),
             cyclomatic_complexity: Some(1),
             max_control_flow_nesting: Some(0),
+        }
+    }
+
+    fn parse_import(path: &str, target: &str, kind: &str) -> ParseImportRecord {
+        ParseImportRecord {
+            path: path.to_owned(),
+            target: target.to_owned(),
+            kind: kind.to_owned(),
+            start_line: 1,
+            end_line: 1,
         }
     }
 
@@ -4819,6 +4965,55 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("src/b.rs", "new")]
         );
+        assert_eq!(
+            store.dependency_count().expect("dependencies should count"),
+            0
+        );
+    }
+
+    #[test]
+    fn persist_symbols_replaces_resolved_dependency_edges() {
+        let fixture = Fixture::new("persist-dependencies");
+        let mut store = IndexStore::open(&fixture.path).expect("index should open");
+        store
+            .persist_scan(&scan_report(vec![
+                scan_file("src/lib.rs", Some(10), Some("Rust"), ContentKind::Text),
+                scan_file("src/child.rs", Some(20), Some("Rust"), ContentKind::Text),
+                scan_file("src/old.rs", Some(30), Some("Rust"), ContentKind::Text),
+            ]))
+            .expect("scan should persist");
+
+        let first = parse_report_with_imports(
+            vec![
+                parse_file("src/lib.rs"),
+                parse_file("src/child.rs"),
+                parse_file("src/old.rs"),
+            ],
+            Vec::new(),
+            vec![
+                parse_import("src/lib.rs", "child", "mod"),
+                parse_import("src/lib.rs", "std::fmt", "use"),
+                parse_import("src/lib.rs", "../unsafe", "use"),
+            ],
+        );
+        store
+            .persist_symbols(&first)
+            .expect("first dependencies should persist");
+
+        assert_eq!(
+            store.dependency_count().expect("dependencies should count"),
+            1
+        );
+
+        let second = parse_report_with_imports(
+            vec![parse_file("src/lib.rs"), parse_file("src/child.rs")],
+            Vec::new(),
+            Vec::new(),
+        );
+        store
+            .persist_symbols(&second)
+            .expect("replacement dependencies should persist");
+
         assert_eq!(
             store.dependency_count().expect("dependencies should count"),
             0

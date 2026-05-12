@@ -12,6 +12,7 @@ use ignore::{DirEntry, Error as IgnoreError, WalkBuilder};
 use serde::Serialize;
 
 pub mod complexity;
+pub mod dependency;
 pub mod git;
 pub mod parse;
 pub mod scoring;
@@ -20,6 +21,10 @@ pub mod storage;
 pub use complexity::{
     ComplexityFileRecord, ComplexityReport, ComplexitySummary, ComplexitySymbolRecord,
     COMPLEXITY_SCHEMA_VERSION,
+};
+pub use dependency::{
+    fan_metrics, resolve_dependencies, DependencyFanMetrics, FileDependencyFan,
+    ResolvedDependencyEdge,
 };
 pub use parse::{
     ParseFileReason, ParseFileRecord, ParseFileStatus, ParseImportRecord, ParseReport,

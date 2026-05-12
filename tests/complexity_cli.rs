@@ -119,6 +119,15 @@ fn symbol_by_name<'a>(value: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("expected symbol named {name}"))
 }
 
+fn file_by_path<'a>(value: &'a Value, path: &str) -> &'a Value {
+    value["files"]
+        .as_array()
+        .expect("files should be an array")
+        .iter()
+        .find(|file| file["path"] == path)
+        .unwrap_or_else(|| panic!("expected file record for {path}"))
+}
+
 fn assert_no_path_leaks(value: &Value, fixture_path: &Path) {
     let rendered = value.to_string();
     let path = fixture_path.display().to_string();
@@ -161,12 +170,17 @@ fn complexity_json_reports_summary_files_symbols_and_persists_parse_symbols() {
     assert_eq!(value["summary"]["large_symbol_count"], 1);
     assert_eq!(value["summary"]["max_cyclomatic_complexity"], 4);
     assert_eq!(value["summary"]["max_nesting_depth"], 3);
+    assert_eq!(value["summary"]["dependency_edge_count"], 0);
+    assert_eq!(value["summary"]["max_fan_in"], 0);
+    assert_eq!(value["summary"]["max_fan_out"], 0);
     assert_eq!(value["files"][0]["path"], "src/lib.rs");
     assert_eq!(value["files"][0]["status"], "parsed");
     assert_eq!(value["files"][0]["function_method_count"], 2);
     assert_eq!(value["files"][0]["large_symbol_count"], 1);
     assert_eq!(value["files"][0]["max_cyclomatic_complexity"], 4);
     assert_eq!(value["files"][0]["max_nesting_depth"], 3);
+    assert_eq!(value["files"][0]["fan_in"], 0);
+    assert_eq!(value["files"][0]["fan_out"], 0);
 
     let render = symbol_by_name(&value, "render");
     assert_eq!(render["path"], "src/lib.rs");
@@ -209,6 +223,9 @@ fn complexity_summary_is_concise_ranked_and_does_not_require_git() {
     assert!(stdout.contains("large symbols      1"));
     assert!(stdout.contains("max cyclomatic     4"));
     assert!(stdout.contains("max nesting        3"));
+    assert!(stdout.contains("dependency edges   0"));
+    assert!(stdout.contains("max fan-in         0"));
+    assert!(stdout.contains("max fan-out        0"));
     assert!(stdout.contains("most complex function/method symbols"));
     assert!(stdout.contains("src/lib.rs:4  method  render"));
     assert!(stdout.contains("src/lib.rs:16  function  large"));
@@ -219,6 +236,40 @@ fn complexity_summary_is_concise_ranked_and_does_not_require_git() {
             < stdout
                 .find("src/lib.rs:16  function  large")
                 .expect("large should be ranked")
+    );
+}
+
+#[test]
+fn complexity_json_reports_file_fan_metrics_and_persists_dependencies() {
+    let fixture = Fixture::new("complexity-dependencies");
+    fixture.write(
+        "src/lib.rs",
+        concat!(
+            "mod child;\n",
+            "use crate::models::Widget;\n",
+            "pub fn lib() {}\n"
+        ),
+    );
+    fixture.write("src/child.rs", "pub fn child() {}\n");
+    fixture.write("src/models/mod.rs", "pub struct Widget;\n");
+
+    let stdout = successful_stdout(&["complexity", "--json"], &fixture.path);
+    let value: Value = serde_json::from_str(&stdout).expect("complexity JSON should parse");
+
+    assert_eq!(value["summary"]["dependency_edge_count"], 2);
+    assert_eq!(value["summary"]["max_fan_in"], 1);
+    assert_eq!(value["summary"]["max_fan_out"], 2);
+    assert_eq!(file_by_path(&value, "src/lib.rs")["fan_in"], 0);
+    assert_eq!(file_by_path(&value, "src/lib.rs")["fan_out"], 2);
+    assert_eq!(file_by_path(&value, "src/child.rs")["fan_in"], 1);
+    assert_eq!(file_by_path(&value, "src/child.rs")["fan_out"], 0);
+    assert_eq!(file_by_path(&value, "src/models/mod.rs")["fan_in"], 1);
+    assert_eq!(file_by_path(&value, "src/models/mod.rs")["fan_out"], 0);
+
+    let store = IndexStore::open(&fixture.path).expect("index should open");
+    assert_eq!(
+        store.dependency_count().expect("dependencies should count"),
+        2
     );
 }
 
