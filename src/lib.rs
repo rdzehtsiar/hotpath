@@ -12,6 +12,7 @@ use ignore::{DirEntry, Error as IgnoreError, WalkBuilder};
 use serde::Serialize;
 
 pub mod complexity;
+pub mod context;
 pub mod dependency;
 pub mod git;
 pub mod graph;
@@ -22,6 +23,11 @@ pub mod storage;
 pub use complexity::{
     ComplexityFileRecord, ComplexityReport, ComplexitySummary, ComplexitySymbolRecord,
     COMPLEXITY_SCHEMA_VERSION,
+};
+pub use context::{
+    estimate_context, parse_budget_tokens, BudgetParseError, ContextBudgetStatus, ContextGroupRow,
+    ContextOptions, ContextReport, ContextSkippedReason, ContextSkippedRow, ContextSummary,
+    CONTEXT_SCHEMA_VERSION,
 };
 pub use dependency::{
     fan_metrics, resolve_dependencies, DependencyFanMetrics, FileDependencyFan,
