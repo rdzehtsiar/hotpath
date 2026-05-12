@@ -7,14 +7,15 @@ contents.
 Hotpath is at the beginning of development. This document defines the privacy
 posture the project is being built toward and describes the local data written
 by the current early scanner, parser, complexity, dependency graph, Git metric,
-hotspot scoring, and index implementation.
+hotspot scoring, context estimate, and index implementation.
 
 ## Default Posture
 
 Hotpath's primary workflows should provide:
 
 - no telemetry by default
-- no network calls for scanning, scoring, indexing, or reports
+- no network calls for scanning, scoring, context estimation, indexing, or
+  reports
 - no cloud APIs for repository analysis
 - no hosted service dependency
 - local storage for indexes, caches, and reports
@@ -67,11 +68,17 @@ to make repeated scans faster. Local writes should be documented, deterministic
 where practical, and avoid including host-specific absolute paths in portable
 output unless the user asks for them.
 
+Context reports can include derived repository-relative paths or groups,
+estimated token counts, byte totals, skipped-file counts, and skipped reasons.
+They do not include source-file contents. `hotpath context` estimates from
+local scanner facts and should not make network calls, use external APIs, run
+cloud tokenizers, or collect telemetry.
+
 ## Network And Cloud Boundaries
 
 Primary Hotpath workflows should not make network calls. Scanning, indexing,
-Git analysis, hotspot scoring, and report generation should not depend on cloud
-APIs.
+Git analysis, hotspot scoring, context estimation, and report generation should
+not depend on cloud APIs.
 
 If future optional features ever need network access, they should be explicit,
 documented, opt-in, and separate from the core local workflow. They should not

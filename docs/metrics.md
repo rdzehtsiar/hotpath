@@ -6,7 +6,7 @@ the beginning of development, so the command surface, JSON schemas, formulas,
 and local index layout are not compatibility promises.
 
 This page defines the public metrics currently exposed by scanner, parser,
-complexity, graph, Git, and hotspot workflows.
+complexity, graph, Git, hotspot, and context workflows.
 
 ## Scope
 
@@ -24,6 +24,7 @@ Current machine-readable schema identifiers include:
 | Complexity report | `hotpath complexity --json` | `hotpath.complexity.v1` |
 | Dependency graph report | `hotpath graph --module <selector> --json` | `hotpath.graph.v1` |
 | Hotspot scoring | `hotpath hotspots`, `hotpath explain` | `hotpath.score.v1` |
+| Context estimate | `hotpath context --json` | `hotpath.context.v1` |
 
 These identifiers describe current output, not a stable released contract.
 
@@ -175,6 +176,30 @@ on Git co-change breadth, not parser dependency fan-in or fan-out.
 
 See [Scoring](scoring.md) for normalization, ranking, limitation codes, and
 formula details.
+
+## Context Estimates
+
+`hotpath context` estimates AI context cost offline from scanner facts. For
+each scanned UTF-8 text file included in the report, Hotpath uses:
+
+```text
+estimated_tokens = ceil(byte_size / 4)
+```
+
+Binary files, unknown or unreadable files, files with unsupported encodings, and
+files missing usable byte-size facts are skipped from token totals and reported
+as skipped. Generated and vendor files are included by default. Passing
+`--exclude-generated` or `--exclude-vendor` removes matching files from the
+estimate and reports the corresponding skipped reason.
+
+`hotpath context --budget <tokens>` accepts integer budgets and `k` or `m`
+suffixes, then reports whether the estimate is within or over that budget.
+
+The estimate does not use external APIs, model tokenizers, telemetry, network
+access, or cloud calls. It is useful for planning approximate context size, not
+for tokenizer-specific billing or exact prompt token counts.
+
+See [Context estimates](context.md) for current semantics.
 
 ## Determinism And Interpretation
 

@@ -2,8 +2,9 @@
 
 Hotpath is at the beginning of development. The repository currently contains
 an early Rust CLI with scanner, parser, complexity, dependency graph, index
-health, Git metric, hotspot ranking, and hotspot explanation commands. There is
-no released binary, stable CLI contract, supported report format, or
+health, Git metric, hotspot ranking, hotspot explanation, and context estimate
+commands. There is no released binary, stable CLI contract, supported report
+format, or
 compatibility promise yet.
 
 This page documents the limits Hotpath should make explicit as it develops.
@@ -16,7 +17,8 @@ extraction with `hotpath parse`, parser-derived complexity summaries with
 `hotpath complexity`, conservative dependency graph output with `hotpath graph
 --module <selector>`, local Git history explanation with `hotpath explain-git`,
 hotspot ranking with `hotpath hotspots`, and per-file hotspot explanation with
-`hotpath explain`. These are not stable interfaces.
+`hotpath explain`, and offline AI context cost estimation with `hotpath
+context`. These are not stable interfaces.
 
 Hotpath does not currently provide stable Git analysis or scoring compatibility,
 broad parser/language support, complete dependency analysis, CI output,
@@ -155,6 +157,28 @@ Known hotspot score limitations include:
 
 See [Scoring](scoring.md) for the current formula, normalization rules, ranking
 behavior, and limitation codes.
+
+## Context Estimate Limits
+
+The current `hotpath context` command estimates AI context cost from scanner
+facts using `estimated_tokens = ceil(byte_size / 4)` for scanned UTF-8 text
+files only. It reports machine-readable output with schema identifier
+`hotpath.context.v1`.
+
+Known context estimate limitations include:
+
+- the estimate is byte-based and does not use a model-specific tokenizer
+- the estimate is useful for planning context size, not exact prompt token
+  counts or tokenizer-specific billing
+- binary files, unknown or unreadable files, files with unsupported encodings,
+  and files missing usable byte-size facts are skipped from token totals
+- generated and vendor files are included by default, unless
+  `--exclude-generated` or `--exclude-vendor` is used
+- budget checks from `--budget <tokens>` are advisory and report only whether
+  the estimate is within or over the supplied integer, `k`, or `m` budget
+
+`hotpath context` should not make external API calls, run cloud tokenizers,
+collect telemetry, or require network access.
 
 ## False Positives And False Negatives
 

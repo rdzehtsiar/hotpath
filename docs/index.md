@@ -7,8 +7,10 @@ compatibility promise.
 The index makes repeated local analysis easier to inspect and extend. It can be
 created and populated by `hotpath scan`, `hotpath parse`, `hotpath
 complexity`, `hotpath graph`, `hotpath explain-git`, `hotpath hotspots`, and
-`hotpath explain` runs. It is not user-authored data and should be safe to
-delete and rebuild.
+`hotpath explain` runs. `hotpath context` uses current scan facts for context
+estimates. When it persists data, it persists only the current scan facts and
+does not add context-specific rows, tables, or schema. The index is not
+user-authored data and should be safe to delete and rebuild.
 
 ## Location And Scope
 
@@ -36,6 +38,12 @@ The schema contains tables for current scanner, parser, dependency, Git, and
 hotspot persistence, plus sparse extension points for later analysis. The
 presence of a table does not mean every possible related feature is
 implemented.
+
+Context estimates currently rely on scanner file facts such as
+repository-relative path, byte size, content kind, generated/vendor flags, and
+file warnings. There is no context-specific table or context-specific index
+schema in the current design, and context estimates do not persist
+token-estimate rows.
 
 Currently populated by `hotpath scan`:
 
