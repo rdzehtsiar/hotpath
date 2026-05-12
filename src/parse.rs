@@ -673,17 +673,7 @@ fn record_named_symbol_with_parent_and_walk(
     let record = symbol_record(state, node, name.clone(), kind, include_complexity, parent);
     state.symbols.push(record);
 
-    if push_parent {
-        state.parents.push(ParentSymbol { name, kind });
-        for child in named_children(node) {
-            walk(child, state);
-        }
-        state.parents.pop();
-    } else {
-        for child in named_children(node) {
-            walk(child, state);
-        }
-    }
+    walk_symbol_children(node, state, name, kind, push_parent, walk);
 }
 
 fn record_symbol_and_walk(
@@ -698,6 +688,17 @@ fn record_symbol_and_walk(
     let record = symbol_record(state, node, name.clone(), kind, include_complexity, None);
     state.symbols.push(record);
 
+    walk_symbol_children(node, state, name, kind, push_parent, walk);
+}
+
+fn walk_symbol_children(
+    node: Node<'_>,
+    state: &mut ExtractionState<'_>,
+    name: String,
+    kind: &'static str,
+    push_parent: bool,
+    walk: fn(Node<'_>, &mut ExtractionState<'_>),
+) {
     if push_parent {
         state.parents.push(ParentSymbol { name, kind });
         for child in named_children(node) {
