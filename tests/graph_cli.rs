@@ -68,6 +68,20 @@ fn successful_stdout(args: &[&str], current_dir: &Path) -> String {
     String::from_utf8(output.stdout).expect("stdout should be UTF-8")
 }
 
+fn failed_stderr(args: &[&str], current_dir: &Path) -> String {
+    let output = hotpath(args, current_dir);
+
+    assert!(
+        !output.status.success(),
+        "hotpath unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+
+    String::from_utf8(output.stderr).expect("stderr should be UTF-8")
+}
+
 fn dependency_fixture(name: &str) -> Fixture {
     let fixture = Fixture::new(name);
     fixture.write(
@@ -171,6 +185,25 @@ fn graph_path_selector_matches_repository_relative_prefix() {
 }
 
 #[test]
+fn graph_path_selector_does_not_match_similar_prefixes() {
+    let fixture = Fixture::new("graph-path-selector-boundary");
+    fixture.write("src/auth/mod.rs", "pub fn auth() {}\n");
+    fixture.write("src/auth/login.rs", "pub fn login() {}\n");
+    fixture.write("src/authz.rs", "pub fn authz() {}\n");
+    fixture.write("src/authentication/mod.rs", "pub fn authentication() {}\n");
+
+    let stdout = successful_stdout(&["graph", "--module", "src/auth"], &fixture.path);
+
+    assert!(stdout.contains("selector       src/auth"));
+    assert!(stdout.contains("matched files  2"));
+    assert!(stdout.contains("\n  src/auth/login.rs"));
+    assert!(stdout.contains("\n  src/auth/mod.rs"));
+    assert!(!stdout.contains("src/authz.rs"));
+    assert!(!stdout.contains("src/authentication/mod.rs"));
+    assert_no_path_leaks_in_text(&stdout, &fixture.path);
+}
+
+#[test]
 fn graph_no_match_succeeds_with_empty_sections() {
     let fixture = dependency_fixture("graph-no-match");
 
@@ -184,4 +217,61 @@ fn graph_no_match_succeeds_with_empty_sections() {
     assert!(stdout.contains("\noutgoing\n  none"));
     assert!(stdout.contains("\nincoming\n  none"));
     assert_no_path_leaks_in_text(&stdout, &fixture.path);
+}
+
+#[test]
+fn graph_json_leaves_unresolved_imports_unpersisted() {
+    let fixture = Fixture::new("graph-unresolved-imports");
+    fixture.write(
+        "src/lib.rs",
+        concat!(
+            "mod child;\n",
+            "use crate::auth::User;\n",
+            "use crate::{fmt, io};\n",
+            "use std::fmt;\n"
+        ),
+    );
+    fixture.write("src/child.rs", "pub fn child() {}\n");
+    fixture.write("src/child/mod.rs", "pub fn child_mod() {}\n");
+    fixture.write("src/auth.rs", "pub struct User;\n");
+    fixture.write("src/auth/mod.rs", "pub struct User;\n");
+    fixture.write(
+        "web/app.ts",
+        concat!(
+            "import { value } from \"./value\";\n",
+            "import { outside } from \"../outside\";\n",
+            "import React from \"react\";\n"
+        ),
+    );
+    fixture.write("web/value.ts", "export const value = 1;\n");
+    fixture.write("web/value.tsx", "export const value = 1;\n");
+    fixture.write("README.md", "# Unsupported\n");
+
+    let parse_stdout = successful_stdout(&["parse", "--json"], &fixture.path);
+    let parse_value: Value = serde_json::from_str(&parse_stdout).expect("parse JSON should parse");
+    assert_eq!(parse_value["summary"]["import_count"], 7);
+
+    let stdout = successful_stdout(&["graph", "--module", "src", "--json"], &fixture.path);
+    let value: Value = serde_json::from_str(&stdout).expect("graph JSON should parse");
+
+    assert_eq!(value["summary"]["outgoing_edge_count"], 0);
+    assert_eq!(value["summary"]["incoming_edge_count"], 0);
+    assert_eq!(value["outgoing"], serde_json::json!([]));
+    assert_eq!(value["incoming"], serde_json::json!([]));
+
+    let store = IndexStore::open(&fixture.path).expect("index should open");
+    assert_eq!(
+        store.dependency_count().expect("dependencies should count"),
+        0
+    );
+}
+
+#[test]
+fn graph_requires_module_before_creating_index() {
+    let fixture = Fixture::new("graph-missing-module");
+
+    let stderr = failed_stderr(&["graph"], &fixture.path);
+
+    assert!(stderr.contains("--module"));
+    assert!(!fixture.path.join(".hotpath").exists());
 }
