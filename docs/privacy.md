@@ -6,8 +6,8 @@ contents.
 
 Hotpath is at the beginning of development. This document defines the privacy
 posture the project is being built toward and describes the local data written
-by the current early scanner, parser, Git metric, hotspot scoring, and index
-implementation.
+by the current early scanner, parser, complexity, dependency graph, Git metric,
+hotspot scoring, and index implementation.
 
 ## Default Posture
 
@@ -48,20 +48,24 @@ Current scan and analysis commands write derived local index data at:
 
 The index stores scanner file facts, scan run metadata, scan warnings,
 per-file warnings, parser-backed symbol rows, Git analysis metadata, per-file
-Git metrics, co-change pairs, and hotspot score rows. It uses
-repository-relative paths and does not store full source-file contents. Current
-parse commands populate parser symbols, but raw imports are not persisted as
-resolved dependency edges.
+Git metrics, co-change pairs, conservative resolved dependency edges, and
+hotspot score rows. It uses repository-relative paths and does not store full
+source-file contents. Current parse, complexity, and graph flows can populate
+dependency edges only when parser-observed relationships resolve safely to local
+repository files.
 
 The index is documented as derived local cache data in [Local index](index.md).
 It may contain sensitive repository-derived information, but creating, reading,
 validating, deleting, or rebuilding it does not require network access,
 telemetry, cloud APIs, hosted services, or a daemon.
 
-Future implementations may write additional local data such as user-requested
-report files or cache files needed to make repeated scans faster. Local writes
-should be documented, deterministic where practical, and avoid including
-host-specific absolute paths in portable output unless the user asks for them.
+Complexity and graph reports can include derived summaries such as symbol
+length, function length, control-flow complexity approximations, dependency
+edge counts, and per-file fan-in/fan-out. Future implementations may write
+additional local data such as user-requested report files or cache files needed
+to make repeated scans faster. Local writes should be documented, deterministic
+where practical, and avoid including host-specific absolute paths in portable
+output unless the user asks for them.
 
 ## Network And Cloud Boundaries
 

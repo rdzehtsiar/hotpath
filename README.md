@@ -34,12 +34,15 @@ into explainable hotspot reports that help engineers decide where to investigate
 Hotpath is at the beginning of development.
 
 The repository currently contains an early Rust CLI with `hotpath scan`,
-`hotpath parse`, `hotpath doctor`, `hotpath explain-git`, `hotpath hotspots`,
-and `hotpath explain`. The scanner reports local file facts and warnings, scan
-commands persist a derived local SQLite index at `.hotpath/index.db`, Git
-analysis explains local history for requested paths, hotspot commands rank and
-explain current files with the documented `hotpath.score.v1` formula, and parse
-commands print an early parser report for supported source files.
+`hotpath parse`, `hotpath complexity`, `hotpath graph`, `hotpath doctor`,
+`hotpath explain-git`, `hotpath hotspots`, and `hotpath explain`. The scanner
+reports local file facts and warnings, scan and analysis commands persist
+derived local SQLite index data at `.hotpath/index.db`, Git analysis explains
+local history for requested paths, hotspot commands rank and explain current
+files with the documented `hotpath.score.v1` formula, parse commands print an
+early parser report for supported source files, complexity commands summarize
+parser-derived symbol complexity and fan metrics, and graph commands expose
+conservative resolved local dependency edges for a selected module scope.
 
 Parser support is currently limited to Rust, Go, TypeScript, and TSX. There is
 no Python parser support yet. `hotpath parse` prints a summary, while
@@ -47,11 +50,14 @@ no Python parser support yet. `hotpath parse` prints a summary, while
 `hotpath.parse.v1`. Parser output includes modules, packages, namespaces,
 imports, functions, methods, classes and types, symbol ranges, parent/nesting
 metadata, and basic parser-derived function/method complexity approximations.
+`hotpath complexity --json` currently uses schema identifier
+`hotpath.complexity.v1`, and `hotpath graph --module <selector> --json`
+currently uses schema identifier `hotpath.graph.v1`.
 
 There is no released binary, stable CLI contract, stable index format,
 supported report format, stable Git analysis compatibility promise, broad
-parser/language support, dependency analysis, CI output, architecture rules, or
-terminal UI yet.
+parser/language support, complete dependency analysis, CI output, architecture
+rules, or terminal UI yet.
 
 Expect the crate layout, commands, data model, scoring formulas, output formats, and documentation to change as the product contract and first implementation milestones are built.
 
@@ -61,6 +67,7 @@ The public contract for Hotpath is documented in:
 
 - [Product contract](docs/product-contract.md)
 - [Privacy](docs/privacy.md)
+- [Metrics](docs/metrics.md)
 - [Scoring principles](docs/scoring.md)
 - [Git metric semantics](docs/git-metrics.md)
 - [Local index](docs/index.md)
@@ -133,9 +140,10 @@ Hotpath is designed as a local tool. The core workflow should not require networ
 Current scans and analysis commands write derived local cache data under
 `.hotpath/`, including `.hotpath/index.db`. The index stores scanner file
 facts, scan run metadata, scan/file warnings, parser-backed symbol rows, Git
-metrics, co-change rows, and hotspot score rows using repository-relative
-paths. It does not require a daemon or network access, and it can be deleted
-and rebuilt from local repository data. See [Local index](docs/index.md).
+metrics, co-change rows, conservative resolved dependency edges, and hotspot
+score rows using repository-relative paths. It does not require a daemon or
+network access, and it can be deleted and rebuilt from local repository data.
+See [Local index](docs/index.md).
 
 ## License
 

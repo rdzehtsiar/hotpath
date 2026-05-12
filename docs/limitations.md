@@ -1,9 +1,10 @@
 # Limitations
 
 Hotpath is at the beginning of development. The repository currently contains
-an early Rust CLI with scanner, index health, Git metric, hotspot ranking, and
-hotspot explanation commands. There is no released binary, stable CLI contract,
-supported report format, or compatibility promise yet.
+an early Rust CLI with scanner, parser, complexity, dependency graph, index
+health, Git metric, hotspot ranking, and hotspot explanation commands. There is
+no released binary, stable CLI contract, supported report format, or
+compatibility promise yet.
 
 This page documents the limits Hotpath should make explicit as it develops.
 
@@ -11,13 +12,15 @@ This page documents the limits Hotpath should make explicit as it develops.
 
 Hotpath currently provides early repository scanning, scan persistence to a
 local index, `hotpath doctor` index health checks, parser-backed symbol
-extraction with `hotpath parse`, local Git history explanation with `hotpath
-explain-git`, hotspot ranking with `hotpath hotspots`, and per-file hotspot
-explanation with `hotpath explain`. These are not stable interfaces.
+extraction with `hotpath parse`, parser-derived complexity summaries with
+`hotpath complexity`, conservative dependency graph output with `hotpath graph
+--module <selector>`, local Git history explanation with `hotpath explain-git`,
+hotspot ranking with `hotpath hotspots`, and per-file hotspot explanation with
+`hotpath explain`. These are not stable interfaces.
 
 Hotpath does not currently provide stable Git analysis or scoring compatibility,
-broad parser/language support, dependency analysis, CI output, architecture
-rules, or a terminal UI.
+broad parser/language support, complete dependency analysis, CI output,
+architecture rules, or a terminal UI.
 
 Future commands, crate layout, data models, scoring formulas, and output formats
 may change while the product contract and first implementation milestones are
@@ -100,18 +103,33 @@ TypeScript, and TSX. Python and other languages are skipped as unsupported.
 
 Parser output can include modules, packages, namespaces, imports, functions,
 methods, classes and types, symbol ranges, parent/nesting metadata, and basic
-function/method complexity approximations. The complexity values are derived
-from parsed control-flow nodes and should be treated as rough local signals,
-not full language-semantic complexity measurements.
+function/method complexity approximations. `hotpath complexity` summarizes
+parser-derived symbol length, function length for functions and methods, large
+symbols at the current `>= 80` line threshold, maximum cyclomatic complexity,
+maximum control-flow nesting, dependency edge counts, maximum fan-in/out, and
+per-file fan-in/fan-out. These values are derived from parsed syntax and
+resolved local edges, so they should be treated as rough local signals, not full
+language-semantic complexity measurements.
 
 Files with syntax errors can still yield partial extraction when the parser
 recovers enough of the tree. In those cases Hotpath reports a warning and the
 extracted symbols, imports, or complexity values may be incomplete.
 
-Raw imports reported by `hotpath parse --json` are not resolved dependency
-edges. Coupling/dependency resolution does not yet use parser output, and
-hotspot scoring does not yet consume parser symbols or parser-derived
-complexity.
+Dependency resolution is conservative and intentionally incomplete. Hotpath
+currently persists resolved local dependency edges during parse, complexity, and
+graph flows only when parser-observed relationships can be safely mapped to
+indexed files. Rust `mod` declarations and Rust `crate::`/`self::` use paths
+are resolved only where safe. TypeScript and TSX relative imports are resolved
+only where safe. Go dependency edges are disabled/unresolved for now. External,
+grouped, glob, ambiguous, and unresolved imports are not stored as dependency
+edges.
+
+Raw imports reported by `hotpath parse --json` should not be read as complete
+dependency graph output. `hotpath graph --module <selector>` exposes current
+resolved local edges with schema identifier `hotpath.graph.v1`, but this is not
+a complete package graph, build graph, runtime graph, or architecture model.
+Hotspot scoring does not yet consume parser symbols, parser-derived complexity,
+or resolved dependency fan metrics.
 
 ## Hotspot Score Limits
 
@@ -126,8 +144,9 @@ Known hotspot score limitations include:
   `HEAD`; they do not query hosted Git providers or cloud APIs
 - parser output, including parser-backed symbols and basic complexity
   approximations, is not a formula input
-- symbol coupling, dependency analysis, test coverage, runtime incidents,
-  ownership policy, and architecture rules are not formula inputs
+- symbol coupling, resolved dependency edges, parser fan-in/fan-out, test
+  coverage, runtime incidents, ownership policy, and architecture rules are not
+  formula inputs
 - generated and vendor classifications are visible scanner facts but are not
   weighted terms in `hotpath.score.v1`
 - missing source facts are not guessed; missing normalized inputs contribute
@@ -151,8 +170,10 @@ testing, incident analysis, architecture discussion, or maintainer judgment.
 Hotpath should avoid implying broad language coverage before the core analysis
 is credible. Current parser support is limited to Rust, Go, TypeScript, and
 TSX; Python is not supported. Language-aware parsing, symbol extraction,
-complexity metrics, and coupling analysis may vary by language and project
-structure.
+complexity metrics, dependency edge resolution, and coupling analysis vary by
+language and project structure. Current dependency edges are especially limited:
+Rust and TypeScript/TSX have conservative local resolution paths, while Go
+dependency edges are disabled/unresolved for now.
 
 Repositories with unusual encodings, large generated trees, vendored source,
 submodules, symlinks, rewritten history, or nonstandard build layouts may

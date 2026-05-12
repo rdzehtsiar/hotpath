@@ -237,8 +237,9 @@ limitations include:
 - Although `hotpath parse` can extract parser-backed symbols and basic
   function/method complexity approximations for Rust, Go, TypeScript, and TSX,
   `hotpath.score.v1` does not consume parser data.
-- The formula does not include symbol coupling, dependency analysis, test
-  coverage, runtime incidents, ownership policy, or architectural rule checks.
+- The formula does not include parser-derived symbol coupling, resolved
+  dependency edges, dependency fan-in/fan-out, test coverage, runtime
+  incidents, ownership policy, or architectural rule checks.
 - Generated and vendor classifications are not part of the v1 weighted formula.
 
 These general limitations are interpretation guidance for v1 scores. The CLI

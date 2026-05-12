@@ -6,8 +6,9 @@ compatibility promise.
 
 The index makes repeated local analysis easier to inspect and extend. It can be
 created and populated by `hotpath scan`, `hotpath parse`, `hotpath
-explain-git`, `hotpath hotspots`, and `hotpath explain` runs. It is not
-user-authored data and should be safe to delete and rebuild.
+complexity`, `hotpath graph`, `hotpath explain-git`, `hotpath hotspots`, and
+`hotpath explain` runs. It is not user-authored data and should be safe to
+delete and rebuild.
 
 ## Location And Scope
 
@@ -31,9 +32,10 @@ identifier `hotpath.index.v2` in metadata. Hotpath rejects indexes with missing,
 unknown, malformed, corrupt, or future schema metadata instead of reading them
 best-effort.
 
-The schema contains tables for current scanner, parser, Git, and hotspot
-persistence, plus sparse extension points for later analysis. The presence of a
-table does not mean the related feature is implemented.
+The schema contains tables for current scanner, parser, dependency, Git, and
+hotspot persistence, plus sparse extension points for later analysis. The
+presence of a table does not mean every possible related feature is
+implemented.
 
 Currently populated by `hotpath scan`:
 
@@ -47,8 +49,8 @@ Currently populated by `hotpath scan`:
   flag, and classification
 - per-file warnings, including warning code and message
 
-Currently populated by `hotpath parse` and `hotpath parse --json` after a
-successful scanner pass:
+Currently populated by `hotpath parse`, `hotpath parse --json`, `hotpath
+complexity`, and `hotpath graph` after a successful scanner/parser pass:
 
 - current scanner rows, using the same scan persistence behavior as `hotpath
   scan`
@@ -62,8 +64,31 @@ successful scanner pass:
 `hotpath parse --json` prints parse reports with schema identifier
 `hotpath.parse.v1`. The command output includes raw import records, symbol
 ranges, parent/nesting metadata, and basic function/method complexity
-approximations. The index currently persists parser symbols only; it does not
-persist raw imports or parser-derived complexity metrics.
+approximations. For parser-derived data, the index currently persists symbol
+rows and conservative resolved dependency edges; it does not persist raw imports
+or parser-derived complexity metrics as separate metric rows.
+
+Currently populated in `dependencies` by `hotpath parse`, `hotpath
+complexity`, and `hotpath graph` when parser-observed relationships can be
+resolved conservatively:
+
+- resolved local dependency edges between indexed repository files
+- repository-relative source and target file identities
+- enough edge metadata for current dependency graph and fan-in/fan-out reports
+
+Current dependency persistence is deliberately conservative. Rust `mod`
+declarations and Rust `crate::`/`self::` use paths are stored only when Hotpath
+can safely resolve them to local files. TypeScript and TSX relative imports are
+stored only when they can be safely resolved to local files. Go dependency
+edges, external package imports, grouped imports, glob imports, ambiguous
+imports, and unresolved imports are not stored as resolved dependency edges.
+
+`hotpath complexity --json` prints complexity reports with schema identifier
+`hotpath.complexity.v1`. `hotpath graph --module <selector> --json` prints
+dependency graph reports with schema identifier `hotpath.graph.v1`. Current
+complexity and graph flows persist resolved dependency edges and derive
+dependency edge counts, per-file fan-in/fan-out, and maximum fan-in/fan-out from
+the same fresh parser report used for that command run.
 
 Currently populated by `hotpath explain-git`, `hotpath hotspots`, and `hotpath
 explain` after successful local history analysis:
@@ -97,15 +122,10 @@ documented in [Scoring](scoring.md), including fixed-weight missing-input
 behavior, conservative Git metric inputs, parser data not being used by
 hotspot scoring, and advisory-only interpretation.
 
-Reserved as a schema extension point but not populated by current commands:
-
-- `dependencies` for future coupling or dependency analysis
-
-Current parse commands populate `symbols`, but they do not populate
-`dependencies`. Raw imports reported by `hotpath parse --json` are unresolved
-import targets, not normalized dependency edges. Documentation and reports
-should not imply resolved coupling or dependency analysis is available until
-implementation and tests exist.
+Current dependency rows are derived cache data, not source-of-truth build
+metadata. Documentation and reports should continue to describe the resolver
+scope and should not imply complete dependency, package, build-system, or
+runtime coupling analysis.
 
 ## Path Storage
 
@@ -132,7 +152,7 @@ consistently, or the write fails without publishing a partial scan.
 When a scan is successfully persisted, the current scan's file set replaces the
 previous active file set for the repository. File rows from older scans that
 were not observed in the current scan are deleted. Dependent rows for those
-stale files, such as file warnings and reserved future metrics tied by foreign
+stale files, such as file warnings and derived metric rows tied by foreign
 keys, are removed or detached according to the schema.
 
 Removed files should not continue to appear in index-backed reads merely
@@ -207,10 +227,10 @@ daemon for the index.
 The index may contain sensitive repository-derived information, including file
 paths, byte sizes, language guesses, line counts, generated/vendor
 classification, symlink classification, scan warnings, file warning messages,
-parser symbol names, parser symbol ranges, concise symbol signatures, Git
-metric rows, co-change pairs, and hotspot score explanations. Current commands
-do not store full source-file contents or resolved dependency edges in the
-index.
+parser symbol names, parser symbol ranges, concise symbol signatures,
+conservative resolved dependency edges, Git metric rows, co-change pairs, and
+hotspot score explanations. Current commands do not store full source-file
+contents in the index.
 
 Users should treat `.hotpath/index.db` like any other local cache derived from a
 private repository and handle it according to their own security and retention
