@@ -383,19 +383,7 @@ fn looks_like_windows_absolute_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{test_support, ContentKind};
-
-    fn file(path: &str, language: &'static str) -> ParseFileRecord {
-        ParseFileRecord {
-            path: path.to_owned(),
-            language: Some(language),
-            content: ContentKind::Text,
-            status: ParseFileStatus::Parsed,
-            reason: None,
-            symbol_count: 0,
-            import_count: 0,
-        }
-    }
+    use crate::test_support::{self, parsed_text_file as file};
 
     fn report(files: Vec<ParseFileRecord>, imports: Vec<ParseImportRecord>) -> ParseReport {
         ParseReport {

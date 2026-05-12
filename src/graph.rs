@@ -239,19 +239,7 @@ fn sort_edges(edges: &mut [ResolvedDependencyEdge]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ContentKind, ParseFileRecord, ParseFileStatus, ParseImportRecord};
-
-    fn file(path: &str, language: &'static str) -> ParseFileRecord {
-        ParseFileRecord {
-            path: path.to_owned(),
-            language: Some(language),
-            content: ContentKind::Text,
-            status: ParseFileStatus::Parsed,
-            reason: None,
-            symbol_count: 0,
-            import_count: 0,
-        }
-    }
+    use crate::{test_support::parsed_text_file as file, ParseFileRecord, ParseImportRecord};
 
     fn import(path: &str, target: &str, kind: &str) -> ParseImportRecord {
         ParseImportRecord {
