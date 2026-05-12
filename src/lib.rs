@@ -18,6 +18,7 @@ pub mod diff;
 pub mod git;
 pub mod graph;
 pub mod parse;
+pub mod report;
 pub mod scoring;
 pub mod storage;
 #[cfg(test)]
@@ -40,6 +41,11 @@ pub use graph::{GraphReport, GraphSummary, GRAPH_SCHEMA_VERSION};
 pub use parse::{
     ParseFileReason, ParseFileRecord, ParseFileStatus, ParseImportRecord, ParseReport,
     ParseSummary, ParseSymbolRecord, ParseWarning,
+};
+pub use report::{
+    build_current_dir_report_and_persist, report_json, Report, ReportCommandError, ReportContext,
+    ReportFinding, ReportFindingLevel, ReportGitSummary, ReportHotspot, ReportSummary,
+    REPORT_SCHEMA_VERSION,
 };
 
 #[cfg(test)]
@@ -1109,7 +1115,7 @@ fn touched_hotspots(
         .collect()
 }
 
-fn ranked_hotspot_scores_from_scan_and_git(
+pub(crate) fn ranked_hotspot_scores_from_scan_and_git(
     files: &[FileRecord],
     git_metrics: &[git::GitFileMetrics],
     co_changes: &[git::GitCoChange],

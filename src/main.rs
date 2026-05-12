@@ -44,6 +44,9 @@ enum Commands {
     /// Analyze pull request risk from explicit base and head refs.
     Pr(PrArgs),
 
+    /// Build an aggregate repository risk report.
+    Report(ReportArgs),
+
     /// Check the local Hotpath index health.
     Doctor,
 }
@@ -69,6 +72,13 @@ struct PrArgs {
     head: String,
 
     /// Print a machine-readable JSON diff risk report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ReportArgs {
+    /// Print a machine-readable JSON report.
     #[arg(long)]
     json: bool,
 }
@@ -191,6 +201,8 @@ fn main() -> ExitCode {
         Commands::Pr(args) => {
             hotpath::pr_risk(&args.base, &args.head, args.json).map_err(Into::into)
         }
+        Commands::Report(args) if args.json => hotpath::report_json().map_err(Into::into),
+        Commands::Report(_) => Err("report currently requires --json".into()),
         Commands::Doctor => hotpath::doctor().map_err(Into::into),
     };
 
