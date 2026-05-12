@@ -3,9 +3,9 @@
 Hotpath is at the beginning of development. The repository currently contains
 an early Rust CLI with scanner, parser, complexity, dependency graph, index
 health, Git metric, hotspot ranking, hotspot explanation, and context estimate
-commands. There is no released binary, stable CLI contract, supported report
-format, or
-compatibility promise yet.
+commands, plus early committed-tree diff and PR risk reports. There is no
+released binary, stable CLI contract, supported report format, or compatibility
+promise yet.
 
 This page documents the limits Hotpath should make explicit as it develops.
 
@@ -18,7 +18,8 @@ extraction with `hotpath parse`, parser-derived complexity summaries with
 --module <selector>`, local Git history explanation with `hotpath explain-git`,
 hotspot ranking with `hotpath hotspots`, and per-file hotspot explanation with
 `hotpath explain`, and offline AI context cost estimation with `hotpath
-context`. These are not stable interfaces.
+context`, plus `hotpath diff` and `hotpath pr` reports for local committed-tree
+comparisons. These are not stable interfaces.
 
 Hotpath does not currently provide stable Git analysis or scoring compatibility,
 broad parser/language support, complete dependency analysis, CI output,
@@ -179,6 +180,32 @@ Known context estimate limitations include:
 
 `hotpath context` should not make external API calls, run cloud tokenizers,
 collect telemetry, or require network access.
+
+## Diff And PR Risk Limits
+
+The current `hotpath diff` and `hotpath pr` commands analyze committed Git
+trees only. They compare the merge-base tree of the requested base and head refs
+against the requested head tree. The requested head must resolve to the current
+checked-out `HEAD`; uncommitted working tree changes and staged-but-uncommitted
+index changes are not included.
+
+Known diff and PR limitations include:
+
+- the commands require a readable non-bare local Git worktree with complete
+  local history and a commit at `HEAD`
+- shallow repositories are rejected instead of producing partial results
+- `hotpath pr` does not call GitHub, GitLab, hosted pull request APIs, or any
+  network service
+- text and JSON output are early surfaces, with JSON currently identified as
+  `hotpath.diff.v1`
+- context growth uses `ceil(byte_size / 4)` on readable UTF-8 Git blob sides,
+  while binary and invalid UTF-8 sides are skipped
+- architecture violations are reported as `not_evaluated` until architecture
+  rules exist
+- exit status is not a risk gate; generated reports exit `0`, while invalid
+  arguments, unsupported repositories, Git errors, index errors, scan errors,
+  and rendering errors exit `1`
+- there is no fail-on-risk threshold yet
 
 ## False Positives And False Negatives
 

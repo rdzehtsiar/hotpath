@@ -6,7 +6,7 @@ the beginning of development, so the command surface, JSON schemas, formulas,
 and local index layout are not compatibility promises.
 
 This page defines the public metrics currently exposed by scanner, parser,
-complexity, graph, Git, hotspot, and context workflows.
+complexity, graph, Git, hotspot, context, diff, and PR workflows.
 
 ## Scope
 
@@ -25,6 +25,7 @@ Current machine-readable schema identifiers include:
 | Dependency graph report | `hotpath graph --module <selector> --json` | `hotpath.graph.v1` |
 | Hotspot scoring | `hotpath hotspots`, `hotpath explain` | `hotpath.score.v1` |
 | Context estimate | `hotpath context --json` | `hotpath.context.v1` |
+| Diff and PR risk | `hotpath diff <base>...<head> --json`, `hotpath pr --base <base> --head <head> --json` | `hotpath.diff.v1` |
 
 These identifiers describe current output, not a stable released contract.
 
@@ -200,6 +201,33 @@ access, or cloud calls. It is useful for planning approximate context size, not
 for tokenizer-specific billing or exact prompt token counts.
 
 See [Context estimates](context.md) for current semantics.
+
+## Diff And PR Metrics
+
+`hotpath diff` and `hotpath pr` produce early committed-tree risk reports from
+local Git data. They compare the merge-base tree of the requested base and head
+refs against the requested head tree. The range head must be the currently
+checked-out `HEAD`; uncommitted working tree and index changes are outside the
+current scope.
+
+The commands do not require GitHub APIs, hosted pull request metadata, network
+access, cloud APIs, or telemetry. `hotpath pr --base <base> --head <head>` is a
+convenience form over the same local comparison as `hotpath diff
+<base>...<head>`.
+
+Current diff and PR report metrics include:
+
+| Metric | Definition | Formula or derivation | Why it matters | Limitations |
+| --- | --- | --- | --- | --- |
+| changed file count | Number of changed files in the merge-base-to-head tree diff. | Count of supported Git diff deltas after rename detection. | Shows the file breadth of the committed change. | It excludes uncommitted changes and depends on local Git diff behavior. |
+| added/deleted lines | Line counts reported by the Git patch for each changed file. | Git patch line statistics for each changed file in the selected tree diff. | Gives a rough size signal for individual changed files. | Binary changes and some type changes may have no meaningful line statistics. |
+| touched hotspot count | Number of changed current files that also appear in the default top hotspot rows. | Intersection of changed file paths with the current top `DEFAULT_HOTSPOTS_LIMIT` `hotpath.score.v1` hotspot rows. | Highlights changes touching already-ranked local risk signals. | Deleted files are not current files, output filters are not applied, and hotspot scoring is advisory and incomplete. |
+| context token delta | Approximate new context size minus old context size for changed Git blob sides. | `ceil(byte_size / 4)` for each readable UTF-8 blob side, then new-side tokens minus old-side tokens. | Estimates whether the committed change grows or shrinks AI context cost. | Binary and invalid UTF-8 sides are skipped and contribute `0`; this is not tokenizer-specific. |
+| architecture status | Current architecture rule evaluation status for the diff. | Always `not_evaluated` until architecture rules exist. | Reserves an explicit report field for future rule checks. | No architecture violations are evaluated or enforced today. |
+
+The current JSON schema identifier is `hotpath.diff.v1`. See [Diff and PR
+risk](diff-risk.md) for command scope, output fields, exit codes, and current
+index persistence behavior.
 
 ## Determinism And Interpretation
 

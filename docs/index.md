@@ -7,10 +7,13 @@ compatibility promise.
 The index makes repeated local analysis easier to inspect and extend. It can be
 created and populated by `hotpath scan`, `hotpath parse`, `hotpath
 complexity`, `hotpath graph`, `hotpath explain-git`, `hotpath hotspots`, and
-`hotpath explain` runs. `hotpath context` uses current scan facts for context
-estimates. When it persists data, it persists only the current scan facts and
-does not add context-specific rows, tables, or schema. The index is not
-user-authored data and should be safe to delete and rebuild.
+`hotpath explain` runs. `hotpath diff` and `hotpath pr` persist the same scan,
+Git analysis, and hotspot rows used by those workflows; they do not add a
+diff-specific table or persist diff report rows in the current schema.
+`hotpath context` uses current scan facts for context estimates. When it
+persists data, it persists only the current scan facts and does not add
+context-specific rows, tables, or schema. The index is not user-authored data
+and should be safe to delete and rebuild.
 
 ## Location And Scope
 
@@ -44,6 +47,11 @@ repository-relative path, byte size, content kind, generated/vendor flags, and
 file warnings. There is no context-specific table or context-specific index
 schema in the current design, and context estimates do not persist
 token-estimate rows.
+
+Diff and PR reports currently rely on scanner facts, local Git analysis, and
+hotspot score rows. There is no diff-specific table or diff-specific index
+schema in the current design, and diff/PR commands do not persist changed-file
+rows, context deltas, or architecture status rows.
 
 Currently populated by `hotpath scan`:
 
@@ -98,8 +106,9 @@ complexity and graph flows persist resolved dependency edges and derive
 dependency edge counts, per-file fan-in/fan-out, and maximum fan-in/fan-out from
 the same fresh parser report used for that command run.
 
-Currently populated by `hotpath explain-git`, `hotpath hotspots`, and `hotpath
-explain` after successful local history analysis:
+Currently populated by `hotpath explain-git`, `hotpath hotspots`, `hotpath
+explain`, `hotpath diff`, and `hotpath pr` after successful local history
+analysis:
 
 - Git analysis metadata, including analyzer version, `HEAD` commit id, `HEAD`
   committer timestamp, recent churn window, and observed row counts
@@ -116,8 +125,8 @@ timestamp skew. Generated and vendor scanner flags are stored separately from
 Git metrics; index v2 does not imply those paths are excluded from Git-derived
 rows.
 
-Currently populated by `hotpath hotspots` and `hotpath explain` after
-successful hotspot scoring:
+Currently populated by `hotpath hotspots`, `hotpath explain`, `hotpath diff`,
+and `hotpath pr` after successful hotspot scoring:
 
 - hotspot score rows for ranked current files
 - formula version identifiers
