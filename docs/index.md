@@ -5,9 +5,9 @@ is still an early derived cache, not a stable public database format or
 compatibility promise.
 
 The index makes repeated local analysis easier to inspect and extend. It can be
-created and populated by `hotpath scan`, `hotpath explain-git`, `hotpath
-hotspots`, and `hotpath explain` runs. It is not user-authored data and should
-be safe to delete and rebuild.
+created and populated by `hotpath scan`, `hotpath parse`, `hotpath
+explain-git`, `hotpath hotspots`, and `hotpath explain` runs. It is not
+user-authored data and should be safe to delete and rebuild.
 
 ## Location And Scope
 
@@ -31,9 +31,9 @@ identifier `hotpath.index.v2` in metadata. Hotpath rejects indexes with missing,
 unknown, malformed, corrupt, or future schema metadata instead of reading them
 best-effort.
 
-The schema contains tables for current scanner persistence and sparse extension
-points for later analysis. The presence of a table does not mean the related
-feature is implemented.
+The schema contains tables for current scanner, parser, Git, and hotspot
+persistence, plus sparse extension points for later analysis. The presence of a
+table does not mean the related feature is implemented.
 
 Currently populated by `hotpath scan`:
 
@@ -46,6 +46,24 @@ Currently populated by `hotpath scan`:
   language guess, line count, content kind, vendor/generated flags, symlink
   flag, and classification
 - per-file warnings, including warning code and message
+
+Currently populated by `hotpath parse` and `hotpath parse --json` after a
+successful scanner pass:
+
+- current scanner rows, using the same scan persistence behavior as `hotpath
+  scan`
+- parser-backed symbol rows for supported Rust, Go, TypeScript, and TSX files
+- symbol names and kinds for extracted modules, packages, namespaces,
+  functions, methods, classes, and types
+- repository-relative file identity, line ranges, concise signatures, and
+  parent symbol links when a nested parent can be resolved within the same
+  parsed file
+
+`hotpath parse --json` prints parse reports with schema identifier
+`hotpath.parse.v1`. The command output includes raw import records, symbol
+ranges, parent/nesting metadata, and basic function/method complexity
+approximations. The index currently persists parser symbols only; it does not
+persist raw imports or parser-derived complexity metrics.
 
 Currently populated by `hotpath explain-git`, `hotpath hotspots`, and `hotpath
 explain` after successful local history analysis:
@@ -76,16 +94,17 @@ successful hotspot scoring:
 
 These hotspot rows are derived cache data. They inherit the limitations
 documented in [Scoring](scoring.md), including fixed-weight missing-input
-behavior, conservative Git metric inputs, lack of parser-backed complexity, and
-advisory-only interpretation.
+behavior, conservative Git metric inputs, parser data not being used by
+hotspot scoring, and advisory-only interpretation.
 
-Reserved as schema extension points but not populated by current commands:
+Reserved as a schema extension point but not populated by current commands:
 
-- `symbols` for future parser output
 - `dependencies` for future coupling or dependency analysis
 
-Current commands do not populate parser symbols or dependency edges.
-Documentation and reports should not imply those analyses are available until
+Current parse commands populate `symbols`, but they do not populate
+`dependencies`. Raw imports reported by `hotpath parse --json` are unresolved
+import targets, not normalized dependency edges. Documentation and reports
+should not imply resolved coupling or dependency analysis is available until
 implementation and tests exist.
 
 ## Path Storage
@@ -188,8 +207,10 @@ daemon for the index.
 The index may contain sensitive repository-derived information, including file
 paths, byte sizes, language guesses, line counts, generated/vendor
 classification, symlink classification, scan warnings, file warning messages,
-Git metric rows, co-change pairs, and hotspot score explanations. Current
-commands do not store full source-file contents in the index.
+parser symbol names, parser symbol ranges, concise symbol signatures, Git
+metric rows, co-change pairs, and hotspot score explanations. Current commands
+do not store full source-file contents or resolved dependency edges in the
+index.
 
 Users should treat `.hotpath/index.db` like any other local cache derived from a
 private repository and handle it according to their own security and retention

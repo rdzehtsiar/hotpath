@@ -6,7 +6,7 @@ contents.
 
 Hotpath is at the beginning of development. This document defines the privacy
 posture the project is being built toward and describes the local data written
-by the current early scanner, Git metric, hotspot scoring, and index
+by the current early scanner, parser, Git metric, hotspot scoring, and index
 implementation.
 
 ## Default Posture
@@ -47,10 +47,11 @@ Current scan and analysis commands write derived local index data at:
 ```
 
 The index stores scanner file facts, scan run metadata, scan warnings,
-per-file warnings, Git analysis metadata, per-file Git metrics, co-change
-pairs, and hotspot score rows. It uses repository-relative paths and does not
-store full source-file contents. Reserved schema tables for future parser and
-dependency data exist but are not populated by current commands.
+per-file warnings, parser-backed symbol rows, Git analysis metadata, per-file
+Git metrics, co-change pairs, and hotspot score rows. It uses
+repository-relative paths and does not store full source-file contents. Current
+parse commands populate parser symbols, but raw imports are not persisted as
+resolved dependency edges.
 
 The index is documented as derived local cache data in [Local index](index.md).
 It may contain sensitive repository-derived information, but creating, reading,

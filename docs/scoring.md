@@ -234,9 +234,11 @@ limitations include:
   Scanner byte size can still provide a size fallback when line count is absent.
 - `commits_per_file` is preserved as raw context but is not a weighted term in
   `hotpath.score.v1`.
-- The formula does not include parser-backed complexity, symbol coupling,
-  dependency analysis, test coverage, runtime incidents, ownership policy, or
-  architectural rule checks.
+- Although `hotpath parse` can extract parser-backed symbols and basic
+  function/method complexity approximations for Rust, Go, TypeScript, and TSX,
+  `hotpath.score.v1` does not consume parser data.
+- The formula does not include symbol coupling, dependency analysis, test
+  coverage, runtime incidents, ownership policy, or architectural rule checks.
 - Generated and vendor classifications are not part of the v1 weighted formula.
 
 These general limitations are interpretation guidance for v1 scores. The CLI

@@ -10,13 +10,13 @@ This page documents the limits Hotpath should make explicit as it develops.
 ## Current Limitations
 
 Hotpath currently provides early repository scanning, scan persistence to a
-local index, `hotpath doctor` index health checks, local Git history
-explanation with `hotpath explain-git`, hotspot ranking with `hotpath
-hotspots`, and per-file hotspot explanation with `hotpath explain`. These are
-not stable interfaces.
+local index, `hotpath doctor` index health checks, parser-backed symbol
+extraction with `hotpath parse`, local Git history explanation with `hotpath
+explain-git`, hotspot ranking with `hotpath hotspots`, and per-file hotspot
+explanation with `hotpath explain`. These are not stable interfaces.
 
 Hotpath does not currently provide stable Git analysis or scoring compatibility,
-parser-backed symbol analysis, dependency analysis, CI output, architecture
+broad parser/language support, dependency analysis, CI output, architecture
 rules, or a terminal UI.
 
 Future commands, crate layout, data models, scoring formulas, and output formats
@@ -91,6 +91,28 @@ Known Git metric limitations include:
 See [Git metric semantics](git-metrics.md) for the current formulas and
 calculation notes.
 
+## Parser Limits
+
+The current parser command surface is `hotpath parse` for a summary and
+`hotpath parse --json` for a machine-readable report with schema identifier
+`hotpath.parse.v1`. Parser support is currently limited to Rust, Go,
+TypeScript, and TSX. Python and other languages are skipped as unsupported.
+
+Parser output can include modules, packages, namespaces, imports, functions,
+methods, classes and types, symbol ranges, parent/nesting metadata, and basic
+function/method complexity approximations. The complexity values are derived
+from parsed control-flow nodes and should be treated as rough local signals,
+not full language-semantic complexity measurements.
+
+Files with syntax errors can still yield partial extraction when the parser
+recovers enough of the tree. In those cases Hotpath reports a warning and the
+extracted symbols, imports, or complexity values may be incomplete.
+
+Raw imports reported by `hotpath parse --json` are not resolved dependency
+edges. Coupling/dependency resolution does not yet use parser output, and
+hotspot scoring does not yet consume parser symbols or parser-derived
+complexity.
+
 ## Hotspot Score Limits
 
 The current `hotpath hotspots` and `hotpath explain` commands combine scanner
@@ -102,9 +124,10 @@ Known hotspot score limitations include:
 
 - scores use current scanned files plus local Git history reachable from
   `HEAD`; they do not query hosted Git providers or cloud APIs
-- parser-backed complexity, symbol coupling, dependency analysis, test
-  coverage, runtime incidents, ownership policy, and architecture rules are not
-  formula inputs
+- parser output, including parser-backed symbols and basic complexity
+  approximations, is not a formula input
+- symbol coupling, dependency analysis, test coverage, runtime incidents,
+  ownership policy, and architecture rules are not formula inputs
 - generated and vendor classifications are visible scanner facts but are not
   weighted terms in `hotpath.score.v1`
 - missing source facts are not guessed; missing normalized inputs contribute
@@ -126,8 +149,10 @@ testing, incident analysis, architecture discussion, or maintainer judgment.
 ## Language And Repository Coverage
 
 Hotpath should avoid implying broad language coverage before the core analysis
-is credible. Language-aware parsing, symbol extraction, complexity metrics, and
-coupling analysis may vary by language and project structure.
+is credible. Current parser support is limited to Rust, Go, TypeScript, and
+TSX; Python is not supported. Language-aware parsing, symbol extraction,
+complexity metrics, and coupling analysis may vary by language and project
+structure.
 
 Repositories with unusual encodings, large generated trees, vendored source,
 submodules, symlinks, rewritten history, or nonstandard build layouts may
