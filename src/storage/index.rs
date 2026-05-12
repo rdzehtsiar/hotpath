@@ -1446,7 +1446,7 @@ fn ensure_git_path_file(
     index_path: &Path,
     repo_id: i64,
     file_path: &str,
-    file_ids: &mut std::collections::BTreeMap<String, i64>,
+    file_ids: &mut BTreeMap<String, i64>,
 ) -> Result<(), IndexError> {
     if file_ids.contains_key(file_path) {
         return Ok(());
