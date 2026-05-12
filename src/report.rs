@@ -7,6 +7,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
+use serde_json::{json, Value};
 
 use crate::context::{ContextBudgetStatus, ContextGroupRow, ContextSkippedRow, ContextSummary};
 use crate::git;
@@ -17,6 +18,8 @@ use crate::storage;
 use crate::{estimate_context, ContextOptions, ScanError, ScanSummary};
 
 pub const REPORT_SCHEMA_VERSION: &str = "hotpath.report.v1";
+const SARIF_HOTSPOT_RULE_ID: &str = "hotpath.hotspot.risk";
+const SARIF_ADVISORY_HELP_TEXT: &str = "Hotpath hotspot risk is advisory decision-support output based on local scan and Git history metrics. Review the file and contributing metrics before using the result as a gate.";
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Report {
@@ -118,6 +121,12 @@ pub fn report_json() -> Result<String, ReportCommandError> {
     let report = build_current_dir_report_and_persist()?;
 
     serde_json::to_string_pretty(&report).map_err(ReportCommandError::Json)
+}
+
+pub fn report_sarif() -> Result<String, ReportCommandError> {
+    let report = build_current_dir_report_and_persist()?;
+
+    render_sarif(&report)
 }
 
 pub fn report_html(output_dir: &Path) -> Result<String, ReportCommandError> {
@@ -478,6 +487,112 @@ pub fn render_html(report: &Report) -> String {
     output.push_str("</main>\n</body>\n</html>\n");
 
     output
+}
+
+pub fn render_sarif(report: &Report) -> Result<String, ReportCommandError> {
+    serde_json::to_string_pretty(&sarif_value(report)).map_err(ReportCommandError::Json)
+}
+
+fn sarif_value(report: &Report) -> Value {
+    let results = report
+        .hotspots
+        .iter()
+        .map(sarif_result_for_hotspot)
+        .collect::<Vec<_>>();
+
+    json!({
+        "version": "2.1.0",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "Hotpath",
+                        "rules": [
+                            {
+                                "id": SARIF_HOTSPOT_RULE_ID,
+                                "name": "Advisory hotspot risk",
+                                "shortDescription": {
+                                    "text": "Hotpath ranked a current repository file as a hotspot."
+                                },
+                                "fullDescription": {
+                                    "text": "Hotpath ranks current files using local scan, churn, ownership, recent-growth, and co-change metrics."
+                                },
+                                "help": {
+                                    "text": SARIF_ADVISORY_HELP_TEXT
+                                },
+                                "properties": {
+                                    "schemaVersion": report.schema_version
+                                }
+                            }
+                        ]
+                    }
+                },
+                "results": results
+            }
+        ]
+    })
+}
+
+fn sarif_result_for_hotspot(hotspot: &ReportHotspot) -> Value {
+    let risk = risk_scale(hotspot.score);
+
+    json!({
+        "ruleId": SARIF_HOTSPOT_RULE_ID,
+        "ruleIndex": 0,
+        "level": sarif_level(risk),
+        "message": {
+            "text": format!(
+                "Hotpath ranked {} as hotspot #{} with advisory score {:.3} ({:.1}/10) using formula {}. {}",
+                hotspot.path,
+                hotspot.rank,
+                hotspot.score,
+                risk,
+                hotspot.formula_version.id,
+                SARIF_ADVISORY_HELP_TEXT
+            )
+        },
+        "locations": [
+            {
+                "physicalLocation": {
+                    "artifactLocation": {
+                        "uri": sarif_artifact_uri(&hotspot.path)
+                    }
+                }
+            }
+        ],
+        "properties": {
+            "rank": hotspot.rank,
+            "score": hotspot.score,
+            "risk": risk,
+            "formulaVersion": hotspot.formula_version.id,
+            "advisory": SARIF_ADVISORY_HELP_TEXT
+        }
+    })
+}
+
+fn sarif_level(risk: f64) -> &'static str {
+    if risk >= 8.0 {
+        "error"
+    } else if risk >= 5.0 {
+        "warning"
+    } else {
+        "note"
+    }
+}
+
+fn sarif_artifact_uri(path: &str) -> String {
+    let mut uri = String::with_capacity(path.len());
+
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                uri.push(byte as char)
+            }
+            _ => uri.push_str(&format!("%{byte:02X}")),
+        }
+    }
+
+    uri
 }
 
 pub fn build_current_dir_report_and_persist() -> Result<Report, ReportCommandError> {

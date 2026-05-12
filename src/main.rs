@@ -89,15 +89,23 @@ struct PrArgs {
 #[derive(Debug, Args)]
 struct ReportArgs {
     /// Print a machine-readable JSON report.
-    #[arg(long, conflicts_with_all = ["markdown", "html"])]
+    #[arg(long, conflicts_with_all = ["markdown", "html", "sarif"])]
     json: bool,
 
     /// Print a human-readable Markdown report.
-    #[arg(long, conflicts_with_all = ["json", "html"])]
+    #[arg(long, conflicts_with_all = ["json", "html", "sarif"])]
     markdown: bool,
 
+    /// Print a SARIF 2.1.0 report for CI systems.
+    #[arg(long, conflicts_with_all = ["json", "markdown", "html"])]
+    sarif: bool,
+
     /// Write a self-contained static HTML report to the output directory.
-    #[arg(long, value_name = "DIR", conflicts_with_all = ["json", "markdown"])]
+    #[arg(
+        long,
+        value_name = "DIR",
+        conflicts_with_all = ["json", "markdown", "sarif"]
+    )]
     html: Option<std::path::PathBuf>,
 }
 
@@ -228,6 +236,7 @@ fn main() -> ExitCode {
         Commands::Report(args) if args.markdown => {
             hotpath::report::report_markdown().map_err(Into::into)
         }
+        Commands::Report(args) if args.sarif => hotpath::report::report_sarif().map_err(Into::into),
         Commands::Report(args) if args.html.is_some() => {
             let output_dir = args.html.expect("html path should be present");
 

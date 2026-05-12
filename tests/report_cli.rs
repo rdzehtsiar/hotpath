@@ -68,6 +68,13 @@ fn report_json(current_dir: &Path) -> (String, Value) {
     (stdout, value)
 }
 
+fn report_sarif(current_dir: &Path) -> (String, Value) {
+    let stdout = successful_stdout(&["report", "--sarif"], current_dir);
+    let value = serde_json::from_str(&stdout).expect("SARIF report JSON should parse");
+
+    (stdout, value)
+}
+
 fn report_markdown(current_dir: &Path) -> String {
     successful_stdout(&["report", "--markdown"], current_dir)
 }
@@ -282,6 +289,139 @@ fn report_rejects_html_with_other_format_flags() {
     assert!(markdown_stderr.contains("--markdown"));
     assert!(markdown_stderr.contains("--html"));
     assert!(markdown_stderr.contains("cannot be used"));
+}
+
+#[test]
+fn report_sarif_is_deterministic_and_has_expected_shape() {
+    let fixture = sarif_levels_fixture("report-sarif-shape");
+
+    let (first_stdout, value) = report_sarif(fixture.path());
+    let (second_stdout, second_value) = report_sarif(fixture.path());
+
+    assert_eq!(first_stdout, second_stdout);
+    assert_eq!(value, second_value);
+    assert!(first_stdout.starts_with("{\n"));
+    assert!(first_stdout.contains("\"version\": \"2.1.0\""));
+    assert_eq!(value["version"], "2.1.0");
+    assert_eq!(value["runs"].as_array().expect("runs array").len(), 1);
+    assert_eq!(value["runs"][0]["tool"]["driver"]["name"], "Hotpath");
+    assert_eq!(
+        value["runs"][0]["tool"]["driver"]["rules"][0]["id"],
+        "hotpath.hotspot.risk"
+    );
+    assert!(
+        value["runs"][0]["tool"]["driver"]["rules"][0]["help"]["text"]
+            .as_str()
+            .expect("rule help")
+            .contains("advisory decision-support")
+    );
+    assert_eq!(
+        sarif_result_uris(&value),
+        vec!["src/high.rs", "src/medium.rs", "src/low.rs"]
+    );
+    assert_eq!(
+        sarif_result_levels(&value),
+        vec!["error", "warning", "note"]
+    );
+    assert!(first_stdout.contains("hotpath.score.v1"));
+    assert!(first_stdout.contains("advisory decision-support"));
+    assert!(!first_stdout.contains("pub fn"));
+    assert!(!first_stdout.contains("\\src\\"));
+    assert!(!contains_path(&first_stdout, fixture.path()));
+}
+
+#[test]
+fn report_sarif_results_include_expected_properties() {
+    let fixture = sarif_levels_fixture("report-sarif-properties");
+    let (_stdout, value) = report_sarif(fixture.path());
+    let result = &value["runs"][0]["results"][0];
+    let score = result["properties"]["score"]
+        .as_f64()
+        .expect("score property should be numeric");
+    let risk = result["properties"]["risk"]
+        .as_f64()
+        .expect("risk property should be numeric");
+
+    assert_eq!(result["ruleId"], "hotpath.hotspot.risk");
+    assert_eq!(result["ruleIndex"], 0);
+    assert_eq!(result["properties"]["rank"], 1);
+    assert_eq!(result["properties"]["formulaVersion"], "hotpath.score.v1");
+    assert_eq!(risk, score * 10.0);
+    assert!(result["message"]["text"]
+        .as_str()
+        .expect("message text")
+        .contains("hotspot #1"));
+    assert!(result["message"]["text"]
+        .as_str()
+        .expect("message text")
+        .contains("/10"));
+    assert!(result["message"]["text"]
+        .as_str()
+        .expect("message text")
+        .contains("hotpath.score.v1"));
+    assert!(result["properties"]["advisory"]
+        .as_str()
+        .expect("advisory property")
+        .contains("Review the file and contributing metrics"));
+}
+
+#[test]
+fn report_sarif_uses_portable_artifact_uris() {
+    let fixture = GitFixture::new("report-sarif-uri");
+    let author = GitIdentity::new("URI Author", "uri@example.invalid");
+
+    fixture.write("src/weird path`name.rs", "pub fn uri_path() {}\n");
+    fixture.commit(CommitOptions::new(
+        "Add path needing URI escaping",
+        author,
+        "2024-01-01T00:00:00 +0000",
+    ));
+
+    let (stdout, value) = report_sarif(fixture.path());
+
+    assert_eq!(
+        sarif_result_uris(&value),
+        vec!["src/weird%20path%60name.rs"]
+    );
+    assert!(!stdout.contains("src/weird path`name.rs\""));
+    assert!(!contains_path(&stdout, fixture.path()));
+}
+
+#[test]
+fn report_sarif_rejects_non_git_directory_without_output_or_path_leak() {
+    let fixture = TempDir::new("report-sarif-non-git");
+    fixture.write("src/lib.rs", "pub fn lib() {}\n");
+
+    let stderr = failed_stderr(&["report", "--sarif"], fixture.path());
+
+    assert!(stderr.starts_with("hotpath: path is not a readable Git worktree"));
+    assert!(stderr.contains("run report from inside a repository"));
+    assert!(!contains_path(&stderr, fixture.path()));
+    assert!(!fixture.path().join(".hotpath").exists());
+}
+
+#[test]
+fn report_rejects_sarif_with_other_format_flags() {
+    let fixture = ranked_fixture("report-sarif-conflict");
+    let output_dir = fixture.path().join("html");
+    let output_arg = output_dir.to_string_lossy().into_owned();
+
+    let json_stderr = failed_stderr(&["report", "--sarif", "--json"], fixture.path());
+    let markdown_stderr = failed_stderr(&["report", "--sarif", "--markdown"], fixture.path());
+    let html_stderr = failed_stderr(
+        &["report", "--sarif", "--html", &output_arg],
+        fixture.path(),
+    );
+
+    assert!(json_stderr.contains("--sarif"));
+    assert!(json_stderr.contains("--json"));
+    assert!(json_stderr.contains("cannot be used"));
+    assert!(markdown_stderr.contains("--sarif"));
+    assert!(markdown_stderr.contains("--markdown"));
+    assert!(markdown_stderr.contains("cannot be used"));
+    assert!(html_stderr.contains("--sarif"));
+    assert!(html_stderr.contains("--html"));
+    assert!(html_stderr.contains("cannot be used"));
 }
 
 #[test]
@@ -604,6 +744,48 @@ fn empty_current_file_set_fixture(name: &str) -> GitFixture {
     fixture
 }
 
+fn sarif_levels_fixture(name: &str) -> GitFixture {
+    let fixture = GitFixture::new(name);
+    let authors = [
+        GitIdentity::new("Ada Levels", "ada-levels@example.invalid"),
+        GitIdentity::new("Ben Levels", "ben-levels@example.invalid"),
+        GitIdentity::new("Cara Levels", "cara-levels@example.invalid"),
+        GitIdentity::new("Dee Levels", "dee-levels@example.invalid"),
+        GitIdentity::new("Eli Levels", "eli-levels@example.invalid"),
+        GitIdentity::new("Flo Levels", "flo-levels@example.invalid"),
+    ];
+
+    fixture.write("src/high.rs", &numbered_lines("high_0", 1_000));
+    fixture.write("src/medium.rs", &numbered_lines("medium", 1_000));
+    fixture.write("src/low.rs", "pub fn low() {}\n");
+    fixture.commit(CommitOptions::new(
+        "Add SARIF level files",
+        authors[0].clone(),
+        "2024-01-01T00:00:00 +0000",
+    ));
+
+    fixture.write("src/medium.rs", &numbered_lines("medium_rewrite", 1_000));
+    fixture.commit(CommitOptions::new(
+        "Rewrite medium risk file",
+        authors[0].clone(),
+        "2024-01-15T00:00:00 +0000",
+    ));
+
+    for (index, author) in authors.iter().enumerate().skip(1) {
+        fixture.write(
+            "src/high.rs",
+            &numbered_lines(&format!("high_{index}"), 1_000),
+        );
+        fixture.commit(CommitOptions::new(
+            &format!("Rewrite high risk file {index}"),
+            author.clone(),
+            &format!("2024-0{}-01T00:00:00 +0000", index + 1),
+        ));
+    }
+
+    fixture
+}
+
 fn numbered_lines(prefix: &str, count: usize) -> String {
     (0..count)
         .map(|index| format!("pub fn {prefix}_{index}() {{}}\n"))
@@ -616,6 +798,30 @@ fn hotspot_paths(value: &Value) -> Vec<&str> {
         .expect("hotspots should be an array")
         .iter()
         .map(|hotspot| hotspot["path"].as_str().expect("path should be a string"))
+        .collect()
+}
+
+fn sarif_results(value: &Value) -> &[Value] {
+    value["runs"][0]["results"]
+        .as_array()
+        .expect("SARIF results should be an array")
+}
+
+fn sarif_result_uris(value: &Value) -> Vec<&str> {
+    sarif_results(value)
+        .iter()
+        .map(|result| {
+            result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+                .as_str()
+                .expect("artifact URI should be a string")
+        })
+        .collect()
+}
+
+fn sarif_result_levels(value: &Value) -> Vec<&str> {
+    sarif_results(value)
+        .iter()
+        .map(|result| result["level"].as_str().expect("level should be a string"))
         .collect()
 }
 
