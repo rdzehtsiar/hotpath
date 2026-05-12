@@ -52,6 +52,9 @@ enum Commands {
 
     /// Check the local Hotpath index health.
     Doctor,
+
+    /// Open the terminal user interface.
+    Tui,
 }
 
 #[derive(Debug, Args)]
@@ -196,6 +199,7 @@ fn main() -> ExitCode {
 
     let command = match cli.command {
         Commands::Ci(args) => return run_ci(args),
+        Commands::Tui => return run_tui(),
         command => command,
     };
 
@@ -244,6 +248,7 @@ fn main() -> ExitCode {
         }
         Commands::Report(_) => hotpath::report::report_markdown().map_err(Into::into),
         Commands::Ci(_) => unreachable!("CI command is handled before generic command dispatch"),
+        Commands::Tui => unreachable!("TUI command is handled before generic command dispatch"),
         Commands::Doctor => hotpath::doctor().map_err(Into::into),
     };
 
@@ -252,6 +257,16 @@ fn main() -> ExitCode {
             println!("{output}");
             ExitCode::SUCCESS
         }
+        Err(error) => {
+            eprintln!("hotpath: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_tui() -> ExitCode {
+    match hotpath::run_tui() {
+        Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("hotpath: {error}");
             ExitCode::FAILURE

@@ -23,6 +23,7 @@ pub mod scoring;
 pub mod storage;
 #[cfg(test)]
 mod test_support;
+pub mod tui;
 
 pub use complexity::{
     ComplexityFileRecord, ComplexityReport, ComplexitySummary, ComplexitySymbolRecord,
@@ -47,6 +48,7 @@ pub use report::{
     ReportFinding, ReportFindingLevel, ReportGitSummary, ReportHotspot, ReportSummary,
     REPORT_SCHEMA_VERSION,
 };
+pub use tui::run_tui;
 
 #[cfg(test)]
 const BINARY_SAMPLE_BYTES: usize = 8 * 1024;
