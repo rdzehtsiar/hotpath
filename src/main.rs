@@ -79,8 +79,12 @@ struct PrArgs {
 #[derive(Debug, Args)]
 struct ReportArgs {
     /// Print a machine-readable JSON report.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "markdown")]
     json: bool,
+
+    /// Print a human-readable Markdown report.
+    #[arg(long, conflicts_with = "json")]
+    markdown: bool,
 }
 
 #[derive(Debug, Args)]
@@ -202,7 +206,10 @@ fn main() -> ExitCode {
             hotpath::pr_risk(&args.base, &args.head, args.json).map_err(Into::into)
         }
         Commands::Report(args) if args.json => hotpath::report_json().map_err(Into::into),
-        Commands::Report(_) => Err("report currently requires --json".into()),
+        Commands::Report(args) if args.markdown => {
+            hotpath::report::report_markdown().map_err(Into::into)
+        }
+        Commands::Report(_) => hotpath::report::report_markdown().map_err(Into::into),
         Commands::Doctor => hotpath::doctor().map_err(Into::into),
     };
 

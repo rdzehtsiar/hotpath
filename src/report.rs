@@ -89,10 +89,150 @@ pub enum ReportCommandError {
     Json(serde_json::Error),
 }
 
+pub fn report_markdown() -> Result<String, ReportCommandError> {
+    let report = build_current_dir_report_and_persist()?;
+
+    Ok(render_markdown(&report))
+}
+
 pub fn report_json() -> Result<String, ReportCommandError> {
     let report = build_current_dir_report_and_persist()?;
 
     serde_json::to_string_pretty(&report).map_err(ReportCommandError::Json)
+}
+
+pub fn render_markdown(report: &Report) -> String {
+    let mut output = String::new();
+
+    output.push_str("# Hotpath Report\n\n");
+    output.push_str("## Summary\n\n");
+    output.push_str(&format!(
+        "- Files scanned: {}\n",
+        report.summary.scan.total_files
+    ));
+    output.push_str(&format!(
+        "- Text files: {}, binary files: {}, unknown files: {}\n",
+        report.summary.scan.content.text_files,
+        report.summary.scan.content.binary_files,
+        report.summary.scan.content.unknown_files
+    ));
+    output.push_str(&format!(
+        "- Generated files: {}, vendor files: {}\n",
+        report.summary.scan.flags.generated_files, report.summary.scan.flags.vendor_files
+    ));
+    output.push_str(&format!(
+        "- Scan warnings: {}\n",
+        report.summary.scan.warnings.total_warnings
+    ));
+    output.push_str(&format!(
+        "- Hotspots ranked: {}\n",
+        report.summary.hotspot_count
+    ));
+    output.push_str(&format!(
+        "- Context estimate: {} tokens across {} included files\n",
+        report.summary.context_estimated_tokens, report.context.summary.included_files
+    ));
+    output.push_str(&format!(
+        "- Git HEAD: `{}`; metrics for {} files; {} co-change pairs; recent window {} days\n\n",
+        report.summary.git.head_commit_id,
+        report.summary.git.file_metric_count,
+        report.summary.git.co_change_count,
+        report.summary.git.recent_window_days
+    ));
+
+    output.push_str("## Top Hotspots\n\n");
+    if report.hotspots.is_empty() {
+        output.push_str("No current files were ranked as hotspots.\n\n");
+    } else {
+        output.push_str("| Rank | Path | Score | Risk /10 | Commits | Churn lines | Recent churn | Authors | Co-changed files |\n");
+        output.push_str("| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+        for hotspot in report.hotspots.iter().take(10) {
+            output.push_str(&format!(
+                "| {} | {} | {:.3} | {:.1} | {} | {} | {} | {} | {} |\n",
+                hotspot.rank,
+                markdown_code_span(&hotspot.path),
+                hotspot.score,
+                risk_scale(hotspot.score),
+                optional_u64(hotspot.raw_metrics.commits_per_file),
+                optional_u64(hotspot.raw_metrics.total_churn_lines),
+                optional_u64(hotspot.raw_metrics.recent_churn_lines),
+                optional_u64(hotspot.raw_metrics.author_count),
+                optional_u64(hotspot.raw_metrics.co_changed_file_count)
+            ));
+        }
+        if report.hotspots.len() > 10 {
+            output.push_str(&format!(
+                "\nShowing top 10 of {} ranked hotspots. JSON output includes all hotspot rows.\n\n",
+                report.hotspots.len()
+            ));
+        } else {
+            output.push('\n');
+        }
+    }
+
+    output.push_str("## Context Estimate\n\n");
+    output.push_str(&format!(
+        "- Estimated tokens: {}\n",
+        report.context.summary.estimated_tokens
+    ));
+    output.push_str(&format!(
+        "- Included files: {}; skipped files: {}; included bytes: {}\n",
+        report.context.summary.included_files,
+        report.context.summary.skipped_files,
+        report.context.summary.included_bytes
+    ));
+    if report.context.groups.is_empty() {
+        output.push_str("- Largest groups: none\n\n");
+    } else {
+        output.push_str("- Largest groups:");
+        for group in report.context.groups.iter().take(5) {
+            output.push_str(&format!(
+                " {} ({} tokens, {} files);",
+                markdown_code_span(&group.path),
+                group.estimated_tokens,
+                group.file_count
+            ));
+        }
+        output.push_str("\n\n");
+    }
+
+    output.push_str("## Findings\n\n");
+    if report.findings.is_empty() {
+        output.push_str("No advisory findings were produced.\n\n");
+    } else {
+        for finding in report.findings.iter().take(10) {
+            output.push_str(&format!(
+                "- `{}`: {}\n",
+                finding.code,
+                markdown_text(&finding.message)
+            ));
+        }
+        if report.findings.len() > 10 {
+            output.push_str(&format!(
+                "- {} additional findings are available in JSON output.\n",
+                report.findings.len() - 10
+            ));
+        }
+        output.push('\n');
+    }
+
+    output.push_str("## Calculation Notes\n\n");
+    output.push_str("- Hotpath runs locally and does not require network access or telemetry for this report.\n");
+    output.push_str(
+        "- Hotspot scores are advisory decision-support signals, not proof of defects.\n",
+    );
+    output
+        .push_str("- Risk /10 is the internal 0.0-1.0 score multiplied by 10 for human reading.\n");
+    if let Some(hotspot) = report.hotspots.first() {
+        output.push_str(&format!(
+            "- Formula version: {}.\n",
+            markdown_code_span(&hotspot.formula_version.id)
+        ));
+    }
+    output.push_str("- Scores use the reported formula version and available local scan and Git history metrics.\n");
+    output.push_str("- Missing or incomplete local history can limit churn, ownership, and co-change signals.\n");
+
+    output
 }
 
 pub fn build_current_dir_report_and_persist() -> Result<Report, ReportCommandError> {
@@ -184,6 +324,45 @@ impl From<&ReportHotspot> for ReportFinding {
             score: Some(hotspot.score),
         }
     }
+}
+
+fn risk_scale(score: f64) -> f64 {
+    score * 10.0
+}
+
+fn optional_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "n/a".to_owned(), |value| value.to_string())
+}
+
+fn markdown_code_span(value: &str) -> String {
+    let value = value.replace('\n', " ").replace('|', "\\|");
+    let fence = "`".repeat(max_backtick_run(&value) + 1);
+
+    if value.contains('`') {
+        format!("{fence} {value} {fence}")
+    } else {
+        format!("{fence}{value}{fence}")
+    }
+}
+
+fn max_backtick_run(value: &str) -> usize {
+    let mut max_run = 0;
+    let mut current_run = 0;
+
+    for character in value.chars() {
+        if character == '`' {
+            current_run += 1;
+            max_run = max_run.max(current_run);
+        } else {
+            current_run = 0;
+        }
+    }
+
+    max_run
+}
+
+fn markdown_text(value: &str) -> String {
+    value.replace('\n', " ")
 }
 
 impl fmt::Display for ReportCommandError {

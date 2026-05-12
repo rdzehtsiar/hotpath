@@ -57,6 +57,10 @@ fn report_json(current_dir: &Path) -> (String, Value) {
     (stdout, value)
 }
 
+fn report_markdown(current_dir: &Path) -> String {
+    successful_stdout(&["report", "--markdown"], current_dir)
+}
+
 #[test]
 fn report_json_is_deterministic_and_has_expected_schema() {
     let fixture = ranked_fixture("report-json-schema");
@@ -88,6 +92,91 @@ fn report_json_is_deterministic_and_has_expected_schema() {
         3
     );
     assert!(!contains_path(&first_stdout, fixture.path()));
+}
+
+#[test]
+fn report_defaults_to_deterministic_markdown_without_path_leaks() {
+    let fixture = ranked_fixture("report-markdown-default");
+
+    let default_stdout = successful_stdout(&["report"], fixture.path());
+    let explicit_stdout = report_markdown(fixture.path());
+    let repeated_stdout = successful_stdout(&["report"], fixture.path());
+
+    assert_eq!(default_stdout, explicit_stdout);
+    assert_eq!(default_stdout, repeated_stdout);
+    assert!(default_stdout.starts_with("# Hotpath Report\n\n"));
+    assert!(default_stdout.contains("## Summary"));
+    assert!(default_stdout.contains("- Files scanned: 3"));
+    assert!(default_stdout.contains("- Hotspots ranked: 3"));
+    assert!(default_stdout.contains("## Top Hotspots"));
+    assert!(default_stdout.contains("| 1 | `src/risky.rs` |"));
+    assert!(default_stdout.contains("Risk /10"));
+    assert!(default_stdout.contains("## Calculation Notes"));
+    assert!(default_stdout.contains("does not require network access or telemetry"));
+    assert!(default_stdout.contains("Scores use the reported formula version"));
+    assert!(!default_stdout.contains("schema_version"));
+    assert!(!contains_path(&default_stdout, fixture.path()));
+}
+
+#[test]
+fn report_markdown_limits_human_hotspots_while_json_remains_complete() {
+    let fixture = many_hotspots_fixture("report-markdown-limit", 12);
+
+    let markdown = report_markdown(fixture.path());
+    let (_json_stdout, value) = report_json(fixture.path());
+
+    assert_eq!(
+        value["hotspots"].as_array().expect("hotspots array").len(),
+        12
+    );
+    assert!(markdown.contains("| 10 | `src/file09.rs` |"));
+    assert!(!markdown.contains("src/file10.rs"));
+    assert!(!markdown.contains("src/file11.rs"));
+    assert!(markdown.contains("Showing top 10 of 12 ranked hotspots"));
+    assert!(markdown.contains("JSON output includes all hotspot rows"));
+    assert!(!contains_path(&markdown, fixture.path()));
+}
+
+#[test]
+fn report_markdown_reports_empty_hotspot_sets() {
+    let fixture = empty_current_file_set_fixture("report-markdown-empty");
+
+    let markdown = report_markdown(fixture.path());
+
+    assert!(markdown.contains("- Files scanned: 0"));
+    assert!(markdown.contains("- Hotspots ranked: 0"));
+    assert!(markdown.contains("No current files were ranked as hotspots."));
+    assert!(markdown.contains("No advisory findings were produced."));
+    assert!(!contains_path(&markdown, fixture.path()));
+}
+
+#[test]
+fn report_markdown_uses_safe_code_spans_for_paths_with_backticks() {
+    let fixture = GitFixture::new("report-markdown-backtick-path");
+    let author = GitIdentity::new("Path Author", "path@example.invalid");
+
+    fixture.write("src/weird`name.rs", "pub fn weird_name() {}\n");
+    fixture.commit(CommitOptions::new(
+        "Add path with backtick",
+        author,
+        "2024-01-01T00:00:00 +0000",
+    ));
+
+    let markdown = report_markdown(fixture.path());
+
+    assert!(markdown.contains("| 1 | `` src/weird`name.rs `` |"));
+    assert!(!contains_path(&markdown, fixture.path()));
+}
+
+#[test]
+fn report_rejects_json_and_markdown_flags_together() {
+    let fixture = ranked_fixture("report-markdown-conflict");
+
+    let stderr = failed_stderr(&["report", "--json", "--markdown"], fixture.path());
+
+    assert!(stderr.contains("--json"));
+    assert!(stderr.contains("--markdown"));
+    assert!(stderr.contains("cannot be used"));
 }
 
 #[test]
@@ -282,6 +371,45 @@ fn ranked_fixture(name: &str) -> GitFixture {
         "Grow risky with related file",
         cara,
         "2024-04-10T00:00:00 +0000",
+    ));
+
+    fixture
+}
+
+fn many_hotspots_fixture(name: &str, count: usize) -> GitFixture {
+    let fixture = GitFixture::new(name);
+    let author = GitIdentity::new("Many Author", "many@example.invalid");
+
+    for index in 0..count {
+        fixture.write(
+            format!("src/file{index:02}.rs"),
+            &format!("pub fn file_{index}() {{}}\n"),
+        );
+    }
+    fixture.commit(CommitOptions::new(
+        "Add many files",
+        author,
+        "2024-01-01T00:00:00 +0000",
+    ));
+
+    fixture
+}
+
+fn empty_current_file_set_fixture(name: &str) -> GitFixture {
+    let fixture = GitFixture::new(name);
+    let author = GitIdentity::new("Empty Author", "empty@example.invalid");
+
+    fixture.write("src/removed.rs", "pub fn removed() {}\n");
+    fixture.commit(CommitOptions::new(
+        "Add removed file",
+        author.clone(),
+        "2024-01-01T00:00:00 +0000",
+    ));
+    fixture.delete("src/removed.rs");
+    fixture.commit(CommitOptions::new(
+        "Remove current files",
+        author,
+        "2024-01-02T00:00:00 +0000",
     ));
 
     fixture
