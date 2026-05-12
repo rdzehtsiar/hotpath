@@ -14,6 +14,7 @@ use serde::Serialize;
 pub mod complexity;
 pub mod context;
 pub mod dependency;
+pub mod diff;
 pub mod git;
 pub mod graph;
 pub mod parse;
