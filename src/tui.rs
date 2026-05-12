@@ -362,60 +362,419 @@ impl From<ScanError> for TuiSnapshotError {
 }
 
 fn run_app(terminal: &mut TuiTerminal, snapshot: &TuiSnapshot) -> io::Result<()> {
-    loop {
-        terminal.draw(|frame| render(frame, snapshot))?;
+    let mut state = TuiAppState::default();
 
+    loop {
+        terminal.draw(|frame| render(frame, snapshot, &state))?;
         if event::poll(Duration::from_millis(250))? {
-            match event::read()? {
-                Event::Key(key) if should_quit(key) => return Ok(()),
-                _ => {}
+            if let Event::Key(key) = event::read()? {
+                reduce_key_with_editor(&mut state, snapshot, key, |name| env::var_os(name));
+                if state.should_exit {
+                    return Ok(());
+                }
             }
         }
     }
 }
 
-fn render(frame: &mut Frame<'_>, snapshot: &TuiSnapshot) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TuiView {
+    Overview,
+    Detail,
+}
+
+impl TuiView {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Detail => "Detail",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TuiAction {
+    DrillDown { from: TuiView, row_text: String },
+    ExplainScore { view: TuiView, row_text: String },
+    OpenEditor { command: String, row_text: String },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListSelection {
+    selected: usize,
+}
+
+impl ListSelection {
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
+    fn move_next(&mut self, row_count: usize) {
+        if row_count == 0 {
+            self.selected = 0;
+            return;
+        }
+
+        self.selected = (self.selected + 1).min(row_count - 1);
+    }
+
+    fn move_previous(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    fn clamp(&mut self, row_count: usize) {
+        if row_count == 0 {
+            self.selected = 0;
+        } else {
+            self.selected = self.selected.min(row_count - 1);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchState {
+    query: String,
+}
+
+impl SearchState {
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuiAppState {
+    current_view: TuiView,
+    back_stack: Vec<TuiView>,
+    selections: BTreeMap<TuiView, ListSelection>,
+    search: Option<SearchState>,
+    status: Option<String>,
+    last_action: Option<TuiAction>,
+    should_exit: bool,
+}
+
+impl Default for TuiAppState {
+    fn default() -> Self {
+        let mut selections = BTreeMap::new();
+        selections.insert(TuiView::Overview, ListSelection::default());
+        selections.insert(TuiView::Detail, ListSelection::default());
+
+        Self {
+            current_view: TuiView::Overview,
+            back_stack: Vec::new(),
+            selections,
+            search: None,
+            status: None,
+            last_action: None,
+            should_exit: false,
+        }
+    }
+}
+
+impl TuiAppState {
+    pub fn current_view(&self) -> TuiView {
+        self.current_view
+    }
+
+    pub fn selected_index(&self) -> usize {
+        self.selection_for_current_view().selected()
+    }
+
+    pub fn search_query(&self) -> Option<&str> {
+        self.search.as_ref().map(SearchState::query)
+    }
+
+    pub fn status(&self) -> Option<&str> {
+        self.status.as_deref()
+    }
+
+    pub fn last_action(&self) -> Option<&TuiAction> {
+        self.last_action.as_ref()
+    }
+
+    pub fn should_exit(&self) -> bool {
+        self.should_exit
+    }
+
+    fn selection_for_current_view(&self) -> &ListSelection {
+        self.selections
+            .get(&self.current_view)
+            .expect("all TUI views have selection state")
+    }
+
+    fn selection_for_current_view_mut(&mut self) -> &mut ListSelection {
+        self.selections
+            .get_mut(&self.current_view)
+            .expect("all TUI views have selection state")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditorResolution {
+    Command(String),
+    Missing,
+}
+
+pub fn resolve_editor_from_env<F>(mut get_env: F) -> EditorResolution
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    get_env("VISUAL")
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| get_env("EDITOR").filter(|value| !value.trim().is_empty()))
+        .map(EditorResolution::Command)
+        .unwrap_or(EditorResolution::Missing)
+}
+
+fn reduce_key_with_editor<F>(
+    state: &mut TuiAppState,
+    snapshot: &TuiSnapshot,
+    key: KeyEvent,
+    mut get_env: F,
+) where
+    F: FnMut(&str) -> Option<std::ffi::OsString>,
+{
+    if key.kind != KeyEventKind::Press {
+        return;
+    }
+
+    let rows = filtered_visible_rows(snapshot, state);
+
+    if state.search.is_some() {
+        match key.code {
+            KeyCode::Esc => reduce_escape(state),
+            KeyCode::Backspace => {
+                if let Some(search) = &mut state.search {
+                    search.query.pop();
+                }
+                clamp_current_selection(state, snapshot);
+            }
+            KeyCode::Char(character) => {
+                if let Some(search) = &mut state.search {
+                    search.query.push(character);
+                }
+                clamp_current_selection(state, snapshot);
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    match key.code {
+        KeyCode::Char('q') => state.should_exit = true,
+        KeyCode::Char('/') => {
+            state.search = Some(SearchState::default());
+            state.status = Some("Search active".to_owned());
+            clamp_current_selection(state, snapshot);
+        }
+        KeyCode::Esc => reduce_escape(state),
+        KeyCode::Char('j') => {
+            state.selection_for_current_view_mut().move_next(rows.len());
+        }
+        KeyCode::Char('k') => {
+            state.selection_for_current_view_mut().move_previous();
+        }
+        KeyCode::Enter => drill_down(state, &rows),
+        KeyCode::Char('x') => explain_score(state, &rows),
+        KeyCode::Char('e') => {
+            let resolution = resolve_editor_from_env(|name| {
+                get_env(name).and_then(|value| value.into_string().ok())
+            });
+            resolve_editor_action(state, &rows, resolution);
+        }
+        _ => {}
+    }
+}
+
+fn reduce_escape(state: &mut TuiAppState) {
+    if state.search.take().is_some() {
+        state.status = Some("Search cleared".to_owned());
+        return;
+    }
+
+    if let Some(previous) = state.back_stack.pop() {
+        state.current_view = previous;
+        state.status = Some(format!("Back to {}", previous.title()));
+    } else {
+        state.should_exit = true;
+    }
+}
+
+fn drill_down(state: &mut TuiAppState, rows: &[String]) {
+    let Some(row_text) = selected_row_text(state, rows) else {
+        state.status = Some("No row selected".to_owned());
+        return;
+    };
+
+    let from = state.current_view;
+    if from == TuiView::Detail {
+        state.status = Some("Already in detail view".to_owned());
+        return;
+    }
+
+    state.back_stack.push(from);
+    state.current_view = TuiView::Detail;
+    state.last_action = Some(TuiAction::DrillDown {
+        from,
+        row_text: row_text.clone(),
+    });
+    state.status = Some(format!("Opened {row_text}"));
+}
+
+fn explain_score(state: &mut TuiAppState, rows: &[String]) {
+    let Some(row_text) = selected_row_text(state, rows) else {
+        state.status = Some("No row selected".to_owned());
+        return;
+    };
+
+    state.last_action = Some(TuiAction::ExplainScore {
+        view: state.current_view,
+        row_text: row_text.clone(),
+    });
+    state.status = Some(format!("Explain score: {row_text}"));
+}
+
+fn resolve_editor_action(state: &mut TuiAppState, rows: &[String], resolution: EditorResolution) {
+    let Some(row_text) = selected_row_text(state, rows) else {
+        state.status = Some("No row selected".to_owned());
+        return;
+    };
+
+    match resolution {
+        EditorResolution::Command(command) => {
+            state.last_action = Some(TuiAction::OpenEditor {
+                command: command.clone(),
+                row_text: row_text.clone(),
+            });
+            state.status = Some(format!("Editor action: {command} {row_text}"));
+        }
+        EditorResolution::Missing => {
+            state.status = Some("Set VISUAL or EDITOR to open a row in an editor".to_owned());
+        }
+    }
+}
+
+fn selected_row_text(state: &TuiAppState, rows: &[String]) -> Option<String> {
+    rows.get(state.selected_index()).cloned()
+}
+
+fn clamp_current_selection(state: &mut TuiAppState, snapshot: &TuiSnapshot) {
+    let row_count = filtered_visible_rows(snapshot, state).len();
+    state.selection_for_current_view_mut().clamp(row_count);
+}
+
+fn filtered_visible_rows(snapshot: &TuiSnapshot, state: &TuiAppState) -> Vec<String> {
+    let rows = visible_rows(snapshot, state.current_view);
+    let Some(search) = &state.search else {
+        return rows;
+    };
+    let query = search.query.trim().to_lowercase();
+    if query.is_empty() {
+        return rows;
+    }
+
+    rows.into_iter()
+        .filter(|row| row.to_lowercase().contains(&query))
+        .collect()
+}
+
+fn visible_rows(snapshot: &TuiSnapshot, view: TuiView) -> Vec<String> {
+    match view {
+        TuiView::Overview => vec![
+            format!("Files: {}", snapshot.scan.summary.total_files),
+            format!("Hotspots: {}", snapshot.report.summary.hotspot_count),
+            format!("Symbols: {}", snapshot.symbols.summary.symbol_count),
+            format!("Dependencies: {}", snapshot.coupling.edges.len()),
+        ],
+        TuiView::Detail => snapshot
+            .report
+            .hotspots
+            .iter()
+            .map(|hotspot| {
+                format!(
+                    "#{rank} {path} score {score:.2}",
+                    rank = hotspot.rank,
+                    path = hotspot.path,
+                    score = hotspot.score
+                )
+            })
+            .chain(snapshot.scan.files.iter().map(|file| file.path.clone()))
+            .collect(),
+    }
+}
+
+fn visible_row_window(
+    rows: &[String],
+    selected: usize,
+    limit: usize,
+) -> impl Iterator<Item = (usize, &String)> {
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(limit)
+        .min(rows.len());
+
+    rows.iter().enumerate().skip(start).take(limit)
+}
+
+fn render(frame: &mut Frame<'_>, snapshot: &TuiSnapshot, state: &TuiAppState) {
     let area = frame.area();
     let [_, content, _] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Fill(1),
-            Constraint::Length(7),
+            Constraint::Length(10),
             Constraint::Fill(1),
         ])
         .areas(area);
-
-    let title = Line::from(vec![
-        Span::styled(
-            "Hotpath",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" local codebase intelligence"),
-    ]);
-    let body = Paragraph::new(vec![
-        title,
+    let rows = filtered_visible_rows(snapshot, state);
+    let selected = state.selected_index();
+    let mut body_lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "Hotpath",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" local codebase intelligence"),
+        ]),
         Line::raw(""),
-        Line::raw(format!(
-            "Snapshot loaded: {} files, {} hotspots, {} symbols, {} dependencies.",
-            snapshot.scan.summary.total_files,
-            snapshot.report.summary.hotspot_count,
-            snapshot.symbols.summary.symbol_count,
-            snapshot.coupling.edges.len()
-        )),
-        Line::raw("Press q or Esc to exit."),
-    ])
-    .alignment(Alignment::Center)
-    .block(
-        Block::default()
-            .title(" Hotpath TUI ")
-            .borders(Borders::ALL),
-    );
+        Line::raw(format!("View: {}", state.current_view.title())),
+    ];
+
+    if rows.is_empty() {
+        body_lines.push(Line::raw("No rows."));
+    } else {
+        body_lines.extend(visible_row_window(&rows, selected, 4).map(|(index, row)| {
+            if index == selected {
+                Line::raw(format!("> {row}"))
+            } else {
+                Line::raw(format!("  {row}"))
+            }
+        }));
+    }
+
+    let footer = match state.search_query() {
+        Some(query) => format!("/{query}"),
+        None => state.status().map(str::to_owned).unwrap_or_else(|| {
+            "j/k move, Enter drill down, / search, x explain, e editor, q quit".to_owned()
+        }),
+    };
+    body_lines.push(Line::raw(""));
+    body_lines.push(Line::raw(footer));
+
+    let body = Paragraph::new(body_lines)
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .title(" Hotpath TUI ")
+                .borders(Borders::ALL),
+        );
 
     frame.render_widget(body, content);
 }
 
+#[cfg(test)]
 fn should_quit(key: KeyEvent) -> bool {
     if key.kind != KeyEventKind::Press {
         return false;
@@ -496,6 +855,182 @@ mod tests {
     }
 
     #[test]
+    fn reducer_moves_selection_with_j_and_k() {
+        let snapshot = test_snapshot();
+        let mut state = TuiAppState::default();
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Char('j'), None);
+        reduce_test_key(&mut state, &snapshot, KeyCode::Char('j'), None);
+        reduce_test_key(&mut state, &snapshot, KeyCode::Char('k'), None);
+
+        assert_eq!(state.selected_index(), 1);
+    }
+
+    #[test]
+    fn reducer_drills_down_and_escape_navigates_back() {
+        let snapshot = test_snapshot();
+        let mut state = TuiAppState::default();
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
+
+        assert_eq!(state.current_view(), TuiView::Detail);
+        assert_eq!(
+            state.last_action(),
+            Some(&TuiAction::DrillDown {
+                from: TuiView::Overview,
+                row_text: "Files: 2".to_owned(),
+            })
+        );
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Esc, None);
+
+        assert_eq!(state.current_view(), TuiView::Overview);
+        assert!(!state.should_exit());
+    }
+
+    #[test]
+    fn reducer_search_filters_current_view_and_escape_clears_search_first() {
+        let snapshot = test_snapshot();
+        let mut state = TuiAppState::default();
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Char('/'), None);
+        for character in "hot".chars() {
+            reduce_test_key(&mut state, &snapshot, KeyCode::Char(character), None);
+        }
+
+        assert_eq!(state.search_query(), Some("hot"));
+        assert_eq!(
+            filtered_visible_rows(&snapshot, &state),
+            vec!["Hotspots: 0"]
+        );
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Esc, None);
+
+        assert_eq!(state.search_query(), None);
+        assert_eq!(state.current_view(), TuiView::Overview);
+        assert!(!state.should_exit());
+    }
+
+    #[test]
+    fn reducer_search_accepts_q_as_query_text() {
+        let snapshot = test_snapshot();
+        let mut state = TuiAppState::default();
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Char('/'), None);
+        reduce_test_key(&mut state, &snapshot, KeyCode::Char('q'), None);
+
+        assert_eq!(state.search_query(), Some("q"));
+        assert!(!state.should_exit());
+    }
+
+    #[test]
+    fn reducer_does_not_create_self_history_from_detail_view() {
+        let snapshot = test_snapshot();
+        let mut state = TuiAppState::default();
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
+        reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
+        reduce_test_key(&mut state, &snapshot, KeyCode::Esc, None);
+
+        assert_eq!(state.current_view(), TuiView::Overview);
+        assert!(!state.should_exit());
+    }
+
+    #[test]
+    fn visible_row_window_keeps_selection_rendered() {
+        let rows = ["a", "b", "c", "d", "e", "f"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+
+        let window = visible_row_window(&rows, 5, 4)
+            .map(|(index, row)| (index, row.as_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(window, vec![(2, "c"), (3, "d"), (4, "e"), (5, "f")]);
+    }
+
+    #[test]
+    fn reducer_q_exits_and_escape_at_root_preserves_existing_exit_behavior() {
+        let snapshot = test_snapshot();
+        let mut state = TuiAppState::default();
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Esc, None);
+
+        assert!(state.should_exit());
+
+        let mut state = TuiAppState::default();
+        reduce_test_key(&mut state, &snapshot, KeyCode::Char('q'), None);
+
+        assert!(state.should_exit());
+    }
+
+    #[test]
+    fn editor_resolution_prefers_visual_then_editor() {
+        let resolved = resolve_editor_from_env(|name| match name {
+            "VISUAL" => Some("code".to_owned()),
+            "EDITOR" => Some("vim".to_owned()),
+            _ => None,
+        });
+
+        assert_eq!(resolved, EditorResolution::Command("code".to_owned()));
+
+        let resolved = resolve_editor_from_env(|name| match name {
+            "EDITOR" => Some("vim".to_owned()),
+            _ => None,
+        });
+
+        assert_eq!(resolved, EditorResolution::Command("vim".to_owned()));
+    }
+
+    #[test]
+    fn reducer_editor_action_sets_status_when_editor_is_missing() {
+        let snapshot = test_snapshot();
+        let mut state = TuiAppState::default();
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Char('e'), None);
+
+        assert_eq!(
+            state.status(),
+            Some("Set VISUAL or EDITOR to open a row in an editor")
+        );
+        assert_eq!(state.last_action(), None);
+    }
+
+    #[test]
+    fn reducer_editor_action_records_resolved_command_without_spawning() {
+        let snapshot = test_snapshot();
+        let mut state = TuiAppState::default();
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Char('e'), Some("vim"));
+
+        assert_eq!(
+            state.last_action(),
+            Some(&TuiAction::OpenEditor {
+                command: "vim".to_owned(),
+                row_text: "Files: 2".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn reducer_explain_score_records_selected_row() {
+        let snapshot = test_snapshot();
+        let mut state = TuiAppState::default();
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Char('j'), None);
+        reduce_test_key(&mut state, &snapshot, KeyCode::Char('x'), None);
+
+        assert_eq!(
+            state.last_action(),
+            Some(&TuiAction::ExplainScore {
+                view: TuiView::Overview,
+                row_text: "Hotspots: 0".to_owned(),
+            })
+        );
+    }
+
+    #[test]
     fn snapshot_constructor_sorts_repository_relative_data() {
         let scan = ScanReport::from_parts(
             Vec::new(),
@@ -570,6 +1105,34 @@ mod tests {
         assert_eq!(snapshot.complexity.summary.total_files, 1);
         assert!(snapshot.coupling.edges.is_empty());
         assert_eq!(snapshot.report.summary.scan.total_files, 1);
+    }
+
+    fn reduce_test_key(
+        state: &mut TuiAppState,
+        snapshot: &TuiSnapshot,
+        code: KeyCode,
+        editor: Option<&str>,
+    ) {
+        reduce_key_with_editor(state, snapshot, KeyEvent::from(code), |name| match name {
+            "VISUAL" => editor.map(Into::into),
+            _ => None,
+        });
+    }
+
+    fn test_snapshot() -> TuiSnapshot {
+        let scan = ScanReport::from_parts(
+            Vec::new(),
+            vec![file_record("src/lib.rs"), file_record("src/main.rs")],
+        );
+        let parse = ParseReport {
+            warnings: Vec::new(),
+            files: vec![parse_file("src/lib.rs"), parse_file("src/main.rs")],
+            symbols: vec![symbol("src/lib.rs", "run", 1)],
+            imports: Vec::new(),
+        };
+        let complexity = complexity::report_from_parse(&parse);
+
+        TuiSnapshot::from_parts(empty_report(&scan), scan, parse, complexity)
     }
 
     fn empty_report(scan: &ScanReport) -> Report {
