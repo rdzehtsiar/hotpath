@@ -1042,7 +1042,7 @@ fn descendant_kind(node: Node<'_>, kind: &str) -> bool {
         .any(|child| child.kind() == kind || descendant_kind(child, kind))
 }
 
-fn named_children<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
+fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).collect()
 }
