@@ -529,7 +529,7 @@ impl IndexStore {
             })?;
         let analysis_run_id = transaction.last_insert_rowid();
 
-        let mut file_ids = std::collections::BTreeMap::new();
+        let mut file_ids = BTreeMap::new();
         for metric in metrics {
             ensure_git_path_file(
                 &transaction,
