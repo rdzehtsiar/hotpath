@@ -80,6 +80,21 @@ pub enum ReportFindingLevel {
     Info,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CiRiskEvaluation {
+    pub threshold: f64,
+    pub threshold_breached: bool,
+    pub highest_risk: Option<CiRiskHotspot>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CiRiskHotspot {
+    pub rank: u64,
+    pub path: String,
+    pub score: f64,
+    pub risk: f64,
+}
+
 #[derive(Debug)]
 pub enum ReportCommandError {
     CurrentDir(std::io::Error),
@@ -115,6 +130,61 @@ pub fn report_html(output_dir: &Path) -> Result<String, ReportCommandError> {
     fs::write(output_dir.join("index.html"), html).map_err(ReportCommandError::WriteHtml)?;
 
     Ok("Wrote HTML report to index.html".to_owned())
+}
+
+pub fn ci_risk_gate(threshold: f64) -> Result<CiRiskEvaluation, ReportCommandError> {
+    let report = build_current_dir_report_and_persist()?;
+
+    Ok(evaluate_ci_risk(&report, threshold))
+}
+
+pub fn evaluate_ci_risk(report: &Report, threshold: f64) -> CiRiskEvaluation {
+    let highest_risk = report.hotspots.first().map(|hotspot| CiRiskHotspot {
+        rank: hotspot.rank,
+        path: hotspot.path.clone(),
+        score: hotspot.score,
+        risk: risk_scale(hotspot.score),
+    });
+    let threshold_breached = highest_risk
+        .as_ref()
+        .is_some_and(|hotspot| hotspot.risk >= threshold);
+
+    CiRiskEvaluation {
+        threshold,
+        threshold_breached,
+        highest_risk,
+    }
+}
+
+pub fn render_ci_risk(evaluation: &CiRiskEvaluation) -> String {
+    let mut output = String::new();
+
+    output.push_str("Hotpath CI risk\n");
+    output.push_str(&format!(
+        "result: {}\n",
+        if evaluation.threshold_breached {
+            "fail"
+        } else {
+            "pass"
+        }
+    ));
+    output.push_str(&format!(
+        "threshold: {}/10\n",
+        format_risk_value(evaluation.threshold)
+    ));
+
+    if let Some(hotspot) = &evaluation.highest_risk {
+        output.push_str(&format!(
+            "max risk: {}/10\n",
+            format_risk_value(hotspot.risk)
+        ));
+        output.push_str(&format!("highest-risk file: {}\n", hotspot.path));
+    } else {
+        output.push_str("max risk: none\n");
+        output.push_str("highest-risk file: none\n");
+    }
+
+    output
 }
 
 pub fn render_markdown(report: &Report) -> String {
@@ -559,6 +629,10 @@ impl From<&ReportHotspot> for ReportFinding {
 
 fn risk_scale(score: f64) -> f64 {
     score * 10.0
+}
+
+fn format_risk_value(value: f64) -> String {
+    format!("{value:.3}")
 }
 
 fn optional_u64(value: Option<u64>) -> String {

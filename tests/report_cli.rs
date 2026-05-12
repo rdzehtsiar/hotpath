@@ -50,6 +50,17 @@ fn failed_stderr(args: &[&str], current_dir: &Path) -> String {
     String::from_utf8(output.stderr).expect("stderr should be UTF-8")
 }
 
+fn assert_exit_code(output: &Output, expected: i32) {
+    assert_eq!(
+        output.status.code(),
+        Some(expected),
+        "expected exit code {expected}, got {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn report_json(current_dir: &Path) -> (String, Value) {
     let stdout = successful_stdout(&["report", "--json"], current_dir);
     let value = serde_json::from_str(&stdout).expect("report JSON should parse");
@@ -65,6 +76,10 @@ fn report_html(current_dir: &Path, output_dir: &Path) -> String {
     let output_arg = output_dir.to_string_lossy().into_owned();
 
     successful_stdout(&["report", "--html", &output_arg], current_dir)
+}
+
+fn ci_output(current_dir: &Path, threshold: &str) -> Output {
+    hotpath(&["ci", "--fail-on-risk", threshold], current_dir)
 }
 
 #[test]
@@ -267,6 +282,90 @@ fn report_rejects_html_with_other_format_flags() {
     assert!(markdown_stderr.contains("--markdown"));
     assert!(markdown_stderr.contains("--html"));
     assert!(markdown_stderr.contains("cannot be used"));
+}
+
+#[test]
+fn ci_risk_gate_passes_when_max_risk_is_below_threshold_without_path_leaks() {
+    let fixture = ranked_fixture("ci-pass");
+
+    let output = ci_output(fixture.path(), "10");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    assert_exit_code(&output, 0);
+    assert!(output.stderr.is_empty());
+    assert!(stdout.starts_with("Hotpath CI risk\n"));
+    assert!(stdout.contains("result: pass\n"));
+    assert!(stdout.contains("threshold: 10.000/10\n"));
+    assert!(stdout.contains("max risk: "));
+    assert!(stdout.contains("highest-risk file: src/risky.rs\n"));
+    assert!(!contains_path(&stdout, fixture.path()));
+}
+
+#[test]
+fn ci_risk_gate_fails_when_max_risk_meets_threshold() {
+    let fixture = ranked_fixture("ci-fail");
+
+    let output = ci_output(fixture.path(), "0.001");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    assert_exit_code(&output, 1);
+    assert!(output.stderr.is_empty());
+    assert!(stdout.contains("result: fail\n"));
+    assert!(stdout.contains("threshold: 0.001/10\n"));
+    assert!(stdout.contains("highest-risk file: src/risky.rs\n"));
+    assert!(!contains_path(&stdout, fixture.path()));
+}
+
+#[test]
+fn ci_risk_gate_passes_empty_current_file_sets() {
+    let fixture = empty_current_file_set_fixture("ci-empty");
+
+    let output = ci_output(fixture.path(), "0.001");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    assert_exit_code(&output, 0);
+    assert!(output.stderr.is_empty());
+    assert!(stdout.contains("result: pass\n"));
+    assert!(stdout.contains("threshold: 0.001/10\n"));
+    assert!(stdout.contains("max risk: none\n"));
+    assert!(stdout.contains("highest-risk file: none\n"));
+    assert!(!contains_path(&stdout, fixture.path()));
+}
+
+#[test]
+fn ci_rejects_invalid_thresholds_before_analysis_or_persistence() {
+    for threshold in ["0", "-1", "10.1", "NaN", "inf", "not-a-number"] {
+        let fixture = TempDir::new(&format!(
+            "ci-invalid-{}",
+            threshold.replace(['-', '.'], "_")
+        ));
+        fixture.write("src/lib.rs", "pub fn lib() {}\n");
+
+        let output = ci_output(fixture.path(), threshold);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+        assert_exit_code(&output, 2);
+        assert!(output.stdout.is_empty());
+        assert!(stderr.contains("fail-on-risk"));
+        assert!(!contains_path(&stderr, fixture.path()));
+        assert!(!fixture.path().join(".hotpath").exists());
+    }
+}
+
+#[test]
+fn ci_operational_errors_exit_two_without_output_or_path_leaks() {
+    let fixture = TempDir::new("ci-non-git");
+    fixture.write("src/lib.rs", "pub fn lib() {}\n");
+
+    let output = ci_output(fixture.path(), "8");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    assert_exit_code(&output, 2);
+    assert!(output.stdout.is_empty());
+    assert!(stderr.starts_with("hotpath: path is not a readable Git worktree"));
+    assert!(stderr.contains("run report from inside a repository"));
+    assert!(!contains_path(&stderr, fixture.path()));
+    assert!(!fixture.path().join(".hotpath").exists());
 }
 
 #[test]

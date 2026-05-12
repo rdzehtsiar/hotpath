@@ -47,8 +47,18 @@ enum Commands {
     /// Build an aggregate repository risk report.
     Report(ReportArgs),
 
+    /// Fail CI when advisory hotspot risk reaches a threshold.
+    Ci(CiArgs),
+
     /// Check the local Hotpath index health.
     Doctor,
+}
+
+#[derive(Debug, Args)]
+struct CiArgs {
+    /// Fail when the maximum hotspot risk is greater than or equal to this 0-10 threshold.
+    #[arg(long, value_parser = parse_ci_risk_threshold, allow_hyphen_values = true)]
+    fail_on_risk: f64,
 }
 
 #[derive(Debug, Args)]
@@ -176,7 +186,12 @@ struct GraphArgs {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    let result: Result<String, Box<dyn std::error::Error>> = match cli.command {
+    let command = match cli.command {
+        Commands::Ci(args) => return run_ci(args),
+        command => command,
+    };
+
+    let result: Result<String, Box<dyn std::error::Error>> = match command {
         Commands::Scan(args) if args.json => hotpath::scan_json().map_err(Into::into),
         Commands::Scan(args) if args.summary => hotpath::scan_summary().map_err(Into::into),
         Commands::Scan(_) => hotpath::scan_summary().map_err(Into::into),
@@ -219,6 +234,7 @@ fn main() -> ExitCode {
             hotpath::report::report_html(&output_dir).map_err(Into::into)
         }
         Commands::Report(_) => hotpath::report::report_markdown().map_err(Into::into),
+        Commands::Ci(_) => unreachable!("CI command is handled before generic command dispatch"),
         Commands::Doctor => hotpath::doctor().map_err(Into::into),
     };
 
@@ -234,6 +250,23 @@ fn main() -> ExitCode {
     }
 }
 
+fn run_ci(args: CiArgs) -> ExitCode {
+    match hotpath::report::ci_risk_gate(args.fail_on_risk) {
+        Ok(evaluation) => {
+            print!("{}", hotpath::report::render_ci_risk(&evaluation));
+            if evaluation.threshold_breached {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Err(error) => {
+            eprintln!("hotpath: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn parse_positive_limit(value: &str) -> Result<usize, String> {
     let limit = value
         .parse::<i128>()
@@ -243,6 +276,22 @@ fn parse_positive_limit(value: &str) -> Result<usize, String> {
         Err("limit must be greater than 0".to_owned())
     } else {
         usize::try_from(limit).map_err(|_| "limit is too large".to_owned())
+    }
+}
+
+fn parse_ci_risk_threshold(value: &str) -> Result<f64, String> {
+    let threshold = value
+        .parse::<f64>()
+        .map_err(|_| "fail-on-risk must be a number greater than 0 and at most 10".to_owned())?;
+
+    if !threshold.is_finite() {
+        Err("fail-on-risk must be finite".to_owned())
+    } else if threshold <= 0.0 {
+        Err("fail-on-risk must be greater than 0".to_owned())
+    } else if threshold > 10.0 {
+        Err("fail-on-risk must be at most 10".to_owned())
+    } else {
+        Ok(threshold)
     }
 }
 
