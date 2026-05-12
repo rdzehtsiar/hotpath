@@ -454,6 +454,9 @@ pub enum DiffCommandError {
     Diff(diff::DiffError),
     Git(git::GitHistoryError),
     Scan(ScanError),
+    PersistScan(storage::index::IndexError),
+    PersistGitAnalysis(storage::index::IndexError),
+    PersistHotspots(storage::index::IndexError),
     Json(serde_json::Error),
 }
 
@@ -602,6 +605,15 @@ impl fmt::Display for DiffCommandError {
             Self::Diff(source) => write!(f, "{source}"),
             Self::Git(source) => write_diff_git_error(f, source),
             Self::Scan(source) => write!(f, "{source}"),
+            Self::PersistScan(source) => {
+                write_diff_persistence_error(f, "persist scan results", source)
+            }
+            Self::PersistGitAnalysis(source) => {
+                write_diff_persistence_error(f, "persist Git analysis", source)
+            }
+            Self::PersistHotspots(source) => {
+                write_diff_persistence_error(f, "persist hotspot scores", source)
+            }
             Self::Json(source) => write!(f, "failed to render diff JSON: {source}"),
         }
     }
@@ -614,6 +626,9 @@ impl StdError for DiffCommandError {
             Self::Diff(source) => Some(source),
             Self::Git(source) => Some(source),
             Self::Scan(source) => Some(source),
+            Self::PersistScan(source)
+            | Self::PersistGitAnalysis(source)
+            | Self::PersistHotspots(source) => Some(source),
             Self::Json(source) => Some(source),
         }
     }
@@ -1027,6 +1042,25 @@ fn diff_risk_report(range: &str) -> Result<DiffRiskReport, DiffCommandError> {
         &analysis.co_changes,
     );
     let touched_hotspots = touched_hotspots(&core_report.changed_files, &scan.files, &ranked);
+    let mut index = storage::index::IndexStore::open(&analysis.worktree_root)
+        .map_err(DiffCommandError::PersistScan)?;
+
+    let scan_run = index
+        .persist_scan(&scan)
+        .map_err(DiffCommandError::PersistScan)?;
+    index
+        .persist_git_analysis(
+            &analysis.worktree_root,
+            &analysis.head_commit_id,
+            analysis.head_commit_time,
+            analysis.recent_window_days as u64,
+            &analysis.file_metrics,
+            &analysis.co_changes,
+        )
+        .map_err(DiffCommandError::PersistGitAnalysis)?;
+    index
+        .persist_hotspots(scan_run.id, &ranked)
+        .map_err(DiffCommandError::PersistHotspots)?;
 
     Ok(DiffRiskReport {
         schema_version: core_report.schema_version,
@@ -1774,6 +1808,14 @@ fn write_hotspots_persistence_error(
     source: &storage::index::IndexError,
 ) -> fmt::Result {
     write_persistence_error(f, action, source, "hotspots")
+}
+
+fn write_diff_persistence_error(
+    f: &mut fmt::Formatter<'_>,
+    action: &str,
+    source: &storage::index::IndexError,
+) -> fmt::Result {
+    write_persistence_error(f, action, source, "diff")
 }
 
 fn write_context_persistence_error(

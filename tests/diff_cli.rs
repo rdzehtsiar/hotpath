@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use hotpath::storage::index::IndexStore;
 use serde_json::Value;
 
 mod support;
 
 use support::git::{CommitOptions, GitFixture, GitIdentity};
+
+static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
 fn hotpath(args: &[&str], current_dir: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_hotpath"))
@@ -46,6 +50,12 @@ fn failed_output(args: &[&str], current_dir: &Path) -> Output {
     output
 }
 
+fn failed_stderr(args: &[&str], current_dir: &Path) -> String {
+    let output = failed_output(args, current_dir);
+
+    String::from_utf8(output.stderr).expect("stderr should be UTF-8")
+}
+
 fn successful_json(args: &[&str], current_dir: &Path) -> (String, Value) {
     let stdout = successful_stdout(args, current_dir);
     let value = serde_json::from_str(&stdout).expect("diff JSON should parse");
@@ -76,6 +86,65 @@ fn diff_fixture(name: &str) -> GitFixture {
     ));
 
     fixture
+}
+
+#[test]
+fn diff_success_persists_scan_git_analysis_and_hotspots() {
+    let fixture = diff_fixture("diff-persisted");
+
+    let stdout = successful_stdout(&["diff", "main...HEAD"], fixture.path());
+
+    assert!(stdout.starts_with("Hotpath diff risk\n"));
+    assert!(!contains_path(&stdout, fixture.path()));
+
+    let persisted = IndexStore::open(fixture.path())
+        .expect("index should open")
+        .latest_scan()
+        .expect("scan should read")
+        .expect("scan should exist");
+    assert_eq!(
+        persisted
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file.line_count))
+            .collect::<Vec<_>>(),
+        vec![
+            ("src/new.rs", Some(1)),
+            ("src/risky.rs", Some(80)),
+            ("src/stable.rs", Some(1)),
+        ]
+    );
+
+    let persisted_git = IndexStore::open(fixture.path())
+        .expect("index should reopen")
+        .latest_git_analysis()
+        .expect("Git analysis should read")
+        .expect("Git analysis should exist");
+    assert_eq!(persisted_git.run.head_commit_time, 1709251200);
+    assert_eq!(persisted_git.run.recent_window_days, 90);
+    assert_eq!(
+        persisted_git
+            .file_stats
+            .iter()
+            .map(|stats| (stats.path.as_str(), stats.commits_per_file))
+            .collect::<Vec<_>>(),
+        vec![("src/new.rs", 1), ("src/risky.rs", 2), ("src/stable.rs", 1),]
+    );
+
+    let persisted_hotspots = IndexStore::open(fixture.path())
+        .expect("index should reopen for hotspots")
+        .latest_hotspots()
+        .expect("hotspots should read");
+    assert_eq!(
+        persisted_hotspots
+            .iter()
+            .map(|hotspot| (hotspot.rank, hotspot.path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(1, "src/risky.rs"), (2, "src/new.rs"), (3, "src/stable.rs"),]
+    );
+    assert!(persisted_hotspots
+        .iter()
+        .all(|hotspot| hotspot.formula_version == "hotpath.score.v1"));
 }
 
 #[test]
@@ -170,6 +239,75 @@ fn diff_invalid_range_has_empty_stdout_and_useful_stderr() {
     assert!(stderr.contains("two-dot ranges are not supported"));
     assert!(!stderr.contains("Hotpath diff risk"));
     assert!(!contains_path(&stderr, fixture.path()));
+}
+
+#[test]
+fn diff_sanitizes_corrupt_index_errors_without_report_output_or_path_leak() {
+    let fixture = diff_fixture("diff-corrupt-index");
+    fixture.write(".hotpath/index.db", "not a sqlite database");
+
+    let stderr = failed_stderr(&["diff", "main...HEAD"], fixture.path());
+
+    assert!(stderr.starts_with(
+        "hotpath: failed to persist scan results in local Hotpath index (.hotpath/index.db):"
+    ));
+    assert!(stderr.contains("remove .hotpath/index.db and rerun diff"));
+    assert!(!stderr.contains("Hotpath diff risk"));
+    assert!(!contains_path(&stderr, fixture.path()));
+}
+
+#[test]
+fn diff_rejects_non_git_directory_without_report_output_or_index_creation() {
+    let fixture = TempDir::new("diff-non-git");
+    fixture.write("src/lib.rs", "pub fn lib() {}\n");
+
+    let stderr = failed_stderr(&["diff", "main...HEAD"], fixture.path());
+
+    assert!(stderr.starts_with("hotpath: path is not a readable Git worktree"));
+    assert!(stderr.contains("run diff analysis from inside a repository"));
+    assert!(!stderr.contains("Hotpath diff risk"));
+    assert!(!contains_path(&stderr, fixture.path()));
+    assert!(!fixture.path().join(".hotpath").exists());
+}
+
+#[test]
+fn diff_rejects_missing_head_without_report_output_or_index_creation() {
+    let fixture = GitFixture::new("diff-missing-head");
+    fixture.write("src/lib.rs", "pub fn lib() {}\n");
+
+    let stderr = failed_stderr(&["diff", "main...HEAD"], fixture.path());
+
+    assert!(stderr.starts_with("hotpath: Git repository does not have a commit at HEAD"));
+    assert!(stderr.contains("create an initial commit before analyzing a diff"));
+    assert!(!stderr.contains("Hotpath diff risk"));
+    assert!(!contains_path(&stderr, fixture.path()));
+    assert!(!fixture.path().join(".hotpath").exists());
+}
+
+#[test]
+fn diff_rejects_shallow_repository_without_report_output_or_index_creation() {
+    let fixture = GitFixture::new("diff-shallow");
+    let author = GitIdentity::new("Shallow Author", "shallow@example.invalid");
+
+    fixture.write("src/lib.rs", "pub fn lib() {}\n");
+    let commit = fixture.commit(CommitOptions::new(
+        "Add library",
+        author,
+        "2024-06-01T00:00:00 +0000",
+    ));
+    fs::write(
+        fixture.path().join(".git").join("shallow"),
+        format!("{commit}\n"),
+    )
+    .expect("shallow marker should be written");
+
+    let stderr = failed_stderr(&["diff", "main...HEAD"], fixture.path());
+
+    assert!(stderr.starts_with("hotpath: Git repository has shallow history"));
+    assert!(stderr.contains("fetch complete local history"));
+    assert!(!stderr.contains("Hotpath diff risk"));
+    assert!(!contains_path(&stderr, fixture.path()));
+    assert!(!fixture.path().join(".hotpath").exists());
 }
 
 fn numbered_lines(prefix: &str, count: usize) -> String {
@@ -281,4 +419,47 @@ fn comparable_path_string(value: &str) -> String {
 #[cfg(not(windows))]
 fn comparable_path_string(value: &str) -> String {
     value.to_owned()
+}
+
+#[derive(Debug)]
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(name: &str) -> Self {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::current_dir()
+            .expect("test should have a current directory")
+            .join("target")
+            .join("diff-fixtures")
+            .join(format!("{name}-{}-{id}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("fixture root should be created");
+        fs::write(path.join(".git"), "not a gitdir\n")
+            .expect("invalid git marker should be written");
+
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn write(&self, relative_path: impl AsRef<Path>, contents: &str) {
+        let path = self.path.join(relative_path);
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("fixture parent should be created");
+        }
+
+        fs::write(path, contents).expect("fixture file should be written");
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }
