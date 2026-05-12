@@ -36,18 +36,23 @@ Hotpath is at the beginning of development.
 The repository currently contains an early Rust CLI with `hotpath scan`,
 `hotpath parse`, `hotpath complexity`, `hotpath graph`, `hotpath doctor`,
 `hotpath explain-git`, `hotpath hotspots`, `hotpath explain`, and
-`hotpath context`, plus early `hotpath diff` and `hotpath pr` commands for
-committed-tree diff risk reports. The scanner reports local file facts and
-warnings, scan and analysis commands persist derived local SQLite index data at
+`hotpath context`, `hotpath report`, and `hotpath ci`, plus early `hotpath diff`
+and `hotpath pr` commands for committed-tree diff risk reports. The scanner
+reports local file facts and warnings, scan and analysis commands persist
+derived local SQLite index data at
 `.hotpath/index.db`, Git analysis explains local history for requested paths,
 hotspot commands rank and explain current files with the documented
 `hotpath.score.v1` formula, parse commands print an early parser report for
 supported source files, complexity commands summarize parser-derived symbol
 complexity and fan metrics, graph commands expose conservative resolved local
 dependency edges for a selected module scope, and context commands estimate AI
-context cost offline from scanner facts. Diff and PR reports compare committed
-Git trees locally, use the merge base of the requested base and head refs, and
-do not require GitHub API or network access.
+context cost offline from scanner facts. Repository reports aggregate scan
+summary, local Git analysis, hotspot ranking, and context estimates into
+Markdown, JSON, SARIF, or static HTML output. The CI command can fail a local or
+hosted CI job when the current repository hotspot risk reaches a supplied
+threshold. Diff and PR reports compare committed Git trees locally, use the
+merge base of the requested base and head refs, and do not require GitHub API or
+network access.
 
 Parser support is currently limited to Rust, Go, TypeScript, and TSX. There is
 no Python parser support yet. `hotpath parse` prints a summary, while
@@ -60,12 +65,14 @@ metadata, and basic parser-derived function/method complexity approximations.
 currently uses schema identifier `hotpath.graph.v1`. `hotpath context --json`
 currently uses schema identifier `hotpath.context.v1`. `hotpath diff
 <base>...<head> --json` and `hotpath pr --base <base> --head <head> --json`
-currently use schema identifier `hotpath.diff.v1`.
+currently use schema identifier `hotpath.diff.v1`. `hotpath report --json`
+currently uses schema identifier `hotpath.report.v1`; `hotpath report --sarif`
+emits SARIF 2.1.0 for hotspot findings.
 
 There is no released binary, stable CLI contract, stable index format,
-supported report format, stable Git analysis compatibility promise, broad
-parser/language support, complete dependency analysis, CI output, architecture
-rules, or terminal UI yet.
+stable report compatibility promise, stable Git analysis compatibility promise,
+broad parser/language support, complete dependency analysis, architecture rules,
+or terminal UI yet.
 
 Expect the crate layout, commands, data model, scoring formulas, output formats, and documentation to change as the product contract and first implementation milestones are built.
 
@@ -80,6 +87,8 @@ The public contract for Hotpath is documented in:
 - [Git metric semantics](docs/git-metrics.md)
 - [Local index](docs/index.md)
 - [Context estimates](docs/context.md)
+- [Report schema](docs/json-schema.md)
+- [CI usage](docs/ci.md)
 - [Diff and PR risk](docs/diff-risk.md)
 - [Limitations](docs/limitations.md)
 
@@ -93,7 +102,7 @@ The public contract for Hotpath is documented in:
 - advisory-only metrics, not automated truth
 - reproducible benchmarks
 - public limitations
-- CI-friendly output once implemented
+- CI-friendly output
 
 ## Who It Is For
 
@@ -154,9 +163,12 @@ metrics, co-change rows, conservative resolved dependency edges, and hotspot
 score rows using repository-relative paths. Context estimates reuse current scan
 facts and do not add a context-specific index table or schema. Diff and PR
 reports persist the same scan, Git analysis, and hotspot rows used by existing
-commands; they do not add a diff-specific index table. The index
-does not require a daemon or network access, and it can be deleted and rebuilt
-from local repository data. See [Local index](docs/index.md).
+commands; they do not add a diff-specific index table. Repository reports and
+CI risk gates persist the same scan, Git analysis, and hotspot rows used by
+existing commands; static HTML reports are written only when requested with
+`hotpath report --html <dir>`. The index does not require a daemon or network
+access, and it can be deleted and rebuilt from local repository data. See
+[Local index](docs/index.md).
 
 ## License
 

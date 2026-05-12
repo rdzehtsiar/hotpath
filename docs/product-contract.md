@@ -50,8 +50,8 @@ Hotpath should eventually help answer questions such as:
 - How expensive is a repository or directory to load into AI coding context?
 - Why did a file, module, or change receive a risk score?
 
-The intended interface is terminal-native. Future CI output should be
-machine-readable and deterministic where practical, but hosted infrastructure
+The intended interface is terminal-native. CI output should be machine-readable
+or log-friendly and deterministic where practical, but hosted infrastructure
 should not be required for the primary workflow.
 
 ## Non-Goals

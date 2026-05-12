@@ -7,9 +7,10 @@ compatibility promise.
 The index makes repeated local analysis easier to inspect and extend. It can be
 created and populated by `hotpath scan`, `hotpath parse`, `hotpath
 complexity`, `hotpath graph`, `hotpath explain-git`, `hotpath hotspots`, and
-`hotpath explain` runs. `hotpath diff` and `hotpath pr` persist the same scan,
-Git analysis, and hotspot rows used by those workflows; they do not add a
-diff-specific table or persist diff report rows in the current schema.
+`hotpath explain` runs. `hotpath report`, `hotpath ci`, `hotpath diff`, and
+`hotpath pr` persist the same scan, Git analysis, and hotspot rows used by
+those workflows; they do not add report-specific, CI-specific, or diff-specific
+tables or persist generated report rows in the current schema.
 `hotpath context` uses current scan facts for context estimates. When it
 persists data, it persists only the current scan facts and does not add
 context-specific rows, tables, or schema. The index is not user-authored data
@@ -107,8 +108,8 @@ dependency edge counts, per-file fan-in/fan-out, and maximum fan-in/fan-out from
 the same fresh parser report used for that command run.
 
 Currently populated by `hotpath explain-git`, `hotpath hotspots`, `hotpath
-explain`, `hotpath diff`, and `hotpath pr` after successful local history
-analysis:
+explain`, `hotpath report`, `hotpath ci`, `hotpath diff`, and `hotpath pr`
+after successful local history analysis:
 
 - Git analysis metadata, including analyzer version, `HEAD` commit id, `HEAD`
   committer timestamp, recent churn window, and observed row counts
@@ -125,8 +126,9 @@ timestamp skew. Generated and vendor scanner flags are stored separately from
 Git metrics; index v2 does not imply those paths are excluded from Git-derived
 rows.
 
-Currently populated by `hotpath hotspots`, `hotpath explain`, `hotpath diff`,
-and `hotpath pr` after successful hotspot scoring:
+Currently populated by `hotpath hotspots`, `hotpath explain`, `hotpath report`,
+`hotpath ci`, `hotpath diff`, and `hotpath pr` after successful hotspot
+scoring:
 
 - hotspot score rows for ranked current files
 - formula version identifiers

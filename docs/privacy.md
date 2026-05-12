@@ -7,7 +7,7 @@ contents.
 Hotpath is at the beginning of development. This document defines the privacy
 posture the project is being built toward and describes the local data written
 by the current early scanner, parser, complexity, dependency graph, Git metric,
-hotspot scoring, context estimate, and index implementation.
+hotspot scoring, context estimate, report, CI, and index implementation.
 
 ## Default Posture
 
@@ -74,11 +74,25 @@ They do not include source-file contents. `hotpath context` estimates from
 local scanner facts and should not make network calls, use external APIs, run
 cloud tokenizers, or collect telemetry.
 
+Repository reports can include derived repository-relative paths, scan summary
+counts, local Git summary metadata, ranked hotspot scores and score
+explanations, context estimate summaries, and advisory finding rows. JSON,
+Markdown, and SARIF report variants print to standard output. `hotpath report
+--html <dir>` writes a self-contained local `index.html` file in the requested
+directory. These report artifacts are user-requested local files or streams;
+they should not include full source-file contents or host-specific absolute
+paths in portable output, but they may still reveal sensitive repository
+structure and derived metrics.
+
+`hotpath ci --fail-on-risk <threshold>` builds the same current-repository
+report model locally and prints a concise pass/fail summary. It does not upload
+repository contents, metrics, reports, or CI results.
+
 ## Network And Cloud Boundaries
 
 Primary Hotpath workflows should not make network calls. Scanning, indexing,
-Git analysis, hotspot scoring, context estimation, and report generation should
-not depend on cloud APIs.
+Git analysis, hotspot scoring, context estimation, report generation, and CI
+risk gating should not depend on cloud APIs.
 
 If future optional features ever need network access, they should be explicit,
 documented, opt-in, and separate from the core local workflow. They should not

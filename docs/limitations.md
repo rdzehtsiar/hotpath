@@ -3,9 +3,10 @@
 Hotpath is at the beginning of development. The repository currently contains
 an early Rust CLI with scanner, parser, complexity, dependency graph, index
 health, Git metric, hotspot ranking, hotspot explanation, and context estimate
-commands, plus early committed-tree diff and PR risk reports. There is no
-released binary, stable CLI contract, supported report format, or compatibility
-promise yet.
+commands, plus early repository reports, CI risk gating, and committed-tree
+diff and PR risk reports. There is no released binary, stable CLI contract,
+stable index format, stable report compatibility promise, or stable Git/scoring
+compatibility promise yet.
 
 This page documents the limits Hotpath should make explicit as it develops.
 
@@ -18,12 +19,12 @@ extraction with `hotpath parse`, parser-derived complexity summaries with
 --module <selector>`, local Git history explanation with `hotpath explain-git`,
 hotspot ranking with `hotpath hotspots`, and per-file hotspot explanation with
 `hotpath explain`, and offline AI context cost estimation with `hotpath
-context`, plus `hotpath diff` and `hotpath pr` reports for local committed-tree
-comparisons. These are not stable interfaces.
+context`, plus `hotpath report`, `hotpath ci`, `hotpath diff`, and `hotpath pr`
+for local reports and gates. These are not stable interfaces.
 
 Hotpath does not currently provide stable Git analysis or scoring compatibility,
-broad parser/language support, complete dependency analysis, CI output,
-architecture rules, or a terminal UI.
+broad parser/language support, complete dependency analysis, architecture
+rules, or a terminal UI.
 
 Future commands, crate layout, data models, scoring formulas, and output formats
 may change while the product contract and first implementation milestones are
@@ -181,6 +182,48 @@ Known context estimate limitations include:
 `hotpath context` should not make external API calls, run cloud tokenizers,
 collect telemetry, or require network access.
 
+## Repository Report And CI Limits
+
+The current `hotpath report` command builds an aggregate current-repository
+report from scanner facts, local Git analysis, `hotpath.score.v1` hotspot
+ranking, and the default context estimate. It can print Markdown, JSON with
+schema identifier `hotpath.report.v1`, SARIF 2.1.0, or write a self-contained
+static HTML file.
+
+Known repository report limitations include:
+
+- report generation requires a readable non-bare local Git worktree with a
+  commit at `HEAD` and complete local history
+- shallow repositories are rejected instead of producing partial reports
+- report output is an early surface and is not a stable compatibility contract
+- Markdown and HTML intentionally show only the top hotspot rows for human
+  readability, while JSON and SARIF are the better machine-readable surfaces
+- SARIF currently maps hotspot rows to advisory findings only; it does not
+  report architecture violations, parser diagnostics, security findings, test
+  coverage, or runtime incidents
+- static HTML is local and self-contained; it is not a hosted dashboard and
+  does not include live drill-down or source browsing
+- report artifacts may contain sensitive repository-relative paths and derived
+  metrics even though they should avoid source contents and host-specific
+  absolute paths in portable output
+
+The current `hotpath ci --fail-on-risk <threshold>` command gates the aggregate
+current-repository hotspot report risk on a public `0-10` scale. The threshold
+must be finite, greater than `0`, and at most `10`. CI fails when the maximum
+hotspot score multiplied by `10.0` is greater than or equal to the threshold.
+
+Known CI risk-gate limitations include:
+
+- the gate uses advisory hotspot scoring, not a proof of defect or release
+  readiness
+- the gate evaluates the current repository report risk, not a diff-specific
+  touched-hotspot threshold
+- the gate does not enforce architecture policy because architecture rules do
+  not exist yet
+- operational analysis errors exit separately from threshold failures, but both
+  require users to inspect the command output before treating the result as
+  actionable
+
 ## Diff And PR Risk Limits
 
 The current `hotpath diff` and `hotpath pr` commands analyze committed Git
@@ -205,7 +248,8 @@ Known diff and PR limitations include:
 - exit status is not a risk gate; generated reports exit `0`, while invalid
   arguments, unsupported repositories, Git errors, index errors, scan errors,
   and rendering errors exit `1`
-- there is no fail-on-risk threshold yet
+- diff and PR commands do not have a fail-on-risk threshold; use `hotpath ci
+  --fail-on-risk <threshold>` to gate the current repository hotspot report risk
 
 ## False Positives And False Negatives
 

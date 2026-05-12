@@ -6,7 +6,7 @@ the beginning of development, so the command surface, JSON schemas, formulas,
 and local index layout are not compatibility promises.
 
 This page defines the public metrics currently exposed by scanner, parser,
-complexity, graph, Git, hotspot, context, diff, and PR workflows.
+complexity, graph, Git, hotspot, context, report, CI, diff, and PR workflows.
 
 ## Scope
 
@@ -25,9 +25,12 @@ Current machine-readable schema identifiers include:
 | Dependency graph report | `hotpath graph --module <selector> --json` | `hotpath.graph.v1` |
 | Hotspot scoring | `hotpath hotspots`, `hotpath explain` | `hotpath.score.v1` |
 | Context estimate | `hotpath context --json` | `hotpath.context.v1` |
+| Repository report | `hotpath report --json` | `hotpath.report.v1` |
 | Diff and PR risk | `hotpath diff <base>...<head> --json`, `hotpath pr --base <base> --head <head> --json` | `hotpath.diff.v1` |
 
 These identifiers describe current output, not a stable released contract.
+`hotpath report --sarif` emits SARIF 2.1.0 with Hotpath hotspot findings, but
+SARIF itself is an interchange format rather than a Hotpath schema identifier.
 
 ## Scanner Metrics
 
@@ -201,6 +204,27 @@ access, or cloud calls. It is useful for planning approximate context size, not
 for tokenizer-specific billing or exact prompt token counts.
 
 See [Context estimates](context.md) for current semantics.
+
+## Repository Reports And CI Risk
+
+`hotpath report` builds an aggregate current-repository risk report from local
+scan facts, local Git history, ranked hotspot scores, and the default context
+estimate. The command defaults to Markdown. `hotpath report --json` prints the
+machine-readable `hotpath.report.v1` shape, `hotpath report --sarif` prints a
+SARIF 2.1.0 hotspot result set, and `hotpath report --html <dir>` writes a
+self-contained `index.html` file.
+
+Current report metrics include:
+
+| Metric | Definition | Formula or derivation | Why it matters | Limitations |
+| --- | --- | --- | --- | --- |
+| report hotspot count | Number of current files ranked by the shared hotspot scorer. | Count of report hotspot rows derived from `hotpath.score.v1`. | Shows the breadth of files with available advisory hotspot scores. | It depends on current scan facts and local Git analysis; unsupported repositories produce no report. |
+| report context estimate | Default context estimate for the current scanned files. | Same `ceil(byte_size / 4)` estimate used by `hotpath context` with default options. | Shows approximate context cost next to hotspot risk. | It is not tokenizer-specific and includes generated/vendor files by default. |
+| report finding | Advisory row derived from a ranked hotspot. | One finding per report hotspot, with path, rank, score, and code `hotpath.hotspot.risk`. | Gives machine consumers a compact list of hotspot-related findings. | Findings are advisory and currently focus on hotspot risk, not architecture, tests, runtime incidents, or security. |
+| CI risk | Public `0-10` risk value used by `hotpath ci --fail-on-risk <threshold>`. | Internal hotspot score multiplied by `10.0`; CI compares the maximum risk with the threshold using `>=`. | Lets CI fail when current repository hotspot risk reaches a chosen advisory threshold. | It gates the current repository report risk, not diff-specific touched-hotspot risk or architecture policy. |
+
+See [Report schema](json-schema.md) and [CI usage](ci.md) for current command
+surfaces, output examples, and exit-code behavior.
 
 ## Diff And PR Metrics
 

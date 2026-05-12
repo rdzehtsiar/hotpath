@@ -103,9 +103,15 @@ Current exit-code policy:
 - `1` for invalid arguments, unsupported repositories, Git errors, index
   persistence errors, scan errors, or report rendering errors
 
-There is no fail-on-risk threshold yet. A report with touched hotspots,
-positive context growth, or `not_evaluated` architecture status still exits `0`
-when it is generated successfully.
+Diff and PR commands do not have a fail-on-risk threshold. A report with
+touched hotspots, positive context growth, or `not_evaluated` architecture
+status still exits `0` when it is generated successfully.
+
+For CI gating, use `hotpath ci --fail-on-risk <threshold>`. That command builds
+the current aggregate repository hotspot report and fails when the maximum
+hotspot score on the public `0-10` risk scale is greater than or equal to the
+threshold. It does not gate this diff/PR report, touched-hotspot count, context
+growth, or architecture status.
 
 ## Index Persistence
 
