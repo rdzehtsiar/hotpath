@@ -200,6 +200,16 @@ pub fn render_markdown(report: &Report) -> String {
     let mut output = String::new();
 
     output.push_str("# Hotpath Report\n\n");
+    render_markdown_summary(&mut output, report);
+    render_markdown_hotspots(&mut output, report);
+    render_markdown_context(&mut output, report);
+    render_markdown_findings(&mut output, report);
+    render_markdown_notes(&mut output, report);
+
+    output
+}
+
+fn render_markdown_summary(output: &mut String, report: &Report) {
     output.push_str("## Summary\n\n");
     output.push_str(&format!(
         "- Files scanned: {}\n",
@@ -234,37 +244,42 @@ pub fn render_markdown(report: &Report) -> String {
         report.summary.git.co_change_count,
         report.summary.git.recent_window_days
     ));
+}
 
+fn render_markdown_hotspots(output: &mut String, report: &Report) {
     output.push_str("## Top Hotspots\n\n");
     if report.hotspots.is_empty() {
         output.push_str("No current files were ranked as hotspots.\n\n");
-    } else {
-        output.push_str("| Rank | Path | Score | Risk /10 | Commits | Churn lines | Recent churn | Authors | Co-changed files |\n");
-        output.push_str("| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
-        for hotspot in report.hotspots.iter().take(10) {
-            output.push_str(&format!(
-                "| {} | {} | {:.3} | {:.1} | {} | {} | {} | {} | {} |\n",
-                hotspot.rank,
-                markdown_code_span(&hotspot.path),
-                hotspot.score,
-                risk_scale(hotspot.score),
-                optional_u64(hotspot.raw_metrics.commits_per_file),
-                optional_u64(hotspot.raw_metrics.total_churn_lines),
-                optional_u64(hotspot.raw_metrics.recent_churn_lines),
-                optional_u64(hotspot.raw_metrics.author_count),
-                optional_u64(hotspot.raw_metrics.co_changed_file_count)
-            ));
-        }
-        if report.hotspots.len() > 10 {
-            output.push_str(&format!(
-                "\nShowing top 10 of {} ranked hotspots. JSON output includes all hotspot rows.\n\n",
-                report.hotspots.len()
-            ));
-        } else {
-            output.push('\n');
-        }
+        return;
     }
 
+    output.push_str("| Rank | Path | Score | Risk /10 | Commits | Churn lines | Recent churn | Authors | Co-changed files |\n");
+    output.push_str("| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    for hotspot in report.hotspots.iter().take(10) {
+        output.push_str(&format!(
+            "| {} | {} | {:.3} | {:.1} | {} | {} | {} | {} | {} |\n",
+            hotspot.rank,
+            markdown_code_span(&hotspot.path),
+            hotspot.score,
+            risk_scale(hotspot.score),
+            optional_u64(hotspot.raw_metrics.commits_per_file),
+            optional_u64(hotspot.raw_metrics.total_churn_lines),
+            optional_u64(hotspot.raw_metrics.recent_churn_lines),
+            optional_u64(hotspot.raw_metrics.author_count),
+            optional_u64(hotspot.raw_metrics.co_changed_file_count)
+        ));
+    }
+    if report.hotspots.len() > 10 {
+        output.push_str(&format!(
+            "\nShowing top 10 of {} ranked hotspots. JSON output includes all hotspot rows.\n\n",
+            report.hotspots.len()
+        ));
+    } else {
+        output.push('\n');
+    }
+}
+
+fn render_markdown_context(output: &mut String, report: &Report) {
     output.push_str("## Context Estimate\n\n");
     output.push_str(&format!(
         "- Estimated tokens: {}\n",
@@ -290,27 +305,32 @@ pub fn render_markdown(report: &Report) -> String {
         }
         output.push_str("\n\n");
     }
+}
 
+fn render_markdown_findings(output: &mut String, report: &Report) {
     output.push_str("## Findings\n\n");
     if report.findings.is_empty() {
         output.push_str("No advisory findings were produced.\n\n");
-    } else {
-        for finding in report.findings.iter().take(10) {
-            output.push_str(&format!(
-                "- `{}`: {}\n",
-                finding.code,
-                markdown_text(&finding.message)
-            ));
-        }
-        if report.findings.len() > 10 {
-            output.push_str(&format!(
-                "- {} additional findings are available in JSON output.\n",
-                report.findings.len() - 10
-            ));
-        }
-        output.push('\n');
+        return;
     }
 
+    for finding in report.findings.iter().take(10) {
+        output.push_str(&format!(
+            "- `{}`: {}\n",
+            finding.code,
+            markdown_text(&finding.message)
+        ));
+    }
+    if report.findings.len() > 10 {
+        output.push_str(&format!(
+            "- {} additional findings are available in JSON output.\n",
+            report.findings.len() - 10
+        ));
+    }
+    output.push('\n');
+}
+
+fn render_markdown_notes(output: &mut String, report: &Report) {
     output.push_str("## Calculation Notes\n\n");
     output.push_str("- Hotpath runs locally and does not require network access or telemetry for this report.\n");
     output.push_str(
@@ -326,8 +346,6 @@ pub fn render_markdown(report: &Report) -> String {
     }
     output.push_str("- Scores use the reported formula version and available local scan and Git history metrics.\n");
     output.push_str("- Missing or incomplete local history can limit churn, ownership, and co-change signals.\n");
-
-    output
 }
 
 pub fn render_html(report: &Report) -> String {
@@ -354,7 +372,17 @@ pub fn render_html(report: &Report) -> String {
     output.push_str(".note{color:#52606d;}\n");
     output.push_str("</style>\n</head>\n<body>\n<main>\n");
     output.push_str("<h1>Hotpath Report</h1>\n");
+    render_html_summary(&mut output, report);
+    render_html_hotspots(&mut output, report);
+    render_html_context(&mut output, report);
+    render_html_findings(&mut output, report);
+    render_html_notes(&mut output, report);
+    output.push_str("</main>\n</body>\n</html>\n");
 
+    output
+}
+
+fn render_html_summary(output: &mut String, report: &Report) {
     output.push_str("<h2>Summary</h2>\n<ul>\n");
     output.push_str(&format!(
         "<li>Files scanned: {}</li>\n",
@@ -390,35 +418,40 @@ pub fn render_html(report: &Report) -> String {
         report.summary.git.recent_window_days
     ));
     output.push_str("</ul>\n");
+}
 
+fn render_html_hotspots(output: &mut String, report: &Report) {
     output.push_str("<h2>Top Hotspots</h2>\n");
     if report.hotspots.is_empty() {
         output.push_str("<p>No current files were ranked as hotspots.</p>\n");
-    } else {
-        output.push_str("<table>\n<thead><tr><th class=\"numeric\">Rank</th><th>Path</th><th class=\"numeric\">Score</th><th class=\"numeric\">Risk /10</th><th class=\"numeric\">Commits</th><th class=\"numeric\">Churn lines</th><th class=\"numeric\">Recent churn</th><th class=\"numeric\">Authors</th><th class=\"numeric\">Co-changed files</th></tr></thead>\n<tbody>\n");
-        for hotspot in report.hotspots.iter().take(10) {
-            output.push_str(&format!(
-                "<tr><td class=\"numeric\">{}</td><td>{}</td><td class=\"numeric\">{:.3}</td><td class=\"numeric\">{:.1}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td></tr>\n",
-                hotspot.rank,
-                html_escape(&hotspot.path),
-                hotspot.score,
-                risk_scale(hotspot.score),
-                optional_u64(hotspot.raw_metrics.commits_per_file),
-                optional_u64(hotspot.raw_metrics.total_churn_lines),
-                optional_u64(hotspot.raw_metrics.recent_churn_lines),
-                optional_u64(hotspot.raw_metrics.author_count),
-                optional_u64(hotspot.raw_metrics.co_changed_file_count)
-            ));
-        }
-        output.push_str("</tbody>\n</table>\n");
-        if report.hotspots.len() > 10 {
-            output.push_str(&format!(
-                "<p class=\"note\">Showing top 10 of {} ranked hotspots. JSON output includes all hotspot rows.</p>\n",
-                report.hotspots.len()
-            ));
-        }
+        return;
     }
 
+    output.push_str("<table>\n<thead><tr><th class=\"numeric\">Rank</th><th>Path</th><th class=\"numeric\">Score</th><th class=\"numeric\">Risk /10</th><th class=\"numeric\">Commits</th><th class=\"numeric\">Churn lines</th><th class=\"numeric\">Recent churn</th><th class=\"numeric\">Authors</th><th class=\"numeric\">Co-changed files</th></tr></thead>\n<tbody>\n");
+    for hotspot in report.hotspots.iter().take(10) {
+        output.push_str(&format!(
+            "<tr><td class=\"numeric\">{}</td><td>{}</td><td class=\"numeric\">{:.3}</td><td class=\"numeric\">{:.1}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td></tr>\n",
+            hotspot.rank,
+            html_escape(&hotspot.path),
+            hotspot.score,
+            risk_scale(hotspot.score),
+            optional_u64(hotspot.raw_metrics.commits_per_file),
+            optional_u64(hotspot.raw_metrics.total_churn_lines),
+            optional_u64(hotspot.raw_metrics.recent_churn_lines),
+            optional_u64(hotspot.raw_metrics.author_count),
+            optional_u64(hotspot.raw_metrics.co_changed_file_count)
+        ));
+    }
+    output.push_str("</tbody>\n</table>\n");
+    if report.hotspots.len() > 10 {
+        output.push_str(&format!(
+            "<p class=\"note\">Showing top 10 of {} ranked hotspots. JSON output includes all hotspot rows.</p>\n",
+            report.hotspots.len()
+        ));
+    }
+}
+
+fn render_html_context(output: &mut String, report: &Report) {
     output.push_str("<h2>Context Estimate</h2>\n<ul>\n");
     output.push_str(&format!(
         "<li>Estimated tokens: {}</li>\n",
@@ -445,28 +478,33 @@ pub fn render_html(report: &Report) -> String {
         }
         output.push_str("</tbody>\n</table>\n");
     }
+}
 
+fn render_html_findings(output: &mut String, report: &Report) {
     output.push_str("<h2>Findings</h2>\n");
     if report.findings.is_empty() {
         output.push_str("<p>No advisory findings were produced.</p>\n");
-    } else {
-        output.push_str("<ul>\n");
-        for finding in report.findings.iter().take(10) {
-            output.push_str(&format!(
-                "<li>{}: {}</li>\n",
-                html_escape(finding.code),
-                html_escape(&finding.message)
-            ));
-        }
-        if report.findings.len() > 10 {
-            output.push_str(&format!(
-                "<li>{} additional findings are available in JSON output.</li>\n",
-                report.findings.len() - 10
-            ));
-        }
-        output.push_str("</ul>\n");
+        return;
     }
 
+    output.push_str("<ul>\n");
+    for finding in report.findings.iter().take(10) {
+        output.push_str(&format!(
+            "<li>{}: {}</li>\n",
+            html_escape(finding.code),
+            html_escape(&finding.message)
+        ));
+    }
+    if report.findings.len() > 10 {
+        output.push_str(&format!(
+            "<li>{} additional findings are available in JSON output.</li>\n",
+            report.findings.len() - 10
+        ));
+    }
+    output.push_str("</ul>\n");
+}
+
+fn render_html_notes(output: &mut String, report: &Report) {
     output.push_str("<h2>Calculation Notes</h2>\n<ul>\n");
     output.push_str("<li>Hotpath runs locally and does not require network access or telemetry for this report.</li>\n");
     output.push_str(
@@ -484,9 +522,6 @@ pub fn render_html(report: &Report) -> String {
     output.push_str("<li>Scores use the reported formula version and available local scan and Git history metrics.</li>\n");
     output.push_str("<li>Missing or incomplete local history can limit churn, ownership, and co-change signals.</li>\n");
     output.push_str("</ul>\n");
-    output.push_str("</main>\n</body>\n</html>\n");
-
-    output
 }
 
 pub fn render_sarif(report: &Report) -> Result<String, ReportCommandError> {
@@ -873,42 +908,7 @@ fn write_report_git_error(
     f: &mut fmt::Formatter<'_>,
     source: &git::GitHistoryError,
 ) -> fmt::Result {
-    match source {
-        git::GitHistoryError::NotRepository { .. } => write!(
-            f,
-            "path is not a readable Git worktree; run report from inside a repository with local history"
-        ),
-        git::GitHistoryError::OpenRepository { .. } => write!(
-            f,
-            "failed to open Git repository from the current worktree; ensure local Git metadata is readable"
-        ),
-        git::GitHistoryError::MissingHead { .. } => write!(
-            f,
-            "Git repository does not have a commit at HEAD; create an initial commit before generating a report"
-        ),
-        git::GitHistoryError::ShallowRepository { .. } => write!(
-            f,
-            "Git repository has shallow history; fetch complete local history before running report so metrics are not based on incomplete commits"
-        ),
-        git::GitHistoryError::BareRepository { .. } => write!(
-            f,
-            "Git repository has no worktree; report generation requires a local worktree"
-        ),
-        git::GitHistoryError::HeadNotCommit { source, .. } => {
-            write!(f, "Git HEAD does not resolve to a commit: {source}")
-        }
-        git::GitHistoryError::Git { context, source } => {
-            write!(f, "failed to traverse Git history while {context}: {source}")
-        }
-        git::GitHistoryError::UnsupportedAuthorIdentity { commit_id } => write!(
-            f,
-            "commit {commit_id} has an author name or email that is not valid UTF-8"
-        ),
-        git::GitHistoryError::UnsupportedPathEncoding { commit_id } => write!(
-            f,
-            "commit {commit_id} changed a path that is not valid UTF-8"
-        ),
-    }
+    git::write_git_history_error(f, source, git::GitHistoryUsage::Report)
 }
 
 fn write_report_scan_error(f: &mut fmt::Formatter<'_>, source: &ScanError) -> fmt::Result {

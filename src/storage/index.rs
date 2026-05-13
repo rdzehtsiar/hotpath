@@ -137,23 +137,7 @@ pub struct PersistedGitAnalysisRun {
     pub co_changes_observed: u64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct PersistedGitFileStats {
-    pub path: String,
-    pub commits_per_file: u64,
-    pub total_churn_added: u64,
-    pub total_churn_deleted: u64,
-    pub recent_churn_added: u64,
-    pub recent_churn_deleted: u64,
-    pub author_count: u64,
-    pub dominant_owner: Option<String>,
-    pub dominant_owner_share: Option<f64>,
-    pub first_commit_id: Option<String>,
-    pub first_commit_time: Option<i64>,
-    pub last_commit_id: Option<String>,
-    pub last_commit_time: Option<i64>,
-    pub file_age_days: Option<u64>,
-}
+pub type PersistedGitFileStats = GitFileMetrics;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedGitCoChange {
@@ -774,22 +758,8 @@ impl IndexStore {
                     source,
                 })?;
         let repo_id = ensure_repo_for_symbols(&transaction, &index_path)?;
-        let mut file_ids = BTreeMap::new();
-
-        for file in &report.files {
-            if file_ids.contains_key(&file.path) {
-                continue;
-            }
-
-            let file_id = current_file_id_for_symbols(
-                &transaction,
-                &index_path,
-                repo_id,
-                &file.path,
-                "parse file",
-            )?;
-            file_ids.insert(file.path.clone(), file_id);
-        }
+        let file_ids =
+            current_file_ids_for_parse_report(&transaction, &index_path, repo_id, report)?;
 
         {
             let mut delete = transaction
@@ -954,22 +924,8 @@ impl IndexStore {
                     source,
                 })?;
         let repo_id = ensure_repo_for_symbols(&transaction, &index_path)?;
-        let mut file_ids = BTreeMap::new();
-
-        for file in &report.files {
-            if file_ids.contains_key(&file.path) {
-                continue;
-            }
-
-            let file_id = current_file_id_for_symbols(
-                &transaction,
-                &index_path,
-                repo_id,
-                &file.path,
-                "parse file",
-            )?;
-            file_ids.insert(file.path.clone(), file_id);
-        }
+        let file_ids =
+            current_file_ids_for_parse_report(&transaction, &index_path, repo_id, report)?;
 
         replace_dependencies_for_report(&transaction, &index_path, repo_id, &file_ids, report)?;
 
@@ -1550,6 +1506,32 @@ fn current_file_id_for_symbols(
         })
 }
 
+fn current_file_ids_for_parse_report(
+    transaction: &Transaction<'_>,
+    index_path: &Path,
+    repo_id: i64,
+    report: &ParseReport,
+) -> Result<BTreeMap<String, i64>, IndexError> {
+    let mut file_ids = BTreeMap::new();
+
+    for file in &report.files {
+        if file_ids.contains_key(&file.path) {
+            continue;
+        }
+
+        let file_id = current_file_id_for_symbols(
+            transaction,
+            index_path,
+            repo_id,
+            &file.path,
+            "parse file",
+        )?;
+        file_ids.insert(file.path.clone(), file_id);
+    }
+
+    Ok(file_ids)
+}
+
 fn symbol_file_id(
     file_ids: &BTreeMap<String, i64>,
     index_path: &Path,
@@ -2109,7 +2091,7 @@ fn read_git_file_stats(
 }
 
 fn read_persisted_git_file_stats(row: &Row<'_>) -> rusqlite::Result<PersistedGitFileStats> {
-    Ok(PersistedGitFileStats {
+    Ok(GitFileMetrics {
         path: row.get(0)?,
         commits_per_file: i64_to_u64(row.get(1)?, 1)?,
         total_churn_added: i64_to_u64(row.get(2)?, 2)?,

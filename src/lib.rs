@@ -1666,18 +1666,39 @@ fn choose_explain_candidate(
     scanned_paths: &BTreeSet<&str>,
     candidates: &[String],
 ) -> Result<String, ExplainPathError> {
-    let scanned_matches = candidates
-        .iter()
-        .filter(|candidate| scanned_paths.contains(candidate.as_str()))
-        .collect::<Vec<_>>();
+    match select_unique_candidate(candidates, |candidate| scanned_paths.contains(candidate)) {
+        CandidateSelection::One(candidate) => Ok(candidate),
+        CandidateSelection::Ambiguous { first, second } => {
+            Err(ExplainPathError::AmbiguousPath { first, second })
+        }
+        CandidateSelection::None => Err(ExplainPathError::NotCurrentFile),
+    }
+}
 
-    match scanned_matches.as_slice() {
-        [candidate] => Ok((*candidate).clone()),
-        [first, second, ..] => Err(ExplainPathError::AmbiguousPath {
-            first: (*first).clone(),
-            second: (*second).clone(),
-        }),
-        [] => Err(ExplainPathError::NotCurrentFile),
+pub(crate) enum CandidateSelection {
+    None,
+    One(String),
+    Ambiguous { first: String, second: String },
+}
+
+pub(crate) fn select_unique_candidate(
+    candidates: &[String],
+    mut is_match: impl FnMut(&str) -> bool,
+) -> CandidateSelection {
+    let mut matches = candidates
+        .iter()
+        .filter(|candidate| is_match(candidate.as_str()));
+
+    let Some(first) = matches.next() else {
+        return CandidateSelection::None;
+    };
+    let Some(second) = matches.next() else {
+        return CandidateSelection::One(first.clone());
+    };
+
+    CandidateSelection::Ambiguous {
+        first: first.clone(),
+        second: second.clone(),
     }
 }
 
@@ -1724,42 +1745,7 @@ fn write_explain_git_error(
     f: &mut fmt::Formatter<'_>,
     source: &git::GitHistoryError,
 ) -> fmt::Result {
-    match source {
-        git::GitHistoryError::NotRepository { .. } => write!(
-            f,
-            "path is not a readable Git worktree; run explain from inside a repository with local history"
-        ),
-        git::GitHistoryError::OpenRepository { .. } => write!(
-            f,
-            "failed to open Git repository from the current worktree; ensure local Git metadata is readable"
-        ),
-        git::GitHistoryError::MissingHead { .. } => write!(
-            f,
-            "Git repository does not have a commit at HEAD; create an initial commit before explaining hotspot scores"
-        ),
-        git::GitHistoryError::ShallowRepository { .. } => write!(
-            f,
-            "Git repository has shallow history; fetch complete local history before running explain so metrics are not based on incomplete commits"
-        ),
-        git::GitHistoryError::BareRepository { .. } => write!(
-            f,
-            "Git repository has no worktree; hotspot score explanation requires a local worktree"
-        ),
-        git::GitHistoryError::HeadNotCommit { source, .. } => {
-            write!(f, "Git HEAD does not resolve to a commit: {source}")
-        }
-        git::GitHistoryError::Git { context, source } => {
-            write!(f, "failed to traverse Git history while {context}: {source}")
-        }
-        git::GitHistoryError::UnsupportedAuthorIdentity { commit_id } => write!(
-            f,
-            "commit {commit_id} has an author name or email that is not valid UTF-8"
-        ),
-        git::GitHistoryError::UnsupportedPathEncoding { commit_id } => write!(
-            f,
-            "commit {commit_id} changed a path that is not valid UTF-8"
-        ),
-    }
+    git::write_git_history_error(f, source, git::GitHistoryUsage::ExplainHotspot)
 }
 
 fn write_explain_persistence_error(
@@ -1774,81 +1760,11 @@ fn write_hotspots_git_error(
     f: &mut fmt::Formatter<'_>,
     source: &git::GitHistoryError,
 ) -> fmt::Result {
-    match source {
-        git::GitHistoryError::NotRepository { .. } => write!(
-            f,
-            "path is not a readable Git worktree; run hotspots from inside a repository with local history"
-        ),
-        git::GitHistoryError::OpenRepository { .. } => write!(
-            f,
-            "failed to open Git repository from the current worktree; ensure local Git metadata is readable"
-        ),
-        git::GitHistoryError::MissingHead { .. } => write!(
-            f,
-            "Git repository does not have a commit at HEAD; create an initial commit before analyzing hotspots"
-        ),
-        git::GitHistoryError::ShallowRepository { .. } => write!(
-            f,
-            "Git repository has shallow history; fetch complete local history before running hotspots so metrics are not based on incomplete commits"
-        ),
-        git::GitHistoryError::BareRepository { .. } => write!(
-            f,
-            "Git repository has no worktree; hotspot analysis requires a local worktree"
-        ),
-        git::GitHistoryError::HeadNotCommit { source, .. } => {
-            write!(f, "Git HEAD does not resolve to a commit: {source}")
-        }
-        git::GitHistoryError::Git { context, source } => {
-            write!(f, "failed to traverse Git history while {context}: {source}")
-        }
-        git::GitHistoryError::UnsupportedAuthorIdentity { commit_id } => write!(
-            f,
-            "commit {commit_id} has an author name or email that is not valid UTF-8"
-        ),
-        git::GitHistoryError::UnsupportedPathEncoding { commit_id } => write!(
-            f,
-            "commit {commit_id} changed a path that is not valid UTF-8"
-        ),
-    }
+    git::write_git_history_error(f, source, git::GitHistoryUsage::Hotspots)
 }
 
 fn write_diff_git_error(f: &mut fmt::Formatter<'_>, source: &git::GitHistoryError) -> fmt::Result {
-    match source {
-        git::GitHistoryError::NotRepository { .. } => write!(
-            f,
-            "path is not a readable Git worktree; run diff from inside a repository with local history"
-        ),
-        git::GitHistoryError::OpenRepository { .. } => write!(
-            f,
-            "failed to open Git repository from the current worktree; ensure local Git metadata is readable"
-        ),
-        git::GitHistoryError::MissingHead { .. } => write!(
-            f,
-            "Git repository does not have a commit at HEAD; create an initial commit before analyzing a diff"
-        ),
-        git::GitHistoryError::ShallowRepository { .. } => write!(
-            f,
-            "Git repository has shallow history; fetch complete local history before running diff so metrics are not based on incomplete commits"
-        ),
-        git::GitHistoryError::BareRepository { .. } => write!(
-            f,
-            "Git repository has no worktree; diff analysis requires a local worktree"
-        ),
-        git::GitHistoryError::HeadNotCommit { source, .. } => {
-            write!(f, "Git HEAD does not resolve to a commit: {source}")
-        }
-        git::GitHistoryError::Git { context, source } => {
-            write!(f, "failed to traverse Git history while {context}: {source}")
-        }
-        git::GitHistoryError::UnsupportedAuthorIdentity { commit_id } => write!(
-            f,
-            "commit {commit_id} has an author name or email that is not valid UTF-8"
-        ),
-        git::GitHistoryError::UnsupportedPathEncoding { commit_id } => write!(
-            f,
-            "commit {commit_id} changed a path that is not valid UTF-8"
-        ),
-    }
+    git::write_git_history_error(f, source, git::GitHistoryUsage::Diff)
 }
 
 fn write_hotspots_persistence_error(

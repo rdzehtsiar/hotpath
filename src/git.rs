@@ -160,43 +160,7 @@ pub enum GitExplainError {
 
 impl fmt::Display for GitHistoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotRepository { .. } => write!(
-                f,
-                "path is not a readable Git worktree; run explain-git from inside a repository with local history"
-            ),
-            Self::OpenRepository { .. } => write!(
-                f,
-                "failed to open Git repository from the current worktree; ensure local Git metadata is readable"
-            ),
-            Self::MissingHead { .. } => write!(
-                f,
-                "Git repository does not have a commit at HEAD; create an initial commit before analyzing history"
-            ),
-            Self::ShallowRepository { .. } => write!(
-                f,
-                "Git repository has shallow history; fetch complete local history before running explain-git so metrics are not based on incomplete commits"
-            ),
-            Self::BareRepository { .. } => write!(
-                f,
-                "Git repository has no worktree; Git analysis requires a local worktree"
-            ),
-            Self::HeadNotCommit { source, .. } => write!(
-                f,
-                "Git HEAD does not resolve to a commit: {source}"
-            ),
-            Self::Git { context, source } => {
-                write!(f, "failed to traverse Git history while {context}: {source}")
-            }
-            Self::UnsupportedAuthorIdentity { commit_id } => write!(
-                f,
-                "commit {commit_id} has an author name or email that is not valid UTF-8"
-            ),
-            Self::UnsupportedPathEncoding { commit_id } => write!(
-                f,
-                "commit {commit_id} changed a path that is not valid UTF-8"
-            ),
-        }
+        write_git_history_error(f, self, GitHistoryUsage::ExplainGit)
     }
 }
 
@@ -212,6 +176,94 @@ impl StdError for GitHistoryError {
             | Self::BareRepository { .. }
             | Self::UnsupportedAuthorIdentity { .. }
             | Self::UnsupportedPathEncoding { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GitHistoryUsage {
+    ExplainGit,
+    Report,
+    ExplainHotspot,
+    Hotspots,
+    Diff,
+}
+
+pub(crate) fn write_git_history_error(
+    f: &mut fmt::Formatter<'_>,
+    source: &GitHistoryError,
+    usage: GitHistoryUsage,
+) -> fmt::Result {
+    match source {
+        GitHistoryError::NotRepository { .. } => write!(
+            f,
+            "path is not a readable Git worktree; run {} from inside a repository with local history",
+            usage.command()
+        ),
+        GitHistoryError::OpenRepository { .. } => write!(
+            f,
+            "failed to open Git repository from the current worktree; ensure local Git metadata is readable"
+        ),
+        GitHistoryError::MissingHead { .. } => write!(
+            f,
+            "Git repository does not have a commit at HEAD; create an initial commit before {}",
+            usage.missing_head_action()
+        ),
+        GitHistoryError::ShallowRepository { .. } => write!(
+            f,
+            "Git repository has shallow history; fetch complete local history before running {} so metrics are not based on incomplete commits",
+            usage.command()
+        ),
+        GitHistoryError::BareRepository { .. } => write!(
+            f,
+            "Git repository has no worktree; {} requires a local worktree",
+            usage.worktree_subject()
+        ),
+        GitHistoryError::HeadNotCommit { source, .. } => {
+            write!(f, "Git HEAD does not resolve to a commit: {source}")
+        }
+        GitHistoryError::Git { context, source } => {
+            write!(f, "failed to traverse Git history while {context}: {source}")
+        }
+        GitHistoryError::UnsupportedAuthorIdentity { commit_id } => write!(
+            f,
+            "commit {commit_id} has an author name or email that is not valid UTF-8"
+        ),
+        GitHistoryError::UnsupportedPathEncoding { commit_id } => write!(
+            f,
+            "commit {commit_id} changed a path that is not valid UTF-8"
+        ),
+    }
+}
+
+impl GitHistoryUsage {
+    fn command(self) -> &'static str {
+        match self {
+            Self::ExplainGit => "explain-git",
+            Self::Report => "report",
+            Self::ExplainHotspot => "explain",
+            Self::Hotspots => "hotspots",
+            Self::Diff => "diff",
+        }
+    }
+
+    fn missing_head_action(self) -> &'static str {
+        match self {
+            Self::ExplainGit => "analyzing history",
+            Self::Report => "generating a report",
+            Self::ExplainHotspot => "explaining hotspot scores",
+            Self::Hotspots => "analyzing hotspots",
+            Self::Diff => "analyzing a diff",
+        }
+    }
+
+    fn worktree_subject(self) -> &'static str {
+        match self {
+            Self::ExplainGit => "Git analysis",
+            Self::Report => "report generation",
+            Self::ExplainHotspot => "hotspot score explanation",
+            Self::Hotspots => "hotspot analysis",
+            Self::Diff => "diff analysis",
         }
     }
 }
@@ -938,34 +990,20 @@ fn choose_requested_candidate(
     candidates: &[String],
     metric_paths: &BTreeSet<&str>,
 ) -> Result<String, GitExplainError> {
-    let metric_matches = candidates
-        .iter()
-        .filter(|candidate| metric_paths.contains(candidate.as_str()))
-        .collect::<Vec<_>>();
-
-    match metric_matches.as_slice() {
-        [candidate] => return Ok((*candidate).clone()),
-        [first, second, ..] => {
-            return Err(GitExplainError::AmbiguousPath {
-                first: (*first).clone(),
-                second: (*second).clone(),
-            });
+    match crate::select_unique_candidate(candidates, |candidate| metric_paths.contains(candidate)) {
+        crate::CandidateSelection::One(candidate) => return Ok(candidate),
+        crate::CandidateSelection::Ambiguous { first, second } => {
+            return Err(GitExplainError::AmbiguousPath { first, second });
         }
-        [] => {}
+        crate::CandidateSelection::None => {}
     }
 
-    let existing_matches = candidates
-        .iter()
-        .filter(|candidate| workdir.join(candidate).exists())
-        .collect::<Vec<_>>();
-
-    match existing_matches.as_slice() {
-        [candidate] => Ok((*candidate).clone()),
-        [first, second, ..] => Err(GitExplainError::AmbiguousPath {
-            first: (*first).clone(),
-            second: (*second).clone(),
-        }),
-        [] => candidates
+    match crate::select_unique_candidate(candidates, |candidate| workdir.join(candidate).exists()) {
+        crate::CandidateSelection::One(candidate) => Ok(candidate),
+        crate::CandidateSelection::Ambiguous { first, second } => {
+            Err(GitExplainError::AmbiguousPath { first, second })
+        }
+        crate::CandidateSelection::None => candidates
             .first()
             .cloned()
             .ok_or(GitExplainError::PathOutsideRepository),
