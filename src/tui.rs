@@ -22,12 +22,12 @@ use ratatui::{Frame, Terminal};
 use crate::complexity::{self, ComplexityReport, ComplexitySummary, ComplexitySymbolRecord};
 use crate::dependency::{self, FileDependencyFan, ResolvedDependencyEdge};
 use crate::git;
-use crate::report::{Report, ReportContext, ReportFinding, ReportGitSummary, ReportHotspot};
+use crate::report::{self, Report, ReportFinding, ReportHotspot};
 use crate::storage;
 use crate::{
     estimate_context, parse, ranked_hotspot_scores_from_scan_and_git, ContextBudgetStatus,
     ContextOptions, ContextSkippedReason, FileRecord, ParseImportRecord, ParseReport, ParseSummary,
-    ParseSymbolRecord, ScanError, ScanReport, ScanSummary, REPORT_SCHEMA_VERSION,
+    ParseSymbolRecord, ScanError, ScanReport, ScanSummary,
 };
 
 type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
@@ -103,7 +103,6 @@ impl TuiSnapshot {
             &analysis.co_changes,
         );
         let context = estimate_context(&scan.files, ContextOptions::default());
-        let context_estimated_tokens = context.summary.estimated_tokens;
         let hotspots = ranked.iter().map(ReportHotspot::from).collect::<Vec<_>>();
         let findings = hotspots.iter().map(ReportFinding::from).collect::<Vec<_>>();
         let mut index = storage::index::IndexStore::open(&analysis.worktree_root)
@@ -127,29 +126,8 @@ impl TuiSnapshot {
         index
             .persist_hotspots(scan_run.id, &ranked)
             .map_err(TuiSnapshotError::PersistHotspots)?;
-        let report = Report {
-            schema_version: REPORT_SCHEMA_VERSION,
-            summary: crate::ReportSummary {
-                scan: scan.summary(),
-                git: ReportGitSummary {
-                    head_commit_id: analysis.head_commit_id,
-                    recent_window_days: analysis.recent_window_days as u64,
-                    file_metric_count: analysis.file_metrics.len() as u64,
-                    co_change_count: analysis.co_changes.len() as u64,
-                },
-                hotspot_count: hotspots.len() as u64,
-                context_estimated_tokens,
-            },
-            hotspots,
-            context: ReportContext {
-                options: context.options,
-                summary: context.summary,
-                groups: context.groups,
-                skipped: context.skipped,
-                budget: context.budget,
-            },
-            findings,
-        };
+        let report =
+            report::report_from_scan_analysis(&scan, &analysis, context, hotspots, findings);
 
         Ok(Self::from_parts(report, scan, parse, complexity))
     }
@@ -194,38 +172,8 @@ impl TuiSymbolSnapshot {
     fn from_parse(parse: ParseReport) -> Self {
         let mut symbols = parse.symbols;
         let mut imports = parse.imports;
-        symbols.sort_by(|left, right| {
-            (
-                &left.path,
-                left.start_line,
-                left.end_line,
-                &left.kind,
-                &left.name,
-            )
-                .cmp(&(
-                    &right.path,
-                    right.start_line,
-                    right.end_line,
-                    &right.kind,
-                    &right.name,
-                ))
-        });
-        imports.sort_by(|left, right| {
-            (
-                &left.path,
-                left.start_line,
-                left.end_line,
-                &left.kind,
-                &left.target,
-            )
-                .cmp(&(
-                    &right.path,
-                    right.start_line,
-                    right.end_line,
-                    &right.kind,
-                    &right.target,
-                ))
-        });
+        parse::sort_symbol_records(&mut symbols);
+        parse::sort_import_records(&mut imports);
         let summary = ParseReport {
             warnings: parse.warnings,
             files: parse.files,
@@ -245,22 +193,7 @@ impl TuiSymbolSnapshot {
 impl TuiComplexitySnapshot {
     fn from_complexity(complexity: ComplexityReport) -> Self {
         let mut symbols = complexity.symbols;
-        symbols.sort_by(|left, right| {
-            (
-                &left.path,
-                left.start_line,
-                left.end_line,
-                &left.kind,
-                &left.name,
-            )
-                .cmp(&(
-                    &right.path,
-                    right.start_line,
-                    right.end_line,
-                    &right.kind,
-                    &right.name,
-                ))
-        });
+        complexity::sort_symbol_records(&mut symbols);
 
         Self {
             summary: complexity.summary,
@@ -1679,14 +1612,15 @@ mod tests {
     use super::*;
     use crate::context::{ContextSkippedReason, ContextSkippedRow, ContextSummary};
     use crate::parse::{ParseFileReason, ParseFileStatus};
-    use crate::report::{ReportFindingLevel, ReportSummary};
+    use crate::report::{
+        ReportContext, ReportFindingLevel, ReportGitSummary, ReportSummary, REPORT_SCHEMA_VERSION,
+    };
     use crate::scoring::{
         FormulaVersion, NormalizedMetric, NormalizedScoreMetrics, RawScoreMetrics, ScoreLimitation,
         WeightedTerm,
     };
-    use crate::{
-        ContentKind, FileRecord, ParseFileRecord, ParseImportRecord, ParseSymbolRecord, ScanReport,
-    };
+    use crate::test_support::parse_import as import;
+    use crate::{ContentKind, FileRecord, ParseFileRecord, ParseSymbolRecord, ScanReport};
 
     #[test]
     fn quit_keys_are_q_and_escape_key_presses() {
@@ -2183,16 +2117,7 @@ mod tests {
                 file_record("docs/guide.md"),
             ],
         );
-        let parse = ParseReport {
-            warnings: Vec::new(),
-            files: scan
-                .files
-                .iter()
-                .map(|file| parse_file(&file.path))
-                .collect(),
-            symbols: Vec::new(),
-            imports: Vec::new(),
-        };
+        let parse = parse::scaffold_report_from_scan(&scan);
         let complexity = complexity::report_from_parse(&parse);
         let snapshot = TuiSnapshot::from_parts(empty_report(&scan), scan, parse, complexity);
 
@@ -2244,16 +2169,7 @@ mod tests {
             Vec::new(),
             vec![file_record("app/main.rs"), file_record("src/main.rs")],
         );
-        let parse = ParseReport {
-            warnings: Vec::new(),
-            files: scan
-                .files
-                .iter()
-                .map(|file| parse_file(&file.path))
-                .collect(),
-            symbols: Vec::new(),
-            imports: Vec::new(),
-        };
+        let parse = parse::scaffold_report_from_scan(&scan);
         let complexity = complexity::report_from_parse(&parse);
         let snapshot = TuiSnapshot::from_parts(empty_report(&scan), scan, parse, complexity);
 
@@ -2615,16 +2531,6 @@ mod tests {
             parent: Some("impl Widget".to_owned()),
             cyclomatic_complexity: Some(8),
             max_control_flow_nesting: Some(3),
-        }
-    }
-
-    fn import(path: &str, target: &str, kind: &str) -> ParseImportRecord {
-        ParseImportRecord {
-            path: path.to_owned(),
-            target: target.to_owned(),
-            kind: kind.to_owned(),
-            start_line: 1,
-            end_line: 1,
         }
     }
 }

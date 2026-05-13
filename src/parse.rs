@@ -236,6 +236,18 @@ pub(crate) fn report_from_scan(root: &Path, scan: &ScanReport) -> ParseReport {
     }
 
     sort_parse_warnings(&mut warnings);
+    sort_symbol_records(&mut symbols);
+    sort_import_records(&mut imports);
+
+    ParseReport {
+        warnings,
+        files,
+        symbols,
+        imports,
+    }
+}
+
+pub(crate) fn sort_symbol_records(symbols: &mut [ParseSymbolRecord]) {
     symbols.sort_by(|left, right| {
         (
             &left.path,
@@ -252,6 +264,9 @@ pub(crate) fn report_from_scan(root: &Path, scan: &ScanReport) -> ParseReport {
                 &right.name,
             ))
     });
+}
+
+pub(crate) fn sort_import_records(imports: &mut [ParseImportRecord]) {
     imports.sort_by(|left, right| {
         (
             &left.path,
@@ -268,13 +283,6 @@ pub(crate) fn report_from_scan(root: &Path, scan: &ScanReport) -> ParseReport {
                 &right.target,
             ))
     });
-
-    ParseReport {
-        warnings,
-        files,
-        symbols,
-        imports,
-    }
 }
 
 pub fn scaffold_report_from_scan(scan: &ScanReport) -> ParseReport {

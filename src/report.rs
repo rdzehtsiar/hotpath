@@ -15,7 +15,7 @@ use crate::scoring::{
     FormulaVersion, NormalizedScoreMetrics, RawScoreMetrics, ScoreLimitation, WeightedTerm,
 };
 use crate::storage;
-use crate::{estimate_context, ContextOptions, ScanError, ScanSummary};
+use crate::{estimate_context, ContextOptions, ContextReport, ScanError, ScanReport, ScanSummary};
 
 pub const REPORT_SCHEMA_VERSION: &str = "hotpath.report.v1";
 const SARIF_HOTSPOT_RULE_ID: &str = "hotpath.hotspot.risk";
@@ -641,16 +641,29 @@ fn build_report_and_persist(
         .map_err(ReportCommandError::PersistHotspots)?;
 
     let context = estimate_context(&scan.files, ContextOptions::default());
-    let context_estimated_tokens = context.summary.estimated_tokens;
     let hotspots = ranked.iter().map(ReportHotspot::from).collect::<Vec<_>>();
     let findings = hotspots.iter().map(ReportFinding::from).collect::<Vec<_>>();
 
-    Ok(Report {
+    Ok(report_from_scan_analysis(
+        &scan, &analysis, context, hotspots, findings,
+    ))
+}
+
+pub(crate) fn report_from_scan_analysis(
+    scan: &ScanReport,
+    analysis: &git::GitAnalysis,
+    context: ContextReport,
+    hotspots: Vec<ReportHotspot>,
+    findings: Vec<ReportFinding>,
+) -> Report {
+    let context_estimated_tokens = context.summary.estimated_tokens;
+
+    Report {
         schema_version: REPORT_SCHEMA_VERSION,
         summary: ReportSummary {
             scan: scan.summary(),
             git: ReportGitSummary {
-                head_commit_id: analysis.head_commit_id,
+                head_commit_id: analysis.head_commit_id.clone(),
                 recent_window_days: analysis.recent_window_days as u64,
                 file_metric_count: analysis.file_metrics.len() as u64,
                 co_change_count: analysis.co_changes.len() as u64,
@@ -667,7 +680,7 @@ fn build_report_and_persist(
             budget: context.budget,
         },
         findings,
-    })
+    }
 }
 
 fn absolute_path(current_dir: &Path, path: &Path) -> PathBuf {

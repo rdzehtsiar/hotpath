@@ -239,17 +239,10 @@ fn sort_edges(edges: &mut [ResolvedDependencyEdge]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{test_support::parsed_text_file as file, ParseFileRecord, ParseImportRecord};
-
-    fn import(path: &str, target: &str, kind: &str) -> ParseImportRecord {
-        ParseImportRecord {
-            path: path.to_owned(),
-            target: target.to_owned(),
-            kind: kind.to_owned(),
-            start_line: 1,
-            end_line: 1,
-        }
-    }
+    use crate::{
+        test_support::{parse_import as import, parsed_text_file as file},
+        ParseFileRecord, ParseImportRecord,
+    };
 
     fn report(files: Vec<ParseFileRecord>, imports: Vec<ParseImportRecord>) -> ParseReport {
         ParseReport {

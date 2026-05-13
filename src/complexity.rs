@@ -309,6 +309,25 @@ fn ranked_symbol_key(symbol: &ComplexitySymbolRecord) -> RankedSymbolKey<'_> {
     }
 }
 
+pub(crate) fn sort_symbol_records(symbols: &mut [ComplexitySymbolRecord]) {
+    symbols.sort_by(|left, right| {
+        (
+            &left.path,
+            left.start_line,
+            left.end_line,
+            &left.kind,
+            &left.name,
+        )
+            .cmp(&(
+                &right.path,
+                right.start_line,
+                right.end_line,
+                &right.kind,
+                &right.name,
+            ))
+    });
+}
+
 fn is_function_or_method(kind: &str) -> bool {
     matches!(kind, "function" | "method")
 }
