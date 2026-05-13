@@ -53,7 +53,7 @@ enum Commands {
     /// Check the local Hotpath index health.
     Doctor,
 
-    /// Open the terminal user interface.
+    /// Open the early keyboard-first terminal user interface.
     Tui,
 }
 

@@ -26,5 +26,25 @@ fn top_level_help_lists_tui_command() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
 
     assert!(stdout.contains("tui"));
-    assert!(stdout.contains("Open the terminal user interface"));
+    assert!(stdout.contains("Open the early keyboard-first terminal user interface"));
+}
+
+#[test]
+fn tui_help_describes_early_keyboard_first_tui() {
+    let output = hotpath(&["tui", "--help"], Path::new(env!("CARGO_MANIFEST_DIR")));
+
+    assert!(
+        output.status.success(),
+        "hotpath tui --help failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+
+    assert!(stdout.contains("Open the early keyboard-first terminal user interface"));
+    assert!(stdout.contains("Usage:"));
+    assert!(stdout.contains("tui"));
+    assert!(stdout.contains("--help"));
 }

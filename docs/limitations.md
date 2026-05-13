@@ -4,9 +4,10 @@ Hotpath is at the beginning of development. The repository currently contains
 an early Rust CLI with scanner, parser, complexity, dependency graph, index
 health, Git metric, hotspot ranking, hotspot explanation, and context estimate
 commands, plus early repository reports, CI risk gating, and committed-tree
-diff and PR risk reports. There is no released binary, stable CLI contract,
-stable index format, stable report compatibility promise, or stable Git/scoring
-compatibility promise yet.
+diff and PR risk reports. It also contains an early `hotpath tui` terminal UI
+for local, offline repository exploration. There is no released binary, stable
+CLI contract, stable TUI contract, stable index format, stable report
+compatibility promise, or stable Git/scoring compatibility promise yet.
 
 This page documents the limits Hotpath should make explicit as it develops.
 
@@ -20,11 +21,14 @@ extraction with `hotpath parse`, parser-derived complexity summaries with
 hotspot ranking with `hotpath hotspots`, and per-file hotspot explanation with
 `hotpath explain`, and offline AI context cost estimation with `hotpath
 context`, plus `hotpath report`, `hotpath ci`, `hotpath diff`, and `hotpath pr`
-for local reports and gates. These are not stable interfaces.
+for local reports and gates. `hotpath tui` provides an early terminal-native,
+keyboard-first interface over local scan, Git, hotspot, symbol, coupling, and
+context facts; it does not require a mouse and does not require network access.
+These are not stable interfaces.
 
 Hotpath does not currently provide stable Git analysis or scoring compatibility,
 broad parser/language support, complete dependency analysis, architecture
-rules, or a terminal UI.
+rules, or a stable terminal UI.
 
 Future commands, crate layout, data models, scoring formulas, and output formats
 may change while the product contract and first implementation milestones are

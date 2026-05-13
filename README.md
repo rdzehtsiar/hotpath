@@ -37,7 +37,10 @@ The repository currently contains an early Rust CLI with `hotpath scan`,
 `hotpath parse`, `hotpath complexity`, `hotpath graph`, `hotpath doctor`,
 `hotpath explain-git`, `hotpath hotspots`, `hotpath explain`, and
 `hotpath context`, `hotpath report`, and `hotpath ci`, plus early `hotpath diff`
-and `hotpath pr` commands for committed-tree diff risk reports. The scanner
+and `hotpath pr` commands for committed-tree diff risk reports. It also
+contains an early `hotpath tui` terminal UI for local, offline exploration of
+the same repository facts. The TUI is terminal-native and keyboard-first, with
+no mouse required, but it is unstable and not a stable UI contract. The scanner
 reports local file facts and warnings, scan and analysis commands persist
 derived local SQLite index data at
 `.hotpath/index.db`, Git analysis explains local history for requested paths,
@@ -69,10 +72,10 @@ currently use schema identifier `hotpath.diff.v1`. `hotpath report --json`
 currently uses schema identifier `hotpath.report.v1`; `hotpath report --sarif`
 emits SARIF 2.1.0 for hotspot findings.
 
-There is no released binary, stable CLI contract, stable index format,
-stable report compatibility promise, stable Git analysis compatibility promise,
-broad parser/language support, complete dependency analysis, architecture rules,
-or terminal UI yet.
+There is no released binary, stable CLI contract, stable TUI contract, stable
+index format, stable report compatibility promise, stable Git analysis
+compatibility promise, broad parser/language support, complete dependency
+analysis, or architecture rules yet.
 
 Expect the crate layout, commands, data model, scoring formulas, output formats, and documentation to change as the product contract and first implementation milestones are built.
 

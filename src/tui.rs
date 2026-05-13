@@ -2149,6 +2149,7 @@ mod tests {
             TuiView::GitDetail,
             TuiView::CouplingGraph,
             TuiView::ContextBudgeting,
+            TuiView::ExplainScore,
         ];
 
         assert_eq!(
@@ -2161,6 +2162,7 @@ mod tests {
                 "Git Detail",
                 "Coupling Graph",
                 "Context Budgeting",
+                "Explain Score",
             ]
         );
         assert!(milestone_views
