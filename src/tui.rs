@@ -380,7 +380,9 @@ fn run_app(terminal: &mut TuiTerminal, snapshot: &TuiSnapshot) -> io::Result<()>
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TuiView {
     Hotspots,
+    RepoTree,
     FileDetail,
+    SymbolDetail,
     GitDetail,
     ExplainScore,
 }
@@ -389,9 +391,42 @@ impl TuiView {
     fn title(self) -> &'static str {
         match self {
             Self::Hotspots => "Hotspots",
+            Self::RepoTree => "Repo Tree",
             Self::FileDetail => "File Detail",
+            Self::SymbolDetail => "Symbol Detail",
             Self::GitDetail => "Git Detail",
             Self::ExplainScore => "Explain Score",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SymbolKey {
+    path: String,
+    start_line: u64,
+    end_line: u64,
+    kind: String,
+    name: String,
+}
+
+impl SymbolKey {
+    fn from_parse(symbol: &ParseSymbolRecord) -> Self {
+        Self {
+            path: symbol.path.clone(),
+            start_line: symbol.start_line,
+            end_line: symbol.end_line,
+            kind: symbol.kind.clone(),
+            name: symbol.name.clone(),
+        }
+    }
+
+    fn from_complexity(symbol: &ComplexitySymbolRecord) -> Self {
+        Self {
+            path: symbol.path.clone(),
+            start_line: symbol.start_line,
+            end_line: symbol.end_line,
+            kind: symbol.kind.clone(),
+            name: symbol.name.clone(),
         }
     }
 }
@@ -460,8 +495,10 @@ impl SearchState {
 pub struct TuiAppState {
     current_view: TuiView,
     current_path: Option<String>,
+    current_symbol: Option<SymbolKey>,
     back_stack: Vec<TuiView>,
     path_stack: Vec<Option<String>>,
+    symbol_stack: Vec<Option<SymbolKey>>,
     selections: BTreeMap<TuiView, ListSelection>,
     search: Option<SearchState>,
     status: Option<String>,
@@ -473,15 +510,19 @@ impl Default for TuiAppState {
     fn default() -> Self {
         let mut selections = BTreeMap::new();
         selections.insert(TuiView::Hotspots, ListSelection::default());
+        selections.insert(TuiView::RepoTree, ListSelection::default());
         selections.insert(TuiView::FileDetail, ListSelection::default());
+        selections.insert(TuiView::SymbolDetail, ListSelection::default());
         selections.insert(TuiView::GitDetail, ListSelection::default());
         selections.insert(TuiView::ExplainScore, ListSelection::default());
 
         Self {
             current_view: TuiView::Hotspots,
             current_path: None,
+            current_symbol: None,
             back_stack: Vec::new(),
             path_stack: Vec::new(),
+            symbol_stack: Vec::new(),
             selections,
             search: None,
             status: None,
@@ -599,6 +640,7 @@ fn reduce_key_with_editor<F>(
             state.selection_for_current_view_mut().move_previous();
         }
         KeyCode::Enter => drill_down(state, snapshot, &rows),
+        KeyCode::Char('t') => open_repo_tree(state),
         KeyCode::Char('x') => explain_score(state, snapshot, &rows),
         KeyCode::Char('e') => {
             let resolution = resolve_editor_from_env(|name| {
@@ -618,6 +660,7 @@ fn reduce_escape(state: &mut TuiAppState) {
 
     if let Some(previous) = state.back_stack.pop() {
         state.current_path = state.path_stack.pop().flatten();
+        state.current_symbol = state.symbol_stack.pop().flatten();
         state.current_view = previous;
         state.status = Some(format!("Back to {}", previous.title()));
     } else {
@@ -636,6 +679,9 @@ fn drill_down(state: &mut TuiAppState, snapshot: &TuiSnapshot, rows: &[String]) 
         TuiView::Hotspots => {
             hotspot_path_from_row(snapshot, &row_text).map(|path| (TuiView::FileDetail, path))
         }
+        TuiView::RepoTree => repo_tree_path_from_row(snapshot, &row_text)
+            .filter(|path| file_for_path(snapshot, path).is_some())
+            .map(|path| (TuiView::FileDetail, path)),
         TuiView::FileDetail => state
             .current_path
             .as_ref()
@@ -643,8 +689,19 @@ fn drill_down(state: &mut TuiAppState, snapshot: &TuiSnapshot, rows: &[String]) 
                 is_git_detail_row(&row_text) && hotspot_for_path(snapshot, path).is_some()
             })
             .cloned()
-            .map(|path| (TuiView::GitDetail, path)),
-        TuiView::GitDetail | TuiView::ExplainScore => None,
+            .map(|path| (TuiView::GitDetail, path))
+            .or_else(|| {
+                let symbol = state
+                    .current_path
+                    .as_deref()
+                    .and_then(|path| symbol_from_file_detail_row(snapshot, path, &row_text));
+                symbol.map(|symbol| {
+                    let path = symbol.path.clone();
+                    push_symbol_view(state, symbol);
+                    (TuiView::SymbolDetail, path)
+                })
+            }),
+        TuiView::SymbolDetail | TuiView::GitDetail | TuiView::ExplainScore => None,
     };
 
     let Some((to, path)) = next else {
@@ -652,7 +709,9 @@ fn drill_down(state: &mut TuiAppState, snapshot: &TuiSnapshot, rows: &[String]) 
         return;
     };
 
-    push_view(state, to, Some(path.clone()));
+    if to != TuiView::SymbolDetail {
+        push_view(state, to, Some(path.clone()));
+    }
     state.last_action = Some(TuiAction::DrillDown {
         from,
         to,
@@ -669,9 +728,11 @@ fn explain_score(state: &mut TuiAppState, snapshot: &TuiSnapshot, rows: &[String
 
     let path = match state.current_view {
         TuiView::Hotspots => hotspot_path_from_row(snapshot, &row_text),
-        TuiView::FileDetail | TuiView::GitDetail | TuiView::ExplainScore => {
-            state.current_path.clone()
-        }
+        TuiView::RepoTree => repo_tree_path_from_row(snapshot, &row_text),
+        TuiView::FileDetail
+        | TuiView::SymbolDetail
+        | TuiView::GitDetail
+        | TuiView::ExplainScore => state.current_path.clone(),
     };
     let Some(path) = path.filter(|path| hotspot_for_path(snapshot, path).is_some()) else {
         state.status = Some("No hotspot score available for this file".to_owned());
@@ -689,6 +750,13 @@ fn explain_score(state: &mut TuiAppState, snapshot: &TuiSnapshot, rows: &[String
     state.status = Some(format!("Explain score: {path}"));
 }
 
+fn open_repo_tree(state: &mut TuiAppState) {
+    if state.current_view != TuiView::RepoTree {
+        push_view(state, TuiView::RepoTree, None);
+    }
+    state.status = Some("Repo tree".to_owned());
+}
+
 fn push_view(state: &mut TuiAppState, next_view: TuiView, next_path: Option<String>) {
     if state.current_view == next_view && state.current_path == next_path {
         return;
@@ -696,8 +764,21 @@ fn push_view(state: &mut TuiAppState, next_view: TuiView, next_path: Option<Stri
 
     state.back_stack.push(state.current_view);
     state.path_stack.push(state.current_path.clone());
+    state.symbol_stack.push(state.current_symbol.clone());
     state.current_view = next_view;
     state.current_path = next_path;
+    state.current_symbol = None;
+    state.selection_for_current_view_mut().selected = 0;
+    state.search = None;
+}
+
+fn push_symbol_view(state: &mut TuiAppState, symbol: &ParseSymbolRecord) {
+    state.back_stack.push(state.current_view);
+    state.path_stack.push(state.current_path.clone());
+    state.symbol_stack.push(state.current_symbol.clone());
+    state.current_view = TuiView::SymbolDetail;
+    state.current_path = Some(symbol.path.clone());
+    state.current_symbol = Some(SymbolKey::from_parse(symbol));
     state.selection_for_current_view_mut().selected = 0;
     state.search = None;
 }
@@ -732,7 +813,7 @@ fn clamp_current_selection(state: &mut TuiAppState, snapshot: &TuiSnapshot) {
 }
 
 fn filtered_visible_rows(snapshot: &TuiSnapshot, state: &TuiAppState) -> Vec<String> {
-    let rows = visible_rows(snapshot, state.current_view, state.current_path.as_deref());
+    let rows = visible_rows(snapshot, state);
     let Some(search) = &state.search else {
         return rows;
     };
@@ -746,16 +827,31 @@ fn filtered_visible_rows(snapshot: &TuiSnapshot, state: &TuiAppState) -> Vec<Str
         .collect()
 }
 
-fn visible_rows(snapshot: &TuiSnapshot, view: TuiView, path: Option<&str>) -> Vec<String> {
-    match view {
+fn visible_rows(snapshot: &TuiSnapshot, state: &TuiAppState) -> Vec<String> {
+    match state.current_view {
         TuiView::Hotspots => hotspot_rows(snapshot),
-        TuiView::FileDetail => path
+        TuiView::RepoTree => repo_tree_rows(snapshot)
+            .into_iter()
+            .map(|row| row.text)
+            .collect(),
+        TuiView::FileDetail => state
+            .current_path
+            .as_deref()
             .map(|path| file_detail_rows(snapshot, path))
             .unwrap_or_else(|| vec!["No file selected.".to_owned()]),
-        TuiView::GitDetail => path
+        TuiView::SymbolDetail => state
+            .current_symbol
+            .as_ref()
+            .map(|symbol| symbol_detail_rows(snapshot, symbol))
+            .unwrap_or_else(|| vec!["No symbol selected.".to_owned()]),
+        TuiView::GitDetail => state
+            .current_path
+            .as_deref()
             .map(|path| git_detail_rows(snapshot, path))
             .unwrap_or_else(|| vec!["No file selected.".to_owned()]),
-        TuiView::ExplainScore => path
+        TuiView::ExplainScore => state
+            .current_path
+            .as_deref()
             .map(|path| explain_score_rows(snapshot, path))
             .unwrap_or_else(|| vec!["No file selected.".to_owned()]),
     }
@@ -783,6 +879,7 @@ fn hotspot_rows(snapshot: &TuiSnapshot) -> Vec<String> {
 
 fn file_detail_rows(snapshot: &TuiSnapshot, path: &str) -> Vec<String> {
     let mut rows = vec![format!("File: {path}")];
+    rows.push("Repo tree: press t".to_owned());
 
     if let Some(file) = file_for_path(snapshot, path) {
         rows.extend([
@@ -824,15 +921,120 @@ fn file_detail_rows(snapshot: &TuiSnapshot, path: &str) -> Vec<String> {
         rows.push("Related symbols: none".to_owned());
     } else {
         rows.push(format!("Related symbols: {}", symbols.len()));
-        rows.extend(symbols.into_iter().take(8).map(|symbol| {
-            format!(
-                "Symbol: {} {} lines {}-{}",
-                symbol.kind, symbol.name, symbol.start_line, symbol.end_line
-            )
-        }));
+        rows.extend(symbols.into_iter().take(8).map(symbol_row_text));
     }
 
     rows
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepoTreeRow {
+    path: String,
+    text: String,
+    is_file: bool,
+}
+
+#[derive(Debug, Default)]
+struct RepoTreeNode {
+    children: BTreeMap<String, RepoTreeNode>,
+    file_path: Option<String>,
+}
+
+fn repo_tree_rows(snapshot: &TuiSnapshot) -> Vec<RepoTreeRow> {
+    let mut root = RepoTreeNode::default();
+    for file in &snapshot.scan.files {
+        insert_repo_tree_path(&mut root, &file.path);
+    }
+
+    let mut rows = Vec::new();
+    append_repo_tree_rows(&root, 0, &mut rows);
+    if rows.is_empty() {
+        rows.push(RepoTreeRow {
+            path: String::new(),
+            text: "Repository tree: no scanned files".to_owned(),
+            is_file: false,
+        });
+    }
+    rows
+}
+
+fn insert_repo_tree_path(root: &mut RepoTreeNode, path: &str) {
+    let mut node = root;
+    for part in path.split('/').filter(|part| !part.is_empty()) {
+        node = node.children.entry(part.to_owned()).or_default();
+    }
+    node.file_path = Some(path.to_owned());
+}
+
+fn append_repo_tree_rows(node: &RepoTreeNode, depth: usize, rows: &mut Vec<RepoTreeRow>) {
+    let (dirs, files): (Vec<_>, Vec<_>) = node
+        .children
+        .iter()
+        .partition(|(_, child)| child.file_path.is_none());
+
+    for (name, child) in dirs {
+        let path = repo_tree_display_path(child);
+        rows.push(RepoTreeRow {
+            path,
+            text: format!("{}[dir] {name}/", "  ".repeat(depth)),
+            is_file: false,
+        });
+        append_repo_tree_rows(child, depth + 1, rows);
+    }
+
+    for (_name, child) in files {
+        if let Some(path) = &child.file_path {
+            rows.push(RepoTreeRow {
+                path: path.clone(),
+                text: format!("{}[file] {path}", "  ".repeat(depth)),
+                is_file: true,
+            });
+        }
+    }
+}
+
+fn repo_tree_display_path(node: &RepoTreeNode) -> String {
+    node.file_path.clone().unwrap_or_default()
+}
+
+fn symbol_detail_rows(snapshot: &TuiSnapshot, key: &SymbolKey) -> Vec<String> {
+    let parse_symbol = parse_symbol_for_key(snapshot, key);
+    let complexity_symbol = complexity_symbol_for_key(snapshot, key);
+    let Some(symbol) = parse_symbol else {
+        return vec![
+            format!("File: {}", key.path),
+            format!("Symbol: {} {}", key.kind, key.name),
+            "Parser facts: symbol not present in current snapshot".to_owned(),
+        ];
+    };
+    let length_lines = complexity_symbol
+        .map(|symbol| symbol.length_lines)
+        .unwrap_or(symbol.end_line - symbol.start_line + 1);
+    let function_length_lines = complexity_symbol.and_then(|symbol| symbol.function_length_lines);
+    let is_large_symbol = complexity_symbol.map(|symbol| symbol.is_large_symbol);
+
+    vec![
+        format!("File: {}", symbol.path),
+        format!("Symbol: {} {}", symbol.kind, symbol.name),
+        format!("Kind: {}", symbol.kind),
+        format!("Range: lines {}-{}", symbol.start_line, symbol.end_line),
+        format!("Parent: {}", optional_string(symbol.parent.as_deref())),
+        format!("Nesting depth: {}", symbol.nesting_depth),
+        format!("Length lines: {length_lines}"),
+        format!(
+            "Function length lines: {}",
+            optional_u64(function_length_lines)
+        ),
+        format!(
+            "Cyclomatic complexity: {}",
+            optional_u64(symbol.cyclomatic_complexity)
+        ),
+        format!(
+            "Max control flow nesting: {}",
+            optional_u64(symbol.max_control_flow_nesting)
+        ),
+        format!("Large symbol: {}", optional_bool(is_large_symbol)),
+    ]
 }
 
 fn git_detail_rows(snapshot: &TuiSnapshot, path: &str) -> Vec<String> {
@@ -943,6 +1145,13 @@ fn hotspot_path_from_row(snapshot: &TuiSnapshot, row_text: &str) -> Option<Strin
         .map(|hotspot| hotspot.path.clone())
 }
 
+fn repo_tree_path_from_row(snapshot: &TuiSnapshot, row_text: &str) -> Option<String> {
+    repo_tree_rows(snapshot)
+        .into_iter()
+        .find(|row| row.is_file && row.text == row_text)
+        .map(|row| row.path)
+}
+
 fn hotspot_for_path<'a>(snapshot: &'a TuiSnapshot, path: &str) -> Option<&'a ReportHotspot> {
     snapshot
         .report
@@ -964,6 +1173,45 @@ fn symbols_for_path<'a>(snapshot: &'a TuiSnapshot, path: &str) -> Vec<&'a ParseS
         .collect()
 }
 
+fn symbol_from_file_detail_row<'a>(
+    snapshot: &'a TuiSnapshot,
+    path: &str,
+    row_text: &str,
+) -> Option<&'a ParseSymbolRecord> {
+    symbols_for_path(snapshot, path)
+        .into_iter()
+        .find(|symbol| symbol_row_text(symbol) == row_text)
+}
+
+fn parse_symbol_for_key<'a>(
+    snapshot: &'a TuiSnapshot,
+    key: &SymbolKey,
+) -> Option<&'a ParseSymbolRecord> {
+    snapshot
+        .symbols
+        .symbols
+        .iter()
+        .find(|symbol| SymbolKey::from_parse(symbol) == *key)
+}
+
+fn complexity_symbol_for_key<'a>(
+    snapshot: &'a TuiSnapshot,
+    key: &SymbolKey,
+) -> Option<&'a ComplexitySymbolRecord> {
+    snapshot
+        .complexity
+        .symbols
+        .iter()
+        .find(|symbol| SymbolKey::from_complexity(symbol) == *key)
+}
+
+fn symbol_row_text(symbol: &ParseSymbolRecord) -> String {
+    format!(
+        "Symbol: {} {} lines {}-{}",
+        symbol.kind, symbol.name, symbol.start_line, symbol.end_line
+    )
+}
+
 fn is_git_detail_row(row_text: &str) -> bool {
     row_text == "Git detail: press Enter"
 }
@@ -983,6 +1231,18 @@ fn optional_f64(value: Option<f64>) -> String {
 fn optional_percent(value: Option<f64>) -> String {
     value
         .map(|value| format!("{:.1}%", value * 100.0))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn optional_string(value: Option<&str>) -> String {
+    value
+        .map(str::to_owned)
+        .unwrap_or_else(|| "none".to_owned())
+}
+
+fn optional_bool(value: Option<bool>) -> String {
+    value
+        .map(|value| value.to_string())
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
@@ -1410,6 +1670,150 @@ mod tests {
     }
 
     #[test]
+    fn repo_tree_rows_use_deterministic_directory_then_file_ordering() {
+        let scan = ScanReport::from_parts(
+            Vec::new(),
+            vec![
+                file_record("zeta.rs"),
+                file_record("src/z.rs"),
+                file_record("README.md"),
+                file_record("src/bin/main.rs"),
+                file_record("src/a.rs"),
+                file_record("docs/guide.md"),
+            ],
+        );
+        let parse = ParseReport {
+            warnings: Vec::new(),
+            files: scan
+                .files
+                .iter()
+                .map(|file| parse_file(&file.path))
+                .collect(),
+            symbols: Vec::new(),
+            imports: Vec::new(),
+        };
+        let complexity = complexity::report_from_parse(&parse);
+        let snapshot = TuiSnapshot::from_parts(empty_report(&scan), scan, parse, complexity);
+
+        let rows = repo_tree_rows(&snapshot)
+            .into_iter()
+            .map(|row| row.text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rows,
+            vec![
+                "[dir] docs/",
+                "  [file] docs/guide.md",
+                "[dir] src/",
+                "  [dir] bin/",
+                "    [file] src/bin/main.rs",
+                "  [file] src/a.rs",
+                "  [file] src/z.rs",
+                "[file] README.md",
+                "[file] zeta.rs",
+            ]
+        );
+    }
+
+    #[test]
+    fn reducer_opens_repo_tree_and_drills_file_rows_to_file_detail() {
+        let snapshot = test_snapshot();
+        let mut state = TuiAppState::default();
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Char('t'), None);
+        select_visible_row(&mut state, &snapshot, "  [file] src/main.rs");
+        reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
+
+        assert_eq!(state.current_view(), TuiView::FileDetail);
+        assert_eq!(state.current_path(), Some("src/main.rs"));
+        assert_eq!(
+            state.last_action(),
+            Some(&TuiAction::DrillDown {
+                from: TuiView::RepoTree,
+                to: TuiView::FileDetail,
+                path: "src/main.rs".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn repo_tree_file_rows_include_relative_paths_to_avoid_ambiguous_basenames() {
+        let scan = ScanReport::from_parts(
+            Vec::new(),
+            vec![file_record("app/main.rs"), file_record("src/main.rs")],
+        );
+        let parse = ParseReport {
+            warnings: Vec::new(),
+            files: scan
+                .files
+                .iter()
+                .map(|file| parse_file(&file.path))
+                .collect(),
+            symbols: Vec::new(),
+            imports: Vec::new(),
+        };
+        let complexity = complexity::report_from_parse(&parse);
+        let snapshot = TuiSnapshot::from_parts(empty_report(&scan), scan, parse, complexity);
+
+        let rows = repo_tree_rows(&snapshot)
+            .into_iter()
+            .map(|row| row.text)
+            .collect::<Vec<_>>();
+
+        assert!(rows.contains(&"  [file] app/main.rs".to_owned()));
+        assert!(rows.contains(&"  [file] src/main.rs".to_owned()));
+        assert_eq!(
+            repo_tree_path_from_row(&snapshot, "  [file] src/main.rs"),
+            Some("src/main.rs".to_owned())
+        );
+    }
+
+    #[test]
+    fn symbol_detail_rows_include_parser_and_complexity_facts() {
+        let snapshot = symbol_detail_snapshot();
+        let key = SymbolKey::from_parse(&snapshot.symbols.symbols[0]);
+        let rows = symbol_detail_rows(&snapshot, &key);
+
+        assert!(rows.contains(&"Symbol: function render".to_owned()));
+        assert!(rows.contains(&"Kind: function".to_owned()));
+        assert!(rows.contains(&"Range: lines 10-92".to_owned()));
+        assert!(rows.contains(&"Parent: impl Widget".to_owned()));
+        assert!(rows.contains(&"Nesting depth: 1".to_owned()));
+        assert!(rows.contains(&"Length lines: 83".to_owned()));
+        assert!(rows.contains(&"Function length lines: 83".to_owned()));
+        assert!(rows.contains(&"Cyclomatic complexity: 8".to_owned()));
+        assert!(rows.contains(&"Max control flow nesting: 3".to_owned()));
+        assert!(rows.contains(&"Large symbol: true".to_owned()));
+    }
+
+    #[test]
+    fn file_detail_symbol_row_drills_to_symbol_detail_and_back() {
+        let snapshot = symbol_detail_snapshot();
+        let mut state = TuiAppState::default();
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
+        select_visible_row(&mut state, &snapshot, "Symbol: function render lines 10-92");
+        reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
+
+        assert_eq!(state.current_view(), TuiView::SymbolDetail);
+        assert_eq!(state.current_path(), Some("src/lib.rs"));
+        assert_eq!(
+            state.last_action(),
+            Some(&TuiAction::DrillDown {
+                from: TuiView::FileDetail,
+                to: TuiView::SymbolDetail,
+                path: "src/lib.rs".to_owned(),
+            })
+        );
+        assert!(filtered_visible_rows(&snapshot, &state).contains(&"Large symbol: true".to_owned()));
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Esc, None);
+        assert_eq!(state.current_view(), TuiView::FileDetail);
+        assert_eq!(state.current_path(), Some("src/lib.rs"));
+    }
+
+    #[test]
     fn snapshot_constructor_sorts_repository_relative_data() {
         let scan = ScanReport::from_parts(
             Vec::new(),
@@ -1498,6 +1902,14 @@ mod tests {
         });
     }
 
+    fn select_visible_row(state: &mut TuiAppState, snapshot: &TuiSnapshot, row_text: &str) {
+        let rows = filtered_visible_rows(snapshot, state);
+        state.selection_for_current_view_mut().selected = rows
+            .iter()
+            .position(|row| row == row_text)
+            .unwrap_or_else(|| panic!("expected visible row {row_text:?}, got {rows:?}"));
+    }
+
     fn test_snapshot() -> TuiSnapshot {
         let scan = ScanReport::from_parts(
             Vec::new(),
@@ -1507,6 +1919,23 @@ mod tests {
             warnings: Vec::new(),
             files: vec![parse_file("src/lib.rs"), parse_file("src/main.rs")],
             symbols: vec![symbol("src/lib.rs", "run", 1)],
+            imports: Vec::new(),
+        };
+        let complexity = complexity::report_from_parse(&parse);
+        let report = report_with_hotspots(&scan);
+
+        TuiSnapshot::from_parts(report, scan, parse, complexity)
+    }
+
+    fn symbol_detail_snapshot() -> TuiSnapshot {
+        let scan = ScanReport::from_parts(
+            Vec::new(),
+            vec![file_record("src/lib.rs"), file_record("src/main.rs")],
+        );
+        let parse = ParseReport {
+            warnings: Vec::new(),
+            files: vec![parse_file("src/lib.rs"), parse_file("src/main.rs")],
+            symbols: vec![detailed_symbol()],
             imports: Vec::new(),
         };
         let complexity = complexity::report_from_parse(&parse);
@@ -1653,6 +2082,21 @@ mod tests {
             parent: None,
             cyclomatic_complexity: Some(1),
             max_control_flow_nesting: Some(0),
+        }
+    }
+
+    fn detailed_symbol() -> ParseSymbolRecord {
+        ParseSymbolRecord {
+            path: "src/lib.rs".to_owned(),
+            name: "render".to_owned(),
+            kind: "function".to_owned(),
+            start_line: 10,
+            end_line: 92,
+            signature: Some("fn render_lines()".to_owned()),
+            nesting_depth: 1,
+            parent: Some("impl Widget".to_owned()),
+            cyclomatic_complexity: Some(8),
+            max_control_flow_nesting: Some(3),
         }
     }
 
