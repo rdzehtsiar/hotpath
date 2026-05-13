@@ -25,9 +25,9 @@ use crate::git;
 use crate::report::{Report, ReportContext, ReportFinding, ReportGitSummary, ReportHotspot};
 use crate::storage;
 use crate::{
-    estimate_context, parse, ranked_hotspot_scores_from_scan_and_git, ContextOptions, FileRecord,
-    ParseImportRecord, ParseReport, ParseSummary, ParseSymbolRecord, ScanError, ScanReport,
-    ScanSummary, REPORT_SCHEMA_VERSION,
+    estimate_context, parse, ranked_hotspot_scores_from_scan_and_git, ContextBudgetStatus,
+    ContextOptions, ContextSkippedReason, FileRecord, ParseImportRecord, ParseReport, ParseSummary,
+    ParseSymbolRecord, ScanError, ScanReport, ScanSummary, REPORT_SCHEMA_VERSION,
 };
 
 type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
@@ -384,6 +384,8 @@ pub enum TuiView {
     FileDetail,
     SymbolDetail,
     GitDetail,
+    CouplingGraph,
+    ContextBudgeting,
     ExplainScore,
 }
 
@@ -395,6 +397,8 @@ impl TuiView {
             Self::FileDetail => "File Detail",
             Self::SymbolDetail => "Symbol Detail",
             Self::GitDetail => "Git Detail",
+            Self::CouplingGraph => "Coupling Graph",
+            Self::ContextBudgeting => "Context Budgeting",
             Self::ExplainScore => "Explain Score",
         }
     }
@@ -514,6 +518,8 @@ impl Default for TuiAppState {
         selections.insert(TuiView::FileDetail, ListSelection::default());
         selections.insert(TuiView::SymbolDetail, ListSelection::default());
         selections.insert(TuiView::GitDetail, ListSelection::default());
+        selections.insert(TuiView::CouplingGraph, ListSelection::default());
+        selections.insert(TuiView::ContextBudgeting, ListSelection::default());
         selections.insert(TuiView::ExplainScore, ListSelection::default());
 
         Self {
@@ -641,6 +647,8 @@ fn reduce_key_with_editor<F>(
         }
         KeyCode::Enter => drill_down(state, snapshot, &rows),
         KeyCode::Char('t') => open_repo_tree(state),
+        KeyCode::Char('g') => open_coupling_graph(state, snapshot, &rows),
+        KeyCode::Char('c') => open_context_budgeting(state),
         KeyCode::Char('x') => explain_score(state, snapshot, &rows),
         KeyCode::Char('e') => {
             let resolution = resolve_editor_from_env(|name| {
@@ -701,7 +709,14 @@ fn drill_down(state: &mut TuiAppState, snapshot: &TuiSnapshot, rows: &[String]) 
                     (TuiView::SymbolDetail, path)
                 })
             }),
-        TuiView::SymbolDetail | TuiView::GitDetail | TuiView::ExplainScore => None,
+        TuiView::CouplingGraph => {
+            coupling_graph_path_from_row(snapshot, state.current_path.as_deref(), &row_text)
+                .map(|path| (TuiView::FileDetail, path))
+        }
+        TuiView::SymbolDetail
+        | TuiView::GitDetail
+        | TuiView::ContextBudgeting
+        | TuiView::ExplainScore => None,
     };
 
     let Some((to, path)) = next else {
@@ -732,6 +747,8 @@ fn explain_score(state: &mut TuiAppState, snapshot: &TuiSnapshot, rows: &[String
         TuiView::FileDetail
         | TuiView::SymbolDetail
         | TuiView::GitDetail
+        | TuiView::CouplingGraph
+        | TuiView::ContextBudgeting
         | TuiView::ExplainScore => state.current_path.clone(),
     };
     let Some(path) = path.filter(|path| hotspot_for_path(snapshot, path).is_some()) else {
@@ -755,6 +772,44 @@ fn open_repo_tree(state: &mut TuiAppState) {
         push_view(state, TuiView::RepoTree, None);
     }
     state.status = Some("Repo tree".to_owned());
+}
+
+fn open_coupling_graph(state: &mut TuiAppState, snapshot: &TuiSnapshot, rows: &[String]) {
+    let selected_path = selected_path_for_view(state, snapshot, rows);
+    if state.current_view != TuiView::CouplingGraph || state.current_path != selected_path {
+        push_view(state, TuiView::CouplingGraph, selected_path.clone());
+    }
+    state.status = Some(match selected_path {
+        Some(path) => format!("Coupling graph: {path}"),
+        None => "Coupling graph".to_owned(),
+    });
+}
+
+fn open_context_budgeting(state: &mut TuiAppState) {
+    if state.current_view != TuiView::ContextBudgeting {
+        push_view(state, TuiView::ContextBudgeting, None);
+    }
+    state.status = Some("Context budgeting".to_owned());
+}
+
+fn selected_path_for_view(
+    state: &TuiAppState,
+    snapshot: &TuiSnapshot,
+    rows: &[String],
+) -> Option<String> {
+    let row_text = selected_row_text(state, rows);
+    match state.current_view {
+        TuiView::Hotspots => row_text.and_then(|row| hotspot_path_from_row(snapshot, &row)),
+        TuiView::RepoTree => row_text.and_then(|row| repo_tree_path_from_row(snapshot, &row)),
+        TuiView::CouplingGraph => row_text.and_then(|row| {
+            coupling_graph_path_from_row(snapshot, state.current_path.as_deref(), &row)
+        }),
+        TuiView::FileDetail
+        | TuiView::SymbolDetail
+        | TuiView::GitDetail
+        | TuiView::ExplainScore => state.current_path.clone(),
+        TuiView::ContextBudgeting => None,
+    }
 }
 
 fn push_view(state: &mut TuiAppState, next_view: TuiView, next_path: Option<String>) {
@@ -849,6 +904,8 @@ fn visible_rows(snapshot: &TuiSnapshot, state: &TuiAppState) -> Vec<String> {
             .as_deref()
             .map(|path| git_detail_rows(snapshot, path))
             .unwrap_or_else(|| vec!["No file selected.".to_owned()]),
+        TuiView::CouplingGraph => coupling_graph_rows(snapshot, state.current_path.as_deref()),
+        TuiView::ContextBudgeting => context_budgeting_rows(snapshot),
         TuiView::ExplainScore => state
             .current_path
             .as_deref()
@@ -880,6 +937,7 @@ fn hotspot_rows(snapshot: &TuiSnapshot) -> Vec<String> {
 fn file_detail_rows(snapshot: &TuiSnapshot, path: &str) -> Vec<String> {
     let mut rows = vec![format!("File: {path}")];
     rows.push("Repo tree: press t".to_owned());
+    rows.push("Coupling graph: press g".to_owned());
 
     if let Some(file) = file_for_path(snapshot, path) {
         rows.extend([
@@ -923,6 +981,129 @@ fn file_detail_rows(snapshot: &TuiSnapshot, path: &str) -> Vec<String> {
         rows.push(format!("Related symbols: {}", symbols.len()));
         rows.extend(symbols.into_iter().take(8).map(symbol_row_text));
     }
+
+    rows
+}
+
+fn coupling_graph_rows(snapshot: &TuiSnapshot, path: Option<&str>) -> Vec<String> {
+    match path {
+        Some(path) => coupling_graph_file_rows(snapshot, path),
+        None => coupling_graph_overview_rows(snapshot),
+    }
+}
+
+fn coupling_graph_file_rows(snapshot: &TuiSnapshot, path: &str) -> Vec<String> {
+    let fan = fan_for_path(snapshot, path);
+    let incoming = incoming_edges_for_path(snapshot, path);
+    let outgoing = outgoing_edges_for_path(snapshot, path);
+    let mut rows = vec![
+        format!("File: {path}"),
+        format!(
+            "Matched current file: {}",
+            file_for_path(snapshot, path).is_some()
+        ),
+        format!("Fan-in: {}", fan.map_or(0, |fan| fan.fan_in)),
+        format!("Fan-out: {}", fan.map_or(0, |fan| fan.fan_out)),
+    ];
+
+    rows.push("Incoming edges:".to_owned());
+    if incoming.is_empty() {
+        rows.push("Incoming: none".to_owned());
+    } else {
+        rows.extend(incoming.into_iter().map(|edge| {
+            format!(
+                "Incoming: {} -> {} ({})",
+                edge.source_path, edge.target_path, edge.kind
+            )
+        }));
+    }
+
+    rows.push("Outgoing edges:".to_owned());
+    if outgoing.is_empty() {
+        rows.push("Outgoing: none".to_owned());
+    } else {
+        rows.extend(outgoing.into_iter().map(|edge| {
+            format!(
+                "Outgoing: {} -> {} ({})",
+                edge.source_path, edge.target_path, edge.kind
+            )
+        }));
+    }
+
+    rows
+}
+
+fn coupling_graph_overview_rows(snapshot: &TuiSnapshot) -> Vec<String> {
+    let mut rows = vec![format!(
+        "Coupling graph: {} resolved dependency edges",
+        snapshot.coupling.edges.len()
+    )];
+
+    if snapshot.coupling.fan_by_file.is_empty() {
+        rows.push("Coupling graph: no parsed current files".to_owned());
+        return rows;
+    }
+
+    rows.push("Files by fan-in/fan-out:".to_owned());
+    rows.extend(snapshot.coupling.fan_by_file.iter().map(|fan| {
+        format!(
+            "File: {} fan-in {} fan-out {}",
+            fan.path, fan.fan_in, fan.fan_out
+        )
+    }));
+
+    if snapshot.coupling.edges.is_empty() {
+        rows.push("Edges: none resolved from parser imports".to_owned());
+    }
+
+    rows
+}
+
+fn context_budgeting_rows(snapshot: &TuiSnapshot) -> Vec<String> {
+    let context = &snapshot.report.context;
+    let summary = &context.summary;
+    let mut rows = vec![
+        format!("Total estimated tokens: {}", summary.estimated_tokens),
+        format!("Included files: {}", summary.included_files),
+        format!("Skipped files: {}", summary.skipped_files),
+        format!("Included bytes: {}", summary.included_bytes),
+    ];
+
+    if let Some(budget) = &context.budget {
+        rows.push(format!("Budget: {}", context_budget_status_text(budget)));
+    } else {
+        rows.push("Budget: none configured".to_owned());
+    }
+
+    rows.push("Top groups:".to_owned());
+    if context.groups.is_empty() {
+        rows.push("Group: none".to_owned());
+    } else {
+        rows.extend(context.groups.iter().map(|group| {
+            format!(
+                "Group: {} tokens {} bytes {} files {}",
+                group.path, group.estimated_tokens, group.byte_size, group.file_count
+            )
+        }));
+    }
+
+    rows.push("Skipped files:".to_owned());
+    if context.skipped.is_empty() {
+        rows.push("Skipped: none".to_owned());
+    } else {
+        rows.extend(context.skipped.iter().map(|skipped| {
+            format!(
+                "Skipped: {} ({})",
+                skipped.path,
+                context_skipped_reason_label(skipped.reason)
+            )
+        }));
+    }
+
+    rows.extend([
+        "Approximation: estimated tokens = ceil(byte_size / 4) for UTF-8 text files".to_owned(),
+        "Approximation: tokenizer-specific counts vary by model and language".to_owned(),
+    ]);
 
     rows
 }
@@ -1152,6 +1333,57 @@ fn repo_tree_path_from_row(snapshot: &TuiSnapshot, row_text: &str) -> Option<Str
         .map(|row| row.path)
 }
 
+fn coupling_graph_path_from_row(
+    snapshot: &TuiSnapshot,
+    current_path: Option<&str>,
+    row_text: &str,
+) -> Option<String> {
+    if let Some(path) = row_text
+        .strip_prefix("File: ")
+        .and_then(|rest| {
+            rest.split_once(" fan-in ")
+                .map(|(path, _)| path)
+                .or(Some(rest))
+        })
+        .filter(|path| file_for_path(snapshot, path).is_some())
+    {
+        return Some(path.to_owned());
+    }
+
+    if let Some((source, target)) = parse_coupling_edge_row(row_text, "Incoming: ") {
+        return coupling_edge_drilldown_target(snapshot, current_path, source, target);
+    }
+
+    if let Some((source, target)) = parse_coupling_edge_row(row_text, "Outgoing: ") {
+        return coupling_edge_drilldown_target(snapshot, current_path, source, target);
+    }
+
+    None
+}
+
+fn parse_coupling_edge_row<'a>(row_text: &'a str, prefix: &str) -> Option<(&'a str, &'a str)> {
+    let rest = row_text.strip_prefix(prefix)?;
+    let (source, rest) = rest.split_once(" -> ")?;
+    let (target, _) = rest.rsplit_once(" (")?;
+
+    Some((source, target))
+}
+
+fn coupling_edge_drilldown_target(
+    snapshot: &TuiSnapshot,
+    current_path: Option<&str>,
+    source: &str,
+    target: &str,
+) -> Option<String> {
+    let next = match current_path {
+        Some(current) if current == source => target,
+        Some(current) if current == target => source,
+        _ => target,
+    };
+
+    file_for_path(snapshot, next).map(|_| next.to_owned())
+}
+
 fn hotspot_for_path<'a>(snapshot: &'a TuiSnapshot, path: &str) -> Option<&'a ReportHotspot> {
     snapshot
         .report
@@ -1170,6 +1402,38 @@ fn symbols_for_path<'a>(snapshot: &'a TuiSnapshot, path: &str) -> Vec<&'a ParseS
         .symbols
         .iter()
         .filter(|symbol| symbol.path == path)
+        .collect()
+}
+
+fn fan_for_path<'a>(snapshot: &'a TuiSnapshot, path: &str) -> Option<&'a TuiFileFan> {
+    snapshot
+        .coupling
+        .fan_by_file
+        .iter()
+        .find(|fan| fan.path == path)
+}
+
+fn incoming_edges_for_path<'a>(
+    snapshot: &'a TuiSnapshot,
+    path: &str,
+) -> Vec<&'a ResolvedDependencyEdge> {
+    snapshot
+        .coupling
+        .edges
+        .iter()
+        .filter(|edge| edge.target_path == path)
+        .collect()
+}
+
+fn outgoing_edges_for_path<'a>(
+    snapshot: &'a TuiSnapshot,
+    path: &str,
+) -> Vec<&'a ResolvedDependencyEdge> {
+    snapshot
+        .coupling
+        .edges
+        .iter()
+        .filter(|edge| edge.source_path == path)
         .collect()
 }
 
@@ -1214,6 +1478,34 @@ fn symbol_row_text(symbol: &ParseSymbolRecord) -> String {
 
 fn is_git_detail_row(row_text: &str) -> bool {
     row_text == "Git detail: press Enter"
+}
+
+fn context_budget_status_text(budget: &ContextBudgetStatus) -> String {
+    match (budget.remaining_tokens, budget.over_budget_tokens) {
+        (Some(remaining), _) => format!(
+            "within budget by {remaining} tokens (budget {}, estimated {})",
+            budget.budget_tokens, budget.estimated_tokens
+        ),
+        (_, Some(over)) => format!(
+            "over budget by {over} tokens (budget {}, estimated {})",
+            budget.budget_tokens, budget.estimated_tokens
+        ),
+        (None, None) => format!(
+            "within budget by 0 tokens (budget {}, estimated {})",
+            budget.budget_tokens, budget.estimated_tokens
+        ),
+    }
+}
+
+fn context_skipped_reason_label(reason: ContextSkippedReason) -> &'static str {
+    match reason {
+        ContextSkippedReason::Binary => "binary",
+        ContextSkippedReason::UnknownContent => "unknown content",
+        ContextSkippedReason::MissingByteSize => "missing byte size",
+        ContextSkippedReason::Unreadable => "unreadable",
+        ContextSkippedReason::ExcludedGenerated => "excluded generated",
+        ContextSkippedReason::ExcludedVendor => "excluded vendor",
+    }
 }
 
 fn optional_u64(value: Option<u64>) -> String {
@@ -1303,7 +1595,7 @@ fn render(frame: &mut Frame<'_>, snapshot: &TuiSnapshot, state: &TuiAppState) {
     let footer = match state.search_query() {
         Some(query) => format!("/{query}"),
         None => state.status().map(str::to_owned).unwrap_or_else(|| {
-            "j/k move, Enter drill down, / search, x explain, Esc back, e editor, q quit".to_owned()
+            "j/k move, Enter drill down, / search, t tree, g graph, c context, x explain, Esc back, e editor, q quit".to_owned()
         }),
     };
     body_lines.push(Line::raw(""));
@@ -1670,6 +1962,213 @@ mod tests {
     }
 
     #[test]
+    fn coupling_graph_file_rows_include_fan_edges_and_empty_states() {
+        let snapshot = coupling_snapshot();
+
+        assert_eq!(
+            coupling_graph_rows(&snapshot, Some("src/lib.rs")),
+            vec![
+                "File: src/lib.rs",
+                "Matched current file: true",
+                "Fan-in: 0",
+                "Fan-out: 1",
+                "Incoming edges:",
+                "Incoming: none",
+                "Outgoing edges:",
+                "Outgoing: src/lib.rs -> src/child.rs (mod)",
+            ]
+        );
+        assert_eq!(
+            coupling_graph_rows(&snapshot, Some("src/child.rs")),
+            vec![
+                "File: src/child.rs",
+                "Matched current file: true",
+                "Fan-in: 1",
+                "Fan-out: 0",
+                "Incoming edges:",
+                "Incoming: src/lib.rs -> src/child.rs (mod)",
+                "Outgoing edges:",
+                "Outgoing: none",
+            ]
+        );
+    }
+
+    #[test]
+    fn coupling_graph_overview_rows_use_deterministic_current_file_fan_rows() {
+        let snapshot = coupling_snapshot();
+
+        assert_eq!(
+            coupling_graph_rows(&snapshot, None),
+            vec![
+                "Coupling graph: 1 resolved dependency edges",
+                "Files by fan-in/fan-out:",
+                "File: src/child.rs fan-in 1 fan-out 0",
+                "File: src/lib.rs fan-in 0 fan-out 1",
+            ]
+        );
+    }
+
+    #[test]
+    fn coupling_graph_edge_rows_resolve_the_neighbor_endpoint_exactly() {
+        let snapshot = coupling_snapshot();
+
+        assert_eq!(
+            coupling_graph_path_from_row(
+                &snapshot,
+                Some("src/lib.rs"),
+                "Outgoing: src/lib.rs -> src/child.rs (mod)",
+            ),
+            Some("src/child.rs".to_owned())
+        );
+        assert_eq!(
+            coupling_graph_path_from_row(
+                &snapshot,
+                Some("src/child.rs"),
+                "Incoming: src/lib.rs -> src/child.rs (mod)",
+            ),
+            Some("src/lib.rs".to_owned())
+        );
+        assert_eq!(
+            coupling_graph_path_from_row(
+                &snapshot,
+                None,
+                "Outgoing: src/lib.rs -> src/child.rsx (mod)",
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn context_budgeting_rows_include_summary_budget_groups_skips_and_notes() {
+        let mut snapshot = test_snapshot();
+        snapshot.report.context.summary = ContextSummary {
+            total_files: 3,
+            included_files: 2,
+            skipped_files: 1,
+            estimated_tokens: 9,
+            included_bytes: 36,
+            filtered_generated_files: 0,
+            filtered_vendor_files: 0,
+        };
+        snapshot.report.context.groups = vec![crate::ContextGroupRow {
+            path: "src".to_owned(),
+            file_count: 2,
+            byte_size: 36,
+            estimated_tokens: 9,
+        }];
+        snapshot.report.context.skipped = vec![ContextSkippedRow {
+            path: "target/cache.bin".to_owned(),
+            reason: ContextSkippedReason::Binary,
+        }];
+        snapshot.report.context.budget = Some(ContextBudgetStatus {
+            budget_tokens: 8,
+            estimated_tokens: 9,
+            remaining_tokens: None,
+            over_budget_tokens: Some(1),
+        });
+
+        let rows = context_budgeting_rows(&snapshot);
+
+        assert!(rows.contains(&"Total estimated tokens: 9".to_owned()));
+        assert!(rows.contains(&"Included files: 2".to_owned()));
+        assert!(rows.contains(&"Skipped files: 1".to_owned()));
+        assert!(rows.contains(&"Included bytes: 36".to_owned()));
+        assert!(
+            rows.contains(&"Budget: over budget by 1 tokens (budget 8, estimated 9)".to_owned())
+        );
+        assert!(rows.contains(&"Group: src tokens 9 bytes 36 files 2".to_owned()));
+        assert!(rows.contains(&"Skipped: target/cache.bin (binary)".to_owned()));
+        assert!(rows.contains(
+            &"Approximation: estimated tokens = ceil(byte_size / 4) for UTF-8 text files"
+                .to_owned()
+        ));
+    }
+
+    #[test]
+    fn context_budgeting_rows_include_all_groups_and_skips() {
+        let mut snapshot = test_snapshot();
+        snapshot.report.context.groups = (0..6)
+            .map(|index| crate::ContextGroupRow {
+                path: format!("group{index}"),
+                file_count: 1,
+                byte_size: 4,
+                estimated_tokens: 1,
+            })
+            .collect();
+        snapshot.report.context.skipped = (0..6)
+            .map(|index| ContextSkippedRow {
+                path: format!("skip{index}.bin"),
+                reason: ContextSkippedReason::Binary,
+            })
+            .collect();
+
+        let rows = context_budgeting_rows(&snapshot);
+
+        assert!(rows.contains(&"Group: group5 tokens 1 bytes 4 files 1".to_owned()));
+        assert!(rows.contains(&"Skipped: skip5.bin (binary)".to_owned()));
+    }
+
+    #[test]
+    fn context_budgeting_rows_report_empty_groups_and_skips() {
+        let snapshot = test_snapshot();
+        let rows = context_budgeting_rows(&snapshot);
+
+        assert!(rows.contains(&"Budget: none configured".to_owned()));
+        assert!(rows.contains(&"Group: none".to_owned()));
+        assert!(rows.contains(&"Skipped: src/z.rs (unreadable)".to_owned()));
+    }
+
+    #[test]
+    fn reducer_routes_to_coupling_graph_and_context_budgeting() {
+        let snapshot = coupling_snapshot();
+        let mut state = TuiAppState::default();
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Char('g'), None);
+
+        assert_eq!(state.current_view(), TuiView::CouplingGraph);
+        assert_eq!(state.current_path(), Some("src/lib.rs"));
+        assert!(filtered_visible_rows(&snapshot, &state)
+            .contains(&"Outgoing: src/lib.rs -> src/child.rs (mod)".to_owned()));
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Char('c'), None);
+
+        assert_eq!(state.current_view(), TuiView::ContextBudgeting);
+        assert_eq!(state.current_path(), None);
+        assert!(filtered_visible_rows(&snapshot, &state)
+            .contains(&"Total estimated tokens: 0".to_owned()));
+    }
+
+    #[test]
+    fn all_milestone_views_have_selection_state_and_titles() {
+        let state = TuiAppState::default();
+        let milestone_views = [
+            TuiView::Hotspots,
+            TuiView::RepoTree,
+            TuiView::FileDetail,
+            TuiView::SymbolDetail,
+            TuiView::GitDetail,
+            TuiView::CouplingGraph,
+            TuiView::ContextBudgeting,
+        ];
+
+        assert_eq!(
+            milestone_views.map(TuiView::title),
+            [
+                "Hotspots",
+                "Repo Tree",
+                "File Detail",
+                "Symbol Detail",
+                "Git Detail",
+                "Coupling Graph",
+                "Context Budgeting",
+            ]
+        );
+        assert!(milestone_views
+            .iter()
+            .all(|view| state.selections.contains_key(view)));
+    }
+
+    #[test]
     fn repo_tree_rows_use_deterministic_directory_then_file_ordering() {
         let scan = ScanReport::from_parts(
             Vec::new(),
@@ -1937,6 +2436,23 @@ mod tests {
             files: vec![parse_file("src/lib.rs"), parse_file("src/main.rs")],
             symbols: vec![detailed_symbol()],
             imports: Vec::new(),
+        };
+        let complexity = complexity::report_from_parse(&parse);
+        let report = report_with_hotspots(&scan);
+
+        TuiSnapshot::from_parts(report, scan, parse, complexity)
+    }
+
+    fn coupling_snapshot() -> TuiSnapshot {
+        let scan = ScanReport::from_parts(
+            Vec::new(),
+            vec![file_record("src/child.rs"), file_record("src/lib.rs")],
+        );
+        let parse = ParseReport {
+            warnings: Vec::new(),
+            files: vec![parse_file("src/child.rs"), parse_file("src/lib.rs")],
+            symbols: Vec::new(),
+            imports: vec![import("src/lib.rs", "child", "mod")],
         };
         let complexity = complexity::report_from_parse(&parse);
         let report = report_with_hotspots(&scan);
