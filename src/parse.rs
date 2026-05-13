@@ -248,22 +248,19 @@ pub(crate) fn report_from_scan(root: &Path, scan: &ScanReport) -> ParseReport {
 }
 
 pub(crate) fn sort_symbol_records(symbols: &mut [ParseSymbolRecord]) {
-    symbols.sort_by(|left, right| {
-        (
-            &left.path,
-            left.start_line,
-            left.end_line,
-            &left.kind,
-            &left.name,
+    crate::sort_symbol_records_by_location(symbols);
+}
+
+impl crate::SymbolRecordSortFields for ParseSymbolRecord {
+    fn symbol_record_sort_key(&self) -> crate::SymbolRecordSortKey<'_> {
+        crate::symbol_record_sort_key(
+            &self.path,
+            self.start_line,
+            self.end_line,
+            &self.kind,
+            &self.name,
         )
-            .cmp(&(
-                &right.path,
-                right.start_line,
-                right.end_line,
-                &right.kind,
-                &right.name,
-            ))
-    });
+    }
 }
 
 pub(crate) fn sort_import_records(imports: &mut [ParseImportRecord]) {

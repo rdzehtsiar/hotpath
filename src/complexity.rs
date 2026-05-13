@@ -310,22 +310,19 @@ fn ranked_symbol_key(symbol: &ComplexitySymbolRecord) -> RankedSymbolKey<'_> {
 }
 
 pub(crate) fn sort_symbol_records(symbols: &mut [ComplexitySymbolRecord]) {
-    symbols.sort_by(|left, right| {
-        (
-            &left.path,
-            left.start_line,
-            left.end_line,
-            &left.kind,
-            &left.name,
+    crate::sort_symbol_records_by_location(symbols);
+}
+
+impl crate::SymbolRecordSortFields for ComplexitySymbolRecord {
+    fn symbol_record_sort_key(&self) -> crate::SymbolRecordSortKey<'_> {
+        crate::symbol_record_sort_key(
+            &self.path,
+            self.start_line,
+            self.end_line,
+            &self.kind,
+            &self.name,
         )
-            .cmp(&(
-                &right.path,
-                right.start_line,
-                right.end_line,
-                &right.kind,
-                &right.name,
-            ))
-    });
+    }
 }
 
 fn is_function_or_method(kind: &str) -> bool {

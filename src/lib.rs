@@ -81,6 +81,45 @@ struct NormalizedPath {
     used_replacement: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct SymbolRecordSortKey<'a> {
+    path: &'a str,
+    start_line: u64,
+    end_line: u64,
+    kind: &'a str,
+    name: &'a str,
+}
+
+pub(crate) fn symbol_record_sort_key<'a>(
+    path: &'a str,
+    start_line: u64,
+    end_line: u64,
+    kind: &'a str,
+    name: &'a str,
+) -> SymbolRecordSortKey<'a> {
+    SymbolRecordSortKey {
+        path,
+        start_line,
+        end_line,
+        kind,
+        name,
+    }
+}
+
+pub(crate) trait SymbolRecordSortFields {
+    fn symbol_record_sort_key(&self) -> SymbolRecordSortKey<'_>;
+}
+
+pub(crate) fn sort_symbol_records_by_location<T>(symbols: &mut [T])
+where
+    T: SymbolRecordSortFields,
+{
+    symbols.sort_by(|left, right| {
+        left.symbol_record_sort_key()
+            .cmp(&right.symbol_record_sort_key())
+    });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentKind {
