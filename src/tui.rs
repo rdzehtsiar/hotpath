@@ -498,6 +498,7 @@ pub struct TuiAppState {
     symbol_stack: Vec<Option<SymbolKey>>,
     selections: BTreeMap<TuiView, ListSelection>,
     search: Option<SearchState>,
+    search_editing: bool,
     pane_focus: TuiPaneFocus,
     show_help: bool,
     command_palette: bool,
@@ -527,6 +528,7 @@ impl Default for TuiAppState {
             symbol_stack: Vec::new(),
             selections,
             search: None,
+            search_editing: false,
             pane_focus: TuiPaneFocus::Main,
             show_help: false,
             command_palette: false,
@@ -552,6 +554,10 @@ impl TuiAppState {
 
     pub fn search_query(&self) -> Option<&str> {
         self.search.as_ref().map(SearchState::query)
+    }
+
+    pub fn is_search_editing(&self) -> bool {
+        self.search_editing
     }
 
     pub fn status(&self) -> Option<&str> {
@@ -651,6 +657,7 @@ fn reduce_key_with_editor<F>(
             KeyCode::Char('/') => {
                 state.command_palette = false;
                 state.search = Some(SearchState::default());
+                state.search_editing = true;
                 state.status = Some("Search active".to_owned());
             }
             _ => {}
@@ -666,9 +673,10 @@ fn reduce_key_with_editor<F>(
 
     let rows = filtered_visible_rows(snapshot, state);
 
-    if state.search.is_some() {
+    if state.search_editing {
         match key.code {
-            KeyCode::Esc => reduce_escape(state),
+            KeyCode::Esc => clear_search(state),
+            KeyCode::Enter => confirm_search(state, snapshot),
             KeyCode::Backspace => {
                 if let Some(search) = &mut state.search {
                     search.query.pop();
@@ -691,6 +699,7 @@ fn reduce_key_with_editor<F>(
         KeyCode::Char('?') => state.show_help = true,
         KeyCode::Char('/') => {
             state.search = Some(SearchState::default());
+            state.search_editing = true;
             state.status = Some("Search active".to_owned());
             clamp_current_selection(state, snapshot);
         }
@@ -732,7 +741,8 @@ fn reduce_key_with_editor<F>(
 
 fn reduce_escape(state: &mut TuiAppState) {
     if state.search.take().is_some() {
-        state.status = Some("Search cleared".to_owned());
+        state.search_editing = false;
+        state.status = Some("Filter cleared".to_owned());
         return;
     }
 
@@ -744,6 +754,24 @@ fn reduce_escape(state: &mut TuiAppState) {
     } else {
         state.should_exit = true;
     }
+}
+
+fn clear_search(state: &mut TuiAppState) {
+    state.search = None;
+    state.search_editing = false;
+    state.status = Some("Filter cleared".to_owned());
+}
+
+fn confirm_search(state: &mut TuiAppState, snapshot: &TuiSnapshot) {
+    state.search_editing = false;
+    let row_count = filtered_visible_rows(snapshot, state).len();
+    state.status = Some(match state.search_query() {
+        Some(query) if !query.trim().is_empty() => {
+            format!("Filter active: {query} ({row_count} rows)")
+        }
+        _ => "Filter active: all rows".to_owned(),
+    });
+    clamp_current_selection(state, snapshot);
 }
 
 fn drill_down(state: &mut TuiAppState, snapshot: &TuiSnapshot, rows: &[String]) {
@@ -902,6 +930,7 @@ fn push_view(state: &mut TuiAppState, next_view: TuiView, next_path: Option<Stri
     state.current_symbol = None;
     state.selection_for_current_view_mut().selected = 0;
     state.search = None;
+    state.search_editing = false;
 }
 
 fn push_symbol_view(state: &mut TuiAppState, symbol: &ParseSymbolRecord) {
@@ -913,6 +942,7 @@ fn push_symbol_view(state: &mut TuiAppState, symbol: &ParseSymbolRecord) {
     state.current_symbol = Some(SymbolKey::from_parse(symbol));
     state.selection_for_current_view_mut().selected = 0;
     state.search = None;
+    state.search_editing = false;
 }
 
 fn resolve_editor_action(state: &mut TuiAppState, rows: &[String], resolution: EditorResolution) {
@@ -2097,11 +2127,16 @@ fn render_inspector(
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiAppState) {
-    let text = match state.search_query() {
-        Some(query) => format!("/{query}"),
-        None => state.status().map(str::to_owned).unwrap_or_else(|| {
+    let text = if state.search_editing {
+        format!("/{}", state.search_query().unwrap_or(""))
+    } else {
+        let default_status = || {
             "j/k or arrows move  Enter drill  / search  1-4 views  ? help  Ctrl-P commands  e editor  q quit".to_owned()
-        }),
+        };
+        state
+            .status()
+            .map(str::to_owned)
+            .unwrap_or_else(default_status)
     };
     frame.render_widget(
         Paragraph::new(text)
@@ -2756,6 +2791,7 @@ mod tests {
         let mut state = TuiAppState::default();
 
         reduce_test_key(&mut state, &snapshot, KeyCode::Char('/'), None);
+        assert!(state.is_search_editing());
         for character in "lib".chars() {
             reduce_test_key(&mut state, &snapshot, KeyCode::Char(character), None);
         }
@@ -2769,8 +2805,33 @@ mod tests {
         reduce_test_key(&mut state, &snapshot, KeyCode::Esc, None);
 
         assert_eq!(state.search_query(), None);
+        assert!(!state.is_search_editing());
         assert_eq!(state.current_view(), TuiView::Hotspots);
         assert!(!state.should_exit());
+    }
+
+    #[test]
+    fn reducer_enter_confirms_search_and_keeps_filtered_rows_active() {
+        let snapshot = test_snapshot();
+        let mut state = TuiAppState::default();
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Char('/'), None);
+        for character in "lib".chars() {
+            reduce_test_key(&mut state, &snapshot, KeyCode::Char(character), None);
+        }
+        reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
+
+        assert_eq!(state.search_query(), Some("lib"));
+        assert!(!state.is_search_editing());
+        assert_eq!(
+            filtered_visible_rows(&snapshot, &state),
+            vec!["#1 src/lib.rs score 0.640"]
+        );
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
+
+        assert_eq!(state.current_view(), TuiView::FileDetail);
+        assert_eq!(state.current_path(), Some("src/lib.rs"));
     }
 
     #[test]
