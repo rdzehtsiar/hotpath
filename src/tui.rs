@@ -347,6 +347,8 @@ const PRIMARY_VIEWS: [TuiView; 4] = [
     TuiView::CouplingGraph,
     TuiView::ContextBudgeting,
 ];
+const METRIC_BAR_WIDTH: usize = 14;
+const METRIC_LABEL_WIDTH: usize = 10;
 
 impl TuiView {
     fn title(self) -> &'static str {
@@ -2235,7 +2237,12 @@ fn render_hotspot_display_row(
         Span::styled(path, row_style),
         Span::raw("  "),
     ];
-    spans.extend(score_bar_spans(hotspot.score, 14, row_style, options));
+    spans.extend(score_bar_spans(
+        hotspot.score,
+        METRIC_BAR_WIDTH,
+        row_style,
+        options,
+    ));
     spans.push(Span::raw(format!(" {:>4.1}", risk)));
 
     Line::from(spans)
@@ -2248,27 +2255,33 @@ fn hotspot_kpi_lines(snapshot: &TuiSnapshot, options: TuiOptions) -> Vec<Line<'s
         .first()
         .map(|hotspot| hotspot.score)
         .unwrap_or(0.0);
-    let mut spans = vec![Span::styled("Risk ", style(options, TuiSeverity::Muted))];
-    spans.extend(score_bar_spans(
-        top_score,
-        18,
-        style(options, severity_for_score(top_score)),
-        options,
-    ));
-    spans.extend([
-        Span::raw(format!(" {:.1}/10", top_score * 10.0)),
-        Span::styled(
-            format!(
-                "   files {}  warnings {}  languages {}",
-                snapshot.scan.summary.total_files,
-                snapshot.scan.summary.warnings.total_warnings,
-                snapshot.scan.summary.languages.len()
-            ),
-            style(options, TuiSeverity::Muted),
+    vec![
+        metric_bar_line(
+            "Repo Risk",
+            top_score,
+            format!("{} {:.1}", severity_label(top_score), top_score * 10.0),
+            severity_for_score(top_score),
+            options,
         ),
-    ]);
-
-    vec![Line::from(spans), Line::raw("")]
+        metric_bar_line(
+            "Coupling",
+            coupling_pressure(snapshot),
+            format!("{} edges", snapshot.coupling.edges.len()),
+            severity_for_score(coupling_pressure(snapshot)),
+            options,
+        ),
+        metric_bar_line(
+            "Context",
+            context_pressure(snapshot),
+            format!(
+                "{} tokens",
+                snapshot.report.summary.context_estimated_tokens
+            ),
+            severity_for_score(context_pressure(snapshot)),
+            options,
+        ),
+        Line::raw(""),
+    ]
 }
 
 fn context_kpi_lines(snapshot: &TuiSnapshot, options: TuiOptions) -> Vec<Line<'static>> {
@@ -2277,41 +2290,134 @@ fn context_kpi_lines(snapshot: &TuiSnapshot, options: TuiOptions) -> Vec<Line<'s
         .budget
         .as_ref()
         .map(context_budget_status_text)
-        .unwrap_or_else(|| "none configured".to_owned());
+        .unwrap_or_else(|| "no budget".to_owned());
     vec![
-        Line::from(vec![
-            Span::styled("Context ", style(options, TuiSeverity::Muted)),
-            Span::styled(
-                format!("{} tokens", context.summary.estimated_tokens),
-                style(options, TuiSeverity::Medium),
-            ),
-            Span::styled(
-                format!("   budget {budget}"),
-                style(options, TuiSeverity::Muted),
-            ),
-        ]),
+        metric_bar_line(
+            "Context",
+            context_pressure(snapshot),
+            format!("{} tokens", context.summary.estimated_tokens),
+            severity_for_score(context_pressure(snapshot)),
+            options,
+        ),
+        Line::styled(
+            format!("Budget     {budget}"),
+            style(options, TuiSeverity::Muted),
+        ),
         Line::raw(""),
     ]
 }
 
 fn coupling_kpi_lines(snapshot: &TuiSnapshot, options: TuiOptions) -> Vec<Line<'static>> {
     vec![
-        Line::from(vec![
-            Span::styled("Coupling ", style(options, TuiSeverity::Muted)),
-            Span::styled(
-                format!("{} edges", snapshot.coupling.edges.len()),
-                style(options, TuiSeverity::Medium),
+        metric_bar_line(
+            "Coupling",
+            coupling_pressure(snapshot),
+            format!("{} edges", snapshot.coupling.edges.len()),
+            severity_for_score(coupling_pressure(snapshot)),
+            options,
+        ),
+        Line::styled(
+            format!(
+                "Files      {} with fan metrics",
+                snapshot.coupling.fan_by_file.len()
             ),
-            Span::styled(
-                format!(
-                    "   {} files with fan metrics",
-                    snapshot.coupling.fan_by_file.len()
-                ),
-                style(options, TuiSeverity::Muted),
-            ),
-        ]),
+            style(options, TuiSeverity::Muted),
+        ),
         Line::raw(""),
     ]
+}
+
+fn metric_bar_line(
+    label: &str,
+    value: f64,
+    text: String,
+    severity: TuiSeverity,
+    options: TuiOptions,
+) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        format!("{label:<METRIC_LABEL_WIDTH$} "),
+        style(options, TuiSeverity::Muted),
+    )];
+    spans.extend(score_bar_spans(
+        value,
+        METRIC_BAR_WIDTH,
+        style(options, severity),
+        options,
+    ));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(text, style(options, severity)));
+
+    Line::from(spans)
+}
+
+fn coupling_pressure(snapshot: &TuiSnapshot) -> f64 {
+    let max_fan = snapshot
+        .coupling
+        .fan_by_file
+        .iter()
+        .map(|fan| fan.fan_in.max(fan.fan_out))
+        .max()
+        .unwrap_or(0);
+    let edge_pressure = normalized_u64(snapshot.coupling.edges.len() as u64, 100);
+    let fan_pressure = normalized_u64(max_fan, 25);
+
+    edge_pressure.max(fan_pressure)
+}
+
+fn context_pressure(snapshot: &TuiSnapshot) -> f64 {
+    let estimated = snapshot.report.context.summary.estimated_tokens;
+    snapshot
+        .report
+        .context
+        .budget
+        .as_ref()
+        .map(|budget| normalized_u64(estimated, budget.budget_tokens.max(1)))
+        .unwrap_or_else(|| normalized_u64(estimated, 100_000))
+}
+
+fn complexity_pressure_for_path(snapshot: &TuiSnapshot, path: &str) -> Option<f64> {
+    let max_complexity = snapshot
+        .complexity
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.path == path)
+        .filter_map(|symbol| symbol.cyclomatic_complexity)
+        .max()?;
+    Some(normalized_u64(max_complexity, 20))
+}
+
+fn normalized_optional_u64(value: Option<u64>, saturation: u64) -> f64 {
+    value
+        .map(|value| normalized_u64(value, saturation))
+        .unwrap_or(0.0)
+}
+
+fn normalized_u64(value: u64, saturation: u64) -> f64 {
+    if saturation == 0 {
+        return 0.0;
+    }
+
+    (value as f64 / saturation as f64).clamp(0.0, 1.0)
+}
+
+fn severity_label(value: f64) -> &'static str {
+    if value >= 0.70 {
+        "HIGH"
+    } else if value >= 0.40 {
+        "MODERATE"
+    } else {
+        "LOW"
+    }
+}
+
+fn format_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}m tokens", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k tokens", tokens as f64 / 1_000.0)
+    } else {
+        format!("{tokens} tokens")
+    }
 }
 
 fn inspector_lines(
@@ -2359,21 +2465,30 @@ fn file_inspector_lines(
         Line::raw(""),
     ];
     if let Some(hotspot) = hotspot_for_path(snapshot, path) {
-        let mut score_spans = vec![
-            Span::styled("Score ", style(options, TuiSeverity::Muted)),
-            Span::styled(
-                format!("{:.3}", hotspot.score),
-                style(options, severity_for_score(hotspot.score)),
-            ),
-            Span::raw(" "),
-        ];
-        score_spans.extend(score_bar_spans(
+        lines.push(metric_bar_line(
+            "Risk",
             hotspot.score,
-            14,
-            style(options, severity_for_score(hotspot.score)),
+            format!("{:.1}", hotspot.score * 10.0),
+            severity_for_score(hotspot.score),
             options,
         ));
-        lines.push(Line::from(score_spans));
+        lines.push(metric_bar_line(
+            "Churn",
+            normalized_optional_u64(hotspot.raw_metrics.total_churn_lines, 2000),
+            optional_u64(hotspot.raw_metrics.total_churn_lines),
+            severity_for_score(normalized_optional_u64(
+                hotspot.raw_metrics.total_churn_lines,
+                2000,
+            )),
+            options,
+        ));
+        lines.push(metric_bar_line(
+            "Ownership",
+            hotspot.normalized_metrics.ownership.unwrap_or(0.0),
+            optional_percent(hotspot.raw_metrics.dominant_owner_share),
+            severity_for_score(hotspot.normalized_metrics.ownership.unwrap_or(0.0)),
+            options,
+        ));
         lines.push(Line::raw(format!(
             "Rank #{}  Formula {}",
             hotspot.rank, hotspot.formula_version.id
@@ -2418,10 +2533,36 @@ fn file_inspector_lines(
         }
     }
     if let Some(fan) = fan_for_path(snapshot, path) {
-        lines.push(Line::raw(format!(
-            "Fan-in {}  Fan-out {}",
-            fan.fan_in, fan.fan_out
-        )));
+        let fan_pressure = normalized_u64(fan.fan_in.max(fan.fan_out), 25);
+        lines.push(metric_bar_line(
+            "Coupling",
+            fan_pressure,
+            format!("in {} out {}", fan.fan_in, fan.fan_out),
+            severity_for_score(fan_pressure),
+            options,
+        ));
+    }
+    if let Some(complexity) = complexity_pressure_for_path(snapshot, path) {
+        lines.push(metric_bar_line(
+            "Complexity",
+            complexity,
+            severity_label(complexity).to_owned(),
+            severity_for_score(complexity),
+            options,
+        ));
+    }
+    if let Some(file) = file_for_path(snapshot, path) {
+        if let Some(byte_size) = file.byte_size {
+            let tokens = byte_size.div_ceil(4);
+            let context = normalized_u64(tokens, 20_000);
+            lines.push(metric_bar_line(
+                "Context",
+                context,
+                format_tokens(tokens),
+                severity_for_score(context),
+                options,
+            ));
+        }
     }
     let symbol_count = symbols_for_path(snapshot, path).len();
     if symbol_count > 0 {
