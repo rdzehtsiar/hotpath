@@ -48,7 +48,7 @@ pub use report::{
     ReportFinding, ReportFindingLevel, ReportGitSummary, ReportHotspot, ReportSummary,
     REPORT_SCHEMA_VERSION,
 };
-pub use tui::run_tui;
+pub use tui::{run_tui, run_tui_with_options, TuiOptions};
 
 #[cfg(test)]
 const BINARY_SAMPLE_BYTES: usize = 8 * 1024;

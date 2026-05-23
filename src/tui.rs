@@ -7,16 +7,16 @@ use std::fmt;
 use std::io::{self, Stdout};
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 use crate::complexity::{self, ComplexityReport, ComplexitySummary, ComplexitySymbolRecord};
@@ -32,10 +32,21 @@ use crate::{
 
 type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TuiOptions {
+    pub context: ContextOptions,
+    pub ascii: bool,
+    pub no_color: bool,
+}
+
 pub fn run_tui() -> io::Result<()> {
-    let snapshot = TuiSnapshot::load_current_dir().map_err(io::Error::other)?;
+    run_tui_with_options(TuiOptions::default())
+}
+
+pub fn run_tui_with_options(options: TuiOptions) -> io::Result<()> {
+    let snapshot = TuiSnapshot::load_current_dir_with_options(options).map_err(io::Error::other)?;
     let mut terminal = TerminalSession::enter()?;
-    run_app(terminal.terminal_mut(), &snapshot)
+    run_app(terminal.terminal_mut(), &snapshot, options)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -92,6 +103,10 @@ pub enum TuiSnapshotError {
 
 impl TuiSnapshot {
     pub fn load_current_dir() -> Result<Self, TuiSnapshotError> {
+        Self::load_current_dir_with_options(TuiOptions::default())
+    }
+
+    pub fn load_current_dir_with_options(options: TuiOptions) -> Result<Self, TuiSnapshotError> {
         let current_dir = env::current_dir().map_err(TuiSnapshotError::CurrentDir)?;
         let analysis = git::analyze_from_head_at(&current_dir)?;
         let scan = crate::scan_repository(&analysis.worktree_root)?;
@@ -102,7 +117,7 @@ impl TuiSnapshot {
             &analysis.file_metrics,
             &analysis.co_changes,
         );
-        let context = estimate_context(&scan.files, ContextOptions::default());
+        let context = estimate_context(&scan.files, options.context);
         let hotspots = ranked.iter().map(ReportHotspot::from).collect::<Vec<_>>();
         let findings = hotspots.iter().map(ReportFinding::from).collect::<Vec<_>>();
         let mut index = storage::index::IndexStore::open(&analysis.worktree_root)
@@ -294,11 +309,15 @@ impl From<ScanError> for TuiSnapshotError {
     }
 }
 
-fn run_app(terminal: &mut TuiTerminal, snapshot: &TuiSnapshot) -> io::Result<()> {
+fn run_app(
+    terminal: &mut TuiTerminal,
+    snapshot: &TuiSnapshot,
+    options: TuiOptions,
+) -> io::Result<()> {
     let mut state = TuiAppState::default();
 
     loop {
-        terminal.draw(|frame| render(frame, snapshot, &state))?;
+        terminal.draw(|frame| render_with_options(frame, snapshot, &state, options))?;
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
                 reduce_key_with_editor(&mut state, snapshot, key, |name| env::var_os(name));
@@ -322,6 +341,13 @@ pub enum TuiView {
     ExplainScore,
 }
 
+const PRIMARY_VIEWS: [TuiView; 4] = [
+    TuiView::Hotspots,
+    TuiView::RepoTree,
+    TuiView::CouplingGraph,
+    TuiView::ContextBudgeting,
+];
+
 impl TuiView {
     fn title(self) -> &'static str {
         match self {
@@ -333,6 +359,40 @@ impl TuiView {
             Self::CouplingGraph => "Coupling Graph",
             Self::ContextBudgeting => "Context Budgeting",
             Self::ExplainScore => "Explain Score",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TuiPaneFocus {
+    Nav,
+    #[default]
+    Main,
+    Inspector,
+}
+
+impl TuiPaneFocus {
+    fn next(self) -> Self {
+        match self {
+            Self::Nav => Self::Main,
+            Self::Main => Self::Inspector,
+            Self::Inspector => Self::Nav,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Nav => Self::Inspector,
+            Self::Main => Self::Nav,
+            Self::Inspector => Self::Main,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Nav => "Nav",
+            Self::Main => "Main",
+            Self::Inspector => "Inspector",
         }
     }
 }
@@ -438,6 +498,9 @@ pub struct TuiAppState {
     symbol_stack: Vec<Option<SymbolKey>>,
     selections: BTreeMap<TuiView, ListSelection>,
     search: Option<SearchState>,
+    pane_focus: TuiPaneFocus,
+    show_help: bool,
+    command_palette: bool,
     status: Option<String>,
     last_action: Option<TuiAction>,
     should_exit: bool,
@@ -464,6 +527,9 @@ impl Default for TuiAppState {
             symbol_stack: Vec::new(),
             selections,
             search: None,
+            pane_focus: TuiPaneFocus::Main,
+            show_help: false,
+            command_palette: false,
             status: None,
             last_action: None,
             should_exit: false,
@@ -490,6 +556,18 @@ impl TuiAppState {
 
     pub fn status(&self) -> Option<&str> {
         self.status.as_deref()
+    }
+
+    pub fn pane_focus(&self) -> TuiPaneFocus {
+        self.pane_focus
+    }
+
+    pub fn show_help(&self) -> bool {
+        self.show_help
+    }
+
+    pub fn command_palette(&self) -> bool {
+        self.command_palette
     }
 
     pub fn last_action(&self) -> Option<&TuiAction> {
@@ -542,6 +620,50 @@ fn reduce_key_with_editor<F>(
         return;
     }
 
+    if state.show_help {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('?') => state.show_help = false,
+            _ => {}
+        }
+        return;
+    }
+
+    if state.command_palette {
+        match key.code {
+            KeyCode::Esc => state.command_palette = false,
+            KeyCode::Char('1') => {
+                state.command_palette = false;
+                open_hotspots(state);
+            }
+            KeyCode::Char('2') => {
+                state.command_palette = false;
+                open_repo_tree(state);
+            }
+            KeyCode::Char('3') => {
+                state.command_palette = false;
+                let rows = filtered_visible_rows(snapshot, state);
+                open_coupling_graph(state, snapshot, &rows);
+            }
+            KeyCode::Char('4') => {
+                state.command_palette = false;
+                open_context_budgeting(state);
+            }
+            KeyCode::Char('/') => {
+                state.command_palette = false;
+                state.search = Some(SearchState::default());
+                state.status = Some("Search active".to_owned());
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+        state.command_palette = true;
+        state.status = Some("Command palette".to_owned());
+        return;
+    }
+
     let rows = filtered_visible_rows(snapshot, state);
 
     if state.search.is_some() {
@@ -566,19 +688,34 @@ fn reduce_key_with_editor<F>(
 
     match key.code {
         KeyCode::Char('q') => state.should_exit = true,
+        KeyCode::Char('?') => state.show_help = true,
         KeyCode::Char('/') => {
             state.search = Some(SearchState::default());
             state.status = Some("Search active".to_owned());
             clamp_current_selection(state, snapshot);
         }
         KeyCode::Esc => reduce_escape(state),
-        KeyCode::Char('j') => {
+        KeyCode::Tab => {
+            state.pane_focus = state.pane_focus.next();
+            state.status = Some(format!("Focus: {}", state.pane_focus.title()));
+        }
+        KeyCode::BackTab => {
+            state.pane_focus = state.pane_focus.previous();
+            state.status = Some(format!("Focus: {}", state.pane_focus.title()));
+        }
+        KeyCode::Left | KeyCode::Char('h') => reduce_escape(state),
+        KeyCode::Right | KeyCode::Char('l') => drill_down(state, snapshot, &rows),
+        KeyCode::Down | KeyCode::Char('j') => {
             state.selection_for_current_view_mut().move_next(rows.len());
         }
-        KeyCode::Char('k') => {
+        KeyCode::Up | KeyCode::Char('k') => {
             state.selection_for_current_view_mut().move_previous();
         }
         KeyCode::Enter => drill_down(state, snapshot, &rows),
+        KeyCode::Char('1') => open_hotspots(state),
+        KeyCode::Char('2') => open_repo_tree(state),
+        KeyCode::Char('3') => open_coupling_graph(state, snapshot, &rows),
+        KeyCode::Char('4') => open_context_budgeting(state),
         KeyCode::Char('t') => open_repo_tree(state),
         KeyCode::Char('g') => open_coupling_graph(state, snapshot, &rows),
         KeyCode::Char('c') => open_context_budgeting(state),
@@ -698,6 +835,13 @@ fn explain_score(state: &mut TuiAppState, snapshot: &TuiSnapshot, rows: &[String
         path: path.clone(),
     });
     state.status = Some(format!("Explain score: {path}"));
+}
+
+fn open_hotspots(state: &mut TuiAppState) {
+    if state.current_view != TuiView::Hotspots {
+        push_view(state, TuiView::Hotspots, None);
+    }
+    state.status = Some("Hotspots".to_owned());
 }
 
 fn open_repo_tree(state: &mut TuiAppState) {
@@ -1471,6 +1615,7 @@ fn optional_bool(value: Option<bool>) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
+#[cfg(test)]
 fn visible_row_window(
     rows: &[String],
     selected: usize,
@@ -1484,67 +1629,890 @@ fn visible_row_window(
     rows.iter().enumerate().skip(start).take(limit)
 }
 
-fn render(frame: &mut Frame<'_>, snapshot: &TuiSnapshot, state: &TuiAppState) {
-    let area = frame.area();
-    let [_, content, _] = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Fill(1),
-            Constraint::Length(10),
-            Constraint::Fill(1),
-        ])
-        .areas(area);
-    let rows = filtered_visible_rows(snapshot, state);
-    let selected = state.selected_index();
-    let mut body_lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "Hotpath",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" local codebase intelligence"),
-        ]),
-        Line::raw(""),
-        Line::raw(match state.current_path() {
-            Some(path) => format!("View: {} - {}", state.current_view.title(), path),
-            None => format!("View: {}", state.current_view.title()),
-        }),
-    ];
-
-    if rows.is_empty() {
-        body_lines.push(Line::raw("No rows."));
-    } else {
-        body_lines.extend(visible_row_window(&rows, selected, 4).map(|(index, row)| {
-            if index == selected {
-                Line::raw(format!("> {row}"))
-            } else {
-                Line::raw(format!("  {row}"))
-            }
-        }));
-    }
-
-    let footer = match state.search_query() {
-        Some(query) => format!("/{query}"),
-        None => state.status().map(str::to_owned).unwrap_or_else(|| {
-            "j/k move, Enter drill down, / search, t tree, g graph, c context, x explain, Esc back, e editor, q quit".to_owned()
-        }),
-    };
-    body_lines.push(Line::raw(""));
-    body_lines.push(Line::raw(footer));
-
-    let body = Paragraph::new(body_lines)
-        .alignment(Alignment::Center)
-        .block(
-            Block::default()
-                .title(" Hotpath TUI ")
-                .borders(Borders::ALL),
-        );
-
-    frame.render_widget(body, content);
+#[derive(Debug, Clone, PartialEq)]
+struct DisplayRow {
+    text: String,
+    label: String,
+    meta: String,
+    severity: TuiSeverity,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum TuiSeverity {
+    High,
+    Medium,
+    Low,
+    #[default]
+    Neutral,
+    Muted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuiLayoutMode {
+    Wide,
+    Medium,
+    Narrow,
+}
+
+fn layout_mode(area: Rect) -> TuiLayoutMode {
+    if area.width >= 120 && area.height >= 30 {
+        TuiLayoutMode::Wide
+    } else if area.width >= 90 {
+        TuiLayoutMode::Medium
+    } else {
+        TuiLayoutMode::Narrow
+    }
+}
+
+fn display_rows(snapshot: &TuiSnapshot, state: &TuiAppState) -> Vec<DisplayRow> {
+    filtered_visible_rows(snapshot, state)
+        .into_iter()
+        .map(|text| display_row_from_text(snapshot, state.current_view, text))
+        .collect()
+}
+
+fn display_row_from_text(snapshot: &TuiSnapshot, view: TuiView, text: String) -> DisplayRow {
+    match view {
+        TuiView::Hotspots => hotspot_display_row(snapshot, text),
+        TuiView::RepoTree => repo_tree_display_row(snapshot, text),
+        TuiView::CouplingGraph => coupling_display_row(text),
+        TuiView::ContextBudgeting => context_display_row(text),
+        TuiView::ExplainScore => explain_display_row(text),
+        TuiView::FileDetail | TuiView::SymbolDetail | TuiView::GitDetail => {
+            detail_display_row(text)
+        }
+    }
+}
+
+fn hotspot_display_row(snapshot: &TuiSnapshot, text: String) -> DisplayRow {
+    let hotspot =
+        hotspot_path_from_row(snapshot, &text).and_then(|path| hotspot_for_path(snapshot, &path));
+    let severity = hotspot
+        .map(|hotspot| severity_for_score(hotspot.score))
+        .unwrap_or(TuiSeverity::Neutral);
+    let meta = hotspot
+        .map(|hotspot| {
+            let risk = (hotspot.score * 10.0).round() as u64;
+            format!(
+                "risk {risk}/10  churn {}  authors {}",
+                optional_u64(hotspot.raw_metrics.total_churn_lines),
+                optional_u64(hotspot.raw_metrics.author_count)
+            )
+        })
+        .unwrap_or_default();
+
+    DisplayRow {
+        label: "hotspot".to_owned(),
+        text,
+        meta,
+        severity,
+    }
+}
+
+fn repo_tree_display_row(snapshot: &TuiSnapshot, text: String) -> DisplayRow {
+    let severity = repo_tree_path_from_row(snapshot, &text)
+        .and_then(|path| {
+            hotspot_for_path(snapshot, &path).map(|hotspot| severity_for_score(hotspot.score))
+        })
+        .unwrap_or(TuiSeverity::Muted);
+    let label = if text.contains("[dir]") {
+        "dir"
+    } else {
+        "file"
+    }
+    .to_owned();
+
+    DisplayRow {
+        text,
+        label,
+        meta: String::new(),
+        severity,
+    }
+}
+
+fn detail_display_row(text: String) -> DisplayRow {
+    let severity = if text.starts_with("Hotspot score:")
+        || text.starts_with("Rank:")
+        || text.starts_with("Large symbol: true")
+    {
+        TuiSeverity::Medium
+    } else if text.starts_with("Limitation:") || text.starts_with("Warnings:") {
+        TuiSeverity::High
+    } else if text.contains("unknown") || text.contains("not ranked") {
+        TuiSeverity::Muted
+    } else {
+        TuiSeverity::Neutral
+    };
+    let label = text
+        .split_once(':')
+        .map(|(label, _)| label.to_ascii_lowercase())
+        .unwrap_or_else(|| "detail".to_owned());
+
+    DisplayRow {
+        text,
+        label,
+        meta: String::new(),
+        severity,
+    }
+}
+
+fn coupling_display_row(text: String) -> DisplayRow {
+    let severity = if text.starts_with("Incoming: none")
+        || text.starts_with("Outgoing: none")
+        || text.starts_with("Edges: none")
+    {
+        TuiSeverity::Muted
+    } else if text.contains("fan-in") || text.contains("fan-out") {
+        TuiSeverity::Medium
+    } else {
+        TuiSeverity::Neutral
+    };
+    let label = if text.starts_with("Incoming:") {
+        "incoming"
+    } else if text.starts_with("Outgoing:") {
+        "outgoing"
+    } else {
+        "coupling"
+    };
+
+    DisplayRow {
+        text,
+        label: label.to_owned(),
+        meta: String::new(),
+        severity,
+    }
+}
+
+fn context_display_row(text: String) -> DisplayRow {
+    let severity = if text.contains("over budget") {
+        TuiSeverity::High
+    } else if text.starts_with("Skipped:") || text.starts_with("Approximation:") {
+        TuiSeverity::Muted
+    } else if text.starts_with("Group:") || text.starts_with("Budget:") {
+        TuiSeverity::Medium
+    } else {
+        TuiSeverity::Neutral
+    };
+
+    DisplayRow {
+        text,
+        label: "context".to_owned(),
+        meta: String::new(),
+        severity,
+    }
+}
+
+fn explain_display_row(text: String) -> DisplayRow {
+    let severity = if text.starts_with("Limitation:") {
+        TuiSeverity::High
+    } else if text.starts_with("Term:") {
+        TuiSeverity::Medium
+    } else {
+        TuiSeverity::Neutral
+    };
+
+    DisplayRow {
+        text,
+        label: "score".to_owned(),
+        meta: String::new(),
+        severity,
+    }
+}
+
+fn severity_for_score(score: f64) -> TuiSeverity {
+    if score >= 0.70 {
+        TuiSeverity::High
+    } else if score >= 0.40 {
+        TuiSeverity::Medium
+    } else {
+        TuiSeverity::Low
+    }
+}
+
+#[cfg(test)]
+fn render(frame: &mut Frame<'_>, snapshot: &TuiSnapshot, state: &TuiAppState) {
+    render_with_options(frame, snapshot, state, TuiOptions::default());
+}
+
+fn render_with_options(
+    frame: &mut Frame<'_>,
+    snapshot: &TuiSnapshot,
+    state: &TuiAppState,
+    options: TuiOptions,
+) {
+    let area = frame.area();
+    let [header, body, footer] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(2),
+        ])
+        .areas(area);
+    let rows = display_rows(snapshot, state);
+    let mode = layout_mode(area);
+
+    render_header(frame, header, snapshot, state, options);
+    match mode {
+        TuiLayoutMode::Wide => render_wide_body(frame, body, snapshot, state, &rows, options),
+        TuiLayoutMode::Medium => render_medium_body(frame, body, snapshot, state, &rows, options),
+        TuiLayoutMode::Narrow => render_narrow_body(frame, body, snapshot, state, &rows, options),
+    }
+    render_footer(frame, footer, state);
+
+    if state.show_help {
+        render_help_overlay(frame, area, options);
+    }
+    if state.command_palette {
+        render_command_palette(frame, area, options);
+    }
+}
+
+fn render_header(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &TuiSnapshot,
+    state: &TuiAppState,
+    options: TuiOptions,
+) {
+    let head = short_commit(&snapshot.report.summary.git.head_commit_id);
+    let path = state.current_path().unwrap_or("repo");
+    let title_style = style(options, TuiSeverity::Low).add_modifier(Modifier::BOLD);
+    let muted = style(options, TuiSeverity::Muted);
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("Hotpath", title_style),
+            Span::raw("  "),
+            Span::styled("local risk triage", muted),
+            Span::raw("  "),
+            Span::styled(format!("HEAD {head}"), muted),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                state.current_view.title(),
+                style(options, TuiSeverity::Medium),
+            ),
+            Span::raw(" / "),
+            Span::raw(truncate_middle(
+                path,
+                area.width.saturating_sub(48) as usize,
+            )),
+            Span::raw("  "),
+            Span::styled(
+                format!(
+                    "{} files  {} hotspots  {} tokens",
+                    snapshot.scan.summary.total_files,
+                    snapshot.report.summary.hotspot_count,
+                    snapshot.report.summary.context_estimated_tokens
+                ),
+                muted,
+            ),
+        ]),
+    ])
+    .block(Block::default().borders(Borders::BOTTOM));
+
+    frame.render_widget(header, area);
+}
+
+fn render_wide_body(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &TuiSnapshot,
+    state: &TuiAppState,
+    rows: &[DisplayRow],
+    options: TuiOptions,
+) {
+    let [nav, main, inspector] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(22),
+            Constraint::Percentage(58),
+            Constraint::Percentage(42),
+        ])
+        .areas(area);
+    render_nav(frame, nav, state, options);
+    render_main_panel(frame, main, snapshot, state, rows, options);
+    render_inspector(frame, inspector, snapshot, state, rows, options);
+}
+
+fn render_medium_body(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &TuiSnapshot,
+    state: &TuiAppState,
+    rows: &[DisplayRow],
+    options: TuiOptions,
+) {
+    let [tabs, content] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(8)])
+        .areas(area);
+    render_tabs(frame, tabs, state, options);
+    let [main, inspector] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
+        .areas(content);
+    render_main_panel(frame, main, snapshot, state, rows, options);
+    render_inspector(frame, inspector, snapshot, state, rows, options);
+}
+
+fn render_narrow_body(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &TuiSnapshot,
+    state: &TuiAppState,
+    rows: &[DisplayRow],
+    options: TuiOptions,
+) {
+    let [tabs, main] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(8)])
+        .areas(area);
+    render_tabs(frame, tabs, state, options);
+    render_main_panel(frame, main, snapshot, state, rows, options);
+}
+
+fn render_nav(frame: &mut Frame<'_>, area: Rect, state: &TuiAppState, options: TuiOptions) {
+    let lines = PRIMARY_VIEWS
+        .iter()
+        .enumerate()
+        .map(|(index, view)| {
+            let active = *view == state.current_view;
+            let marker = if active { ">" } else { " " };
+            let style = if active {
+                style(options, TuiSeverity::Medium).add_modifier(Modifier::BOLD)
+            } else {
+                style(options, TuiSeverity::Muted)
+            };
+            Line::from(vec![Span::styled(
+                format!("{marker} {} {}", index + 1, view.title()),
+                style,
+            )])
+        })
+        .collect::<Vec<_>>();
+    let block = panel_block("Navigate", state.pane_focus == TuiPaneFocus::Nav, options);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &TuiAppState, options: TuiOptions) {
+    let labels = PRIMARY_VIEWS
+        .iter()
+        .enumerate()
+        .map(|(index, view)| {
+            if *view == state.current_view {
+                format!("[{} {}]", index + 1, view.title())
+            } else {
+                format!(" {} {} ", index + 1, view.title())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    frame.render_widget(
+        Paragraph::new(labels)
+            .style(style(options, TuiSeverity::Muted))
+            .block(panel_block(
+                "Views",
+                state.pane_focus == TuiPaneFocus::Nav,
+                options,
+            )),
+        area,
+    );
+}
+
+fn render_main_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &TuiSnapshot,
+    state: &TuiAppState,
+    rows: &[DisplayRow],
+    options: TuiOptions,
+) {
+    let inner_height = area.height.saturating_sub(2).max(1) as usize;
+    let selected = state.selected_index();
+    let mut lines = match state.current_view {
+        TuiView::Hotspots => hotspot_kpi_lines(snapshot, options),
+        TuiView::ContextBudgeting => context_kpi_lines(snapshot, options),
+        TuiView::CouplingGraph => coupling_kpi_lines(snapshot, options),
+        _ => Vec::new(),
+    };
+    let remaining = inner_height.saturating_sub(lines.len()).max(1);
+    if rows.is_empty() {
+        lines.push(Line::styled("No rows.", style(options, TuiSeverity::Muted)));
+    } else {
+        lines.extend(
+            visible_display_row_window(rows, selected, remaining).map(|(index, row)| {
+                render_display_row(row, index == selected, area.width, options)
+            }),
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(panel_block(
+                state.current_view.title(),
+                state.pane_focus == TuiPaneFocus::Main,
+                options,
+            )),
+        area,
+    );
+}
+
+fn render_inspector(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &TuiSnapshot,
+    state: &TuiAppState,
+    rows: &[DisplayRow],
+    options: TuiOptions,
+) {
+    let lines = inspector_lines(snapshot, state, rows, area.width, options);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(panel_block(
+                "Inspector",
+                state.pane_focus == TuiPaneFocus::Inspector,
+                options,
+            )),
+        area,
+    );
+}
+
+fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiAppState) {
+    let text = match state.search_query() {
+        Some(query) => format!("/{query}"),
+        None => state.status().map(str::to_owned).unwrap_or_else(|| {
+            "j/k or arrows move  Enter drill  / search  1-4 views  ? help  Ctrl-P commands  e editor  q quit".to_owned()
+        }),
+    };
+    frame.render_widget(
+        Paragraph::new(text)
+            .alignment(Alignment::Left)
+            .block(Block::default().borders(Borders::TOP)),
+        area,
+    );
+}
+
+fn visible_display_row_window(
+    rows: &[DisplayRow],
+    selected: usize,
+    limit: usize,
+) -> impl Iterator<Item = (usize, &DisplayRow)> {
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(limit)
+        .min(rows.len());
+
+    rows.iter().enumerate().skip(start).take(limit)
+}
+
+fn render_display_row(
+    row: &DisplayRow,
+    selected: bool,
+    width: u16,
+    options: TuiOptions,
+) -> Line<'static> {
+    let marker = if selected { ">" } else { " " };
+    let label_width = 9usize;
+    let meta_width = row.meta.len().min(32);
+    let text_limit = (width as usize)
+        .saturating_sub(label_width + meta_width + 8)
+        .max(12);
+    let row_style = if selected {
+        style(options, row.severity).add_modifier(Modifier::BOLD)
+    } else {
+        style(options, row.severity)
+    };
+
+    let mut spans = vec![
+        Span::styled(marker.to_owned(), row_style),
+        Span::raw(" "),
+        Span::styled(
+            format!("{:<label_width$}", row.label),
+            style(options, TuiSeverity::Muted),
+        ),
+        Span::raw(" "),
+        Span::styled(truncate_middle(&row.text, text_limit), row_style),
+    ];
+    if !row.meta.is_empty() {
+        spans.extend([
+            Span::raw("  "),
+            Span::styled(
+                truncate_middle(&row.meta, meta_width.max(1)),
+                style(options, TuiSeverity::Muted),
+            ),
+        ]);
+    }
+
+    Line::from(spans)
+}
+
+fn hotspot_kpi_lines(snapshot: &TuiSnapshot, options: TuiOptions) -> Vec<Line<'static>> {
+    let top_score = snapshot
+        .report
+        .hotspots
+        .first()
+        .map(|hotspot| hotspot.score)
+        .unwrap_or(0.0);
+    vec![
+        Line::from(vec![
+            Span::styled("Risk ", style(options, TuiSeverity::Muted)),
+            Span::styled(
+                score_bar(top_score, 18, options),
+                style(options, severity_for_score(top_score)),
+            ),
+            Span::raw(format!(" {:.1}/10", top_score * 10.0)),
+            Span::styled(
+                format!(
+                    "   files {}  warnings {}  languages {}",
+                    snapshot.scan.summary.total_files,
+                    snapshot.scan.summary.warnings.total_warnings,
+                    snapshot.scan.summary.languages.len()
+                ),
+                style(options, TuiSeverity::Muted),
+            ),
+        ]),
+        Line::raw(""),
+    ]
+}
+
+fn context_kpi_lines(snapshot: &TuiSnapshot, options: TuiOptions) -> Vec<Line<'static>> {
+    let context = &snapshot.report.context;
+    let budget = context
+        .budget
+        .as_ref()
+        .map(context_budget_status_text)
+        .unwrap_or_else(|| "none configured".to_owned());
+    vec![
+        Line::from(vec![
+            Span::styled("Context ", style(options, TuiSeverity::Muted)),
+            Span::styled(
+                format!("{} tokens", context.summary.estimated_tokens),
+                style(options, TuiSeverity::Medium),
+            ),
+            Span::styled(
+                format!("   budget {budget}"),
+                style(options, TuiSeverity::Muted),
+            ),
+        ]),
+        Line::raw(""),
+    ]
+}
+
+fn coupling_kpi_lines(snapshot: &TuiSnapshot, options: TuiOptions) -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![
+            Span::styled("Coupling ", style(options, TuiSeverity::Muted)),
+            Span::styled(
+                format!("{} edges", snapshot.coupling.edges.len()),
+                style(options, TuiSeverity::Medium),
+            ),
+            Span::styled(
+                format!(
+                    "   {} files with fan metrics",
+                    snapshot.coupling.fan_by_file.len()
+                ),
+                style(options, TuiSeverity::Muted),
+            ),
+        ]),
+        Line::raw(""),
+    ]
+}
+
+fn inspector_lines(
+    snapshot: &TuiSnapshot,
+    state: &TuiAppState,
+    rows: &[DisplayRow],
+    width: u16,
+    options: TuiOptions,
+) -> Vec<Line<'static>> {
+    let selected_text = rows
+        .get(state.selected_index())
+        .map(|row| row.text.as_str());
+    let selected_path = selected_text
+        .and_then(|row| match state.current_view {
+            TuiView::Hotspots => hotspot_path_from_row(snapshot, row),
+            TuiView::RepoTree => repo_tree_path_from_row(snapshot, row),
+            TuiView::CouplingGraph => {
+                coupling_graph_path_from_row(snapshot, state.current_path.as_deref(), row)
+            }
+            TuiView::FileDetail
+            | TuiView::SymbolDetail
+            | TuiView::GitDetail
+            | TuiView::ExplainScore => state.current_path.clone(),
+            TuiView::ContextBudgeting => None,
+        })
+        .or_else(|| state.current_path.clone());
+
+    match selected_path {
+        Some(path) => file_inspector_lines(snapshot, &path, width, options),
+        None => repo_inspector_lines(snapshot, options),
+    }
+}
+
+fn file_inspector_lines(
+    snapshot: &TuiSnapshot,
+    path: &str,
+    width: u16,
+    options: TuiOptions,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::styled(
+            truncate_middle(path, width.saturating_sub(4) as usize),
+            style(options, TuiSeverity::Medium).add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+    ];
+    if let Some(hotspot) = hotspot_for_path(snapshot, path) {
+        lines.push(Line::from(vec![
+            Span::styled("Score ", style(options, TuiSeverity::Muted)),
+            Span::styled(
+                format!("{:.3}", hotspot.score),
+                style(options, severity_for_score(hotspot.score)),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                score_bar(hotspot.score, 14, options),
+                style(options, severity_for_score(hotspot.score)),
+            ),
+        ]));
+        lines.push(Line::raw(format!(
+            "Rank #{}  Formula {}",
+            hotspot.rank, hotspot.formula_version.id
+        )));
+        lines.push(Line::raw(format!(
+            "Churn {}  Recent {}",
+            optional_u64(hotspot.raw_metrics.total_churn_lines),
+            optional_u64(hotspot.raw_metrics.recent_churn_lines)
+        )));
+        lines.push(Line::raw(format!(
+            "Authors {}  Owner {}",
+            optional_u64(hotspot.raw_metrics.author_count),
+            optional_percent(hotspot.raw_metrics.dominant_owner_share)
+        )));
+    } else {
+        lines.push(Line::styled(
+            "No hotspot score for this file",
+            style(options, TuiSeverity::Muted),
+        ));
+    }
+    if let Some(file) = file_for_path(snapshot, path) {
+        lines.push(Line::raw(""));
+        lines.push(Line::raw(format!(
+            "{}  {} lines  {} bytes",
+            file.language.unwrap_or("unknown"),
+            optional_u64(file.line_count),
+            optional_u64(file.byte_size)
+        )));
+        let flags = [
+            ("generated", file.is_generated),
+            ("vendor", file.is_vendor),
+            ("symlink", file.is_symlink),
+        ]
+        .into_iter()
+        .filter_map(|(label, enabled)| enabled.then_some(label))
+        .collect::<Vec<_>>();
+        if !flags.is_empty() {
+            lines.push(Line::styled(
+                format!("Flags: {}", flags.join(", ")),
+                style(options, TuiSeverity::High),
+            ));
+        }
+    }
+    if let Some(fan) = fan_for_path(snapshot, path) {
+        lines.push(Line::raw(format!(
+            "Fan-in {}  Fan-out {}",
+            fan.fan_in, fan.fan_out
+        )));
+    }
+    let symbol_count = symbols_for_path(snapshot, path).len();
+    if symbol_count > 0 {
+        lines.push(Line::raw(format!("{symbol_count} symbols")));
+    }
+
+    lines
+}
+
+fn repo_inspector_lines(snapshot: &TuiSnapshot, options: TuiOptions) -> Vec<Line<'static>> {
+    vec![
+        Line::styled(
+            "Repository",
+            style(options, TuiSeverity::Medium).add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::raw(format!("Files: {}", snapshot.scan.summary.total_files)),
+        Line::raw(format!(
+            "Hotspots: {}",
+            snapshot.report.summary.hotspot_count
+        )),
+        Line::raw(format!(
+            "Context tokens: {}",
+            snapshot.report.summary.context_estimated_tokens
+        )),
+        Line::raw(format!(
+            "Dependency edges: {}",
+            snapshot.coupling.edges.len()
+        )),
+        Line::raw(format!(
+            "Symbols: {}",
+            snapshot.symbols.summary.symbol_count
+        )),
+        Line::raw(""),
+        Line::styled(
+            "Scores are advisory and local.",
+            style(options, TuiSeverity::Muted),
+        ),
+    ]
+}
+
+fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, options: TuiOptions) {
+    let popup = centered_rect(72, 60, area);
+    frame.render_widget(Clear, popup);
+    let lines = vec![
+        Line::styled(
+            "Hotpath keys",
+            style(options, TuiSeverity::Medium).add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::raw("j/k or arrows  move selection"),
+        Line::raw("Enter or l      drill into selected row"),
+        Line::raw("h or Esc        go back, then exit at root"),
+        Line::raw("/               search current view"),
+        Line::raw("1..4            Hotspots, Tree, Coupling, Context"),
+        Line::raw("t/g/c/x         tree, graph, context, explain score"),
+        Line::raw("Tab             cycle focus"),
+        Line::raw("Ctrl-P          command palette"),
+        Line::raw("e               resolve editor action"),
+        Line::raw("q               quit"),
+        Line::raw(""),
+        Line::styled(
+            "All analysis stays local and offline.",
+            style(options, TuiSeverity::Muted),
+        ),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).block(panel_block("Help", true, options)),
+        popup,
+    );
+}
+
+fn render_command_palette(frame: &mut Frame<'_>, area: Rect, options: TuiOptions) {
+    let popup = centered_rect(64, 42, area);
+    frame.render_widget(Clear, popup);
+    let lines = vec![
+        Line::styled(
+            "Command palette",
+            style(options, TuiSeverity::Medium).add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::raw("1  Open hotspots"),
+        Line::raw("2  Open repository tree"),
+        Line::raw("3  Open coupling graph"),
+        Line::raw("4  Open context budgeting"),
+        Line::raw("/  Search current view"),
+        Line::raw("Esc close"),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).block(panel_block("Ctrl-P", true, options)),
+        popup,
+    );
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1]);
+
+    horizontal[1]
+}
+
+fn panel_block<'a>(title: &'a str, focused: bool, options: TuiOptions) -> Block<'a> {
+    let border_style = if focused {
+        style(options, TuiSeverity::Medium)
+    } else {
+        style(options, TuiSeverity::Muted)
+    };
+    Block::default()
+        .title(format!(" {title} "))
+        .borders(Borders::ALL)
+        .border_type(if options.ascii {
+            BorderType::Plain
+        } else {
+            BorderType::Rounded
+        })
+        .border_style(border_style)
+}
+
+fn style(options: TuiOptions, severity: TuiSeverity) -> Style {
+    if options.no_color {
+        return Style::default();
+    }
+
+    let color = match severity {
+        TuiSeverity::High => Color::Red,
+        TuiSeverity::Medium => Color::Yellow,
+        TuiSeverity::Low => Color::Green,
+        TuiSeverity::Neutral => Color::White,
+        TuiSeverity::Muted => Color::DarkGray,
+    };
+
+    Style::default().fg(color)
+}
+
+fn score_bar(score: f64, width: usize, options: TuiOptions) -> String {
+    let filled = ((score.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
+    let fill = if options.ascii { "#" } else { "█" };
+    let empty = if options.ascii { "." } else { "░" };
+
+    format!(
+        "{}{}",
+        fill.repeat(filled),
+        empty.repeat(width.saturating_sub(filled))
+    )
+}
+
+fn short_commit(value: &str) -> String {
+    value.chars().take(7).collect()
+}
+
+fn truncate_middle(value: &str, max: usize) -> String {
+    let length = value.chars().count();
+    if length <= max {
+        return value.to_owned();
+    }
+    if max <= 1 {
+        return "…".to_owned();
+    }
+    if max <= 3 {
+        return ".".repeat(max);
+    }
+    let left_len = (max - 1) / 2;
+    let right_len = max - 1 - left_len;
+    let left = value.chars().take(left_len).collect::<String>();
+    let right = value
+        .chars()
+        .rev()
+        .take(right_len)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+
+    format!("{left}…{right}")
+}
 #[cfg(test)]
 fn should_quit(key: KeyEvent) -> bool {
     if key.kind != KeyEventKind::Press {
@@ -1621,6 +2589,7 @@ mod tests {
     };
     use crate::test_support::parse_import as import;
     use crate::{ContentKind, FileRecord, ParseFileRecord, ParseSymbolRecord, ScanReport};
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn quit_keys_are_q_and_escape_key_presses() {
@@ -1640,6 +2609,27 @@ mod tests {
         reduce_test_key(&mut state, &snapshot, KeyCode::Char('k'), None);
 
         assert_eq!(state.selected_index(), 0);
+    }
+
+    #[test]
+    fn reducer_supports_modern_navigation_keys_and_overlays() {
+        let snapshot = test_snapshot();
+        let mut state = TuiAppState::default();
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Char('?'), None);
+        assert!(state.show_help());
+        reduce_test_key(&mut state, &snapshot, KeyCode::Esc, None);
+        assert!(!state.show_help());
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Tab, None);
+        assert_eq!(state.pane_focus(), TuiPaneFocus::Inspector);
+        reduce_test_key(&mut state, &snapshot, KeyCode::BackTab, None);
+        assert_eq!(state.pane_focus(), TuiPaneFocus::Main);
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Char('2'), None);
+        assert_eq!(state.current_view(), TuiView::RepoTree);
+        reduce_test_key(&mut state, &snapshot, KeyCode::Char('1'), None);
+        assert_eq!(state.current_view(), TuiView::Hotspots);
     }
 
     #[test]
@@ -1727,6 +2717,37 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(window, vec![(2, "c"), (3, "d"), (4, "e"), (5, "f")]);
+    }
+
+    #[test]
+    fn responsive_layout_modes_match_terminal_widths() {
+        assert_eq!(layout_mode(Rect::new(0, 0, 130, 36)), TuiLayoutMode::Wide);
+        assert_eq!(layout_mode(Rect::new(0, 0, 100, 26)), TuiLayoutMode::Medium);
+        assert_eq!(layout_mode(Rect::new(0, 0, 80, 24)), TuiLayoutMode::Narrow);
+    }
+
+    #[test]
+    fn render_dashboard_contains_header_nav_and_inspector() {
+        let snapshot = test_snapshot();
+        let state = TuiAppState::default();
+        let backend = TestBackend::new(130, 36);
+        let mut terminal = Terminal::new(backend).expect("test terminal should initialize");
+
+        terminal
+            .draw(|frame| render(frame, &snapshot, &state))
+            .expect("render should succeed");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Hotpath"));
+        assert!(rendered.contains("Navigate"));
+        assert!(rendered.contains("Inspector"));
+        assert!(rendered.contains("src/lib.rs"));
     }
 
     #[test]

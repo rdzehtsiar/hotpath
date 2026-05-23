@@ -54,7 +54,7 @@ enum Commands {
     Doctor,
 
     /// Open the early keyboard-first terminal user interface.
-    Tui,
+    Tui(TuiArgs),
 }
 
 #[derive(Debug, Args)]
@@ -159,6 +159,29 @@ struct ContextArgs {
 }
 
 #[derive(Debug, Args)]
+struct TuiArgs {
+    /// Token budget to compare against the TUI context estimate. Accepts integers with optional k or m suffix.
+    #[arg(long, value_parser = parse_budget_tokens_arg)]
+    budget: Option<u64>,
+
+    /// Exclude generated files from the TUI context estimate.
+    #[arg(long)]
+    exclude_generated: bool,
+
+    /// Exclude vendor files from the TUI context estimate.
+    #[arg(long)]
+    exclude_vendor: bool,
+
+    /// Use ASCII-only TUI drawing characters.
+    #[arg(long)]
+    ascii: bool,
+
+    /// Disable semantic TUI colors.
+    #[arg(long)]
+    no_color: bool,
+}
+
+#[derive(Debug, Args)]
 struct ScanArgs {
     /// Print a human-readable scan summary.
     #[arg(long, conflicts_with = "json")]
@@ -199,7 +222,7 @@ fn main() -> ExitCode {
 
     let command = match cli.command {
         Commands::Ci(args) => return run_ci(args),
-        Commands::Tui => return run_tui(),
+        Commands::Tui(args) => return run_tui(args),
         command => command,
     };
 
@@ -248,7 +271,7 @@ fn main() -> ExitCode {
         }
         Commands::Report(_) => hotpath::report::report_markdown().map_err(Into::into),
         Commands::Ci(_) => unreachable!("CI command is handled before generic command dispatch"),
-        Commands::Tui => unreachable!("TUI command is handled before generic command dispatch"),
+        Commands::Tui(_) => unreachable!("TUI command is handled before generic command dispatch"),
         Commands::Doctor => hotpath::doctor().map_err(Into::into),
     };
 
@@ -264,8 +287,16 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_tui() -> ExitCode {
-    match hotpath::run_tui() {
+fn run_tui(args: TuiArgs) -> ExitCode {
+    match hotpath::run_tui_with_options(hotpath::TuiOptions {
+        context: hotpath::ContextOptions {
+            exclude_generated: args.exclude_generated,
+            exclude_vendor: args.exclude_vendor,
+            budget_tokens: args.budget,
+        },
+        ascii: args.ascii,
+        no_color: args.no_color,
+    }) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("hotpath: {error}");
