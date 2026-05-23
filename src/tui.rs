@@ -1635,6 +1635,14 @@ struct DisplayRow {
     label: String,
     meta: String,
     severity: TuiSeverity,
+    hotspot: Option<DisplayHotspotRow>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DisplayHotspotRow {
+    rank: u64,
+    path: String,
+    score: f64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1702,7 +1710,12 @@ fn hotspot_display_row(snapshot: &TuiSnapshot, text: String) -> DisplayRow {
         .unwrap_or_default();
 
     DisplayRow {
-        label: "hotspot".to_owned(),
+        hotspot: hotspot.map(|hotspot| DisplayHotspotRow {
+            rank: hotspot.rank,
+            path: hotspot.path.clone(),
+            score: hotspot.score,
+        }),
+        label: String::new(),
         text,
         meta,
         severity,
@@ -1727,6 +1740,7 @@ fn repo_tree_display_row(snapshot: &TuiSnapshot, text: String) -> DisplayRow {
         label,
         meta: String::new(),
         severity,
+        hotspot: None,
     }
 }
 
@@ -1753,6 +1767,7 @@ fn detail_display_row(text: String) -> DisplayRow {
         label,
         meta: String::new(),
         severity,
+        hotspot: None,
     }
 }
 
@@ -1780,6 +1795,7 @@ fn coupling_display_row(text: String) -> DisplayRow {
         label: label.to_owned(),
         meta: String::new(),
         severity,
+        hotspot: None,
     }
 }
 
@@ -1799,6 +1815,7 @@ fn context_display_row(text: String) -> DisplayRow {
         label: "context".to_owned(),
         meta: String::new(),
         severity,
+        hotspot: None,
     }
 }
 
@@ -1816,6 +1833,7 @@ fn explain_display_row(text: String) -> DisplayRow {
         label: "score".to_owned(),
         meta: String::new(),
         severity,
+        hotspot: None,
     }
 }
 
@@ -2047,7 +2065,7 @@ fn render_main_panel(
     }
     frame.render_widget(
         Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
+            .wrap(Wrap { trim: false })
             .block(panel_block(
                 state.current_view.title(),
                 state.pane_focus == TuiPaneFocus::Main,
@@ -2112,6 +2130,10 @@ fn render_display_row(
     width: u16,
     options: TuiOptions,
 ) -> Line<'static> {
+    if let Some(hotspot) = &row.hotspot {
+        return render_hotspot_display_row(hotspot, selected, width, options);
+    }
+
     let marker = if selected { ">" } else { " " };
     let label_width = 9usize;
     let meta_width = row.meta.len().min(32);
@@ -2147,6 +2169,43 @@ fn render_display_row(
     Line::from(spans)
 }
 
+fn render_hotspot_display_row(
+    hotspot: &DisplayHotspotRow,
+    selected: bool,
+    width: u16,
+    options: TuiOptions,
+) -> Line<'static> {
+    let marker = if selected { ">" } else { " " };
+    let row_style = if selected {
+        style(options, severity_for_score(hotspot.score)).add_modifier(Modifier::BOLD)
+    } else {
+        style(options, severity_for_score(hotspot.score))
+    };
+    let selector_width = 2usize;
+    let rank_width = 5usize;
+    let risk_width = 26usize.min((width as usize).saturating_sub(12));
+    let path_width = (width as usize)
+        .saturating_sub(selector_width + rank_width + risk_width + 4)
+        .max(12);
+    let risk = hotspot.score * 10.0;
+    let rank = format!("#{}", hotspot.rank);
+    let path = pad_truncated(&hotspot.path, path_width);
+
+    let mut spans = vec![
+        Span::styled(format!("{marker:<selector_width$}"), row_style),
+        Span::styled(
+            format!("{rank:<rank_width$}"),
+            style(options, TuiSeverity::Muted),
+        ),
+        Span::styled(path, row_style),
+        Span::raw("  "),
+    ];
+    spans.extend(score_bar_spans(hotspot.score, 14, row_style, options));
+    spans.push(Span::raw(format!(" {:>4.1}", risk)));
+
+    Line::from(spans)
+}
+
 fn hotspot_kpi_lines(snapshot: &TuiSnapshot, options: TuiOptions) -> Vec<Line<'static>> {
     let top_score = snapshot
         .report
@@ -2154,26 +2213,27 @@ fn hotspot_kpi_lines(snapshot: &TuiSnapshot, options: TuiOptions) -> Vec<Line<'s
         .first()
         .map(|hotspot| hotspot.score)
         .unwrap_or(0.0);
-    vec![
-        Line::from(vec![
-            Span::styled("Risk ", style(options, TuiSeverity::Muted)),
-            Span::styled(
-                score_bar(top_score, 18, options),
-                style(options, severity_for_score(top_score)),
+    let mut spans = vec![Span::styled("Risk ", style(options, TuiSeverity::Muted))];
+    spans.extend(score_bar_spans(
+        top_score,
+        18,
+        style(options, severity_for_score(top_score)),
+        options,
+    ));
+    spans.extend([
+        Span::raw(format!(" {:.1}/10", top_score * 10.0)),
+        Span::styled(
+            format!(
+                "   files {}  warnings {}  languages {}",
+                snapshot.scan.summary.total_files,
+                snapshot.scan.summary.warnings.total_warnings,
+                snapshot.scan.summary.languages.len()
             ),
-            Span::raw(format!(" {:.1}/10", top_score * 10.0)),
-            Span::styled(
-                format!(
-                    "   files {}  warnings {}  languages {}",
-                    snapshot.scan.summary.total_files,
-                    snapshot.scan.summary.warnings.total_warnings,
-                    snapshot.scan.summary.languages.len()
-                ),
-                style(options, TuiSeverity::Muted),
-            ),
-        ]),
-        Line::raw(""),
-    ]
+            style(options, TuiSeverity::Muted),
+        ),
+    ]);
+
+    vec![Line::from(spans), Line::raw("")]
 }
 
 fn context_kpi_lines(snapshot: &TuiSnapshot, options: TuiOptions) -> Vec<Line<'static>> {
@@ -2264,18 +2324,21 @@ fn file_inspector_lines(
         Line::raw(""),
     ];
     if let Some(hotspot) = hotspot_for_path(snapshot, path) {
-        lines.push(Line::from(vec![
+        let mut score_spans = vec![
             Span::styled("Score ", style(options, TuiSeverity::Muted)),
             Span::styled(
                 format!("{:.3}", hotspot.score),
                 style(options, severity_for_score(hotspot.score)),
             ),
             Span::raw(" "),
-            Span::styled(
-                score_bar(hotspot.score, 14, options),
-                style(options, severity_for_score(hotspot.score)),
-            ),
-        ]));
+        ];
+        score_spans.extend(score_bar_spans(
+            hotspot.score,
+            14,
+            style(options, severity_for_score(hotspot.score)),
+            options,
+        ));
+        lines.push(Line::from(score_spans));
         lines.push(Line::raw(format!(
             "Rank #{}  Formula {}",
             hotspot.rank, hotspot.formula_version.id
@@ -2472,16 +2535,39 @@ fn style(options: TuiOptions, severity: TuiSeverity) -> Style {
     Style::default().fg(color)
 }
 
-fn score_bar(score: f64, width: usize, options: TuiOptions) -> String {
+fn score_bar_parts(score: f64, width: usize, options: TuiOptions) -> (String, String) {
     let filled = ((score.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
-    let fill = if options.ascii { "#" } else { "█" };
-    let empty = if options.ascii { "." } else { "░" };
+    let fill = if options.ascii { "=" } else { "■" };
+    let empty = if options.ascii { "." } else { "□" };
 
-    format!(
-        "{}{}",
+    (
         fill.repeat(filled),
-        empty.repeat(width.saturating_sub(filled))
+        empty.repeat(width.saturating_sub(filled)),
     )
+}
+
+fn score_bar_spans(
+    score: f64,
+    width: usize,
+    active_style: Style,
+    options: TuiOptions,
+) -> Vec<Span<'static>> {
+    let (filled, empty) = score_bar_parts(score, width, options);
+    vec![
+        Span::styled(filled, active_style),
+        Span::styled(empty, inactive_bar_style(options)),
+    ]
+}
+
+fn inactive_bar_style(options: TuiOptions) -> Style {
+    if options.no_color {
+        return Style::default();
+    }
+    if options.ascii {
+        return style(options, TuiSeverity::Muted);
+    }
+
+    Style::default().fg(Color::Rgb(82, 82, 82)).bg(Color::Black)
 }
 
 fn short_commit(value: &str) -> String {
@@ -2512,6 +2598,13 @@ fn truncate_middle(value: &str, max: usize) -> String {
         .collect::<String>();
 
     format!("{left}…{right}")
+}
+
+fn pad_truncated(value: &str, width: usize) -> String {
+    let truncated = truncate_middle(value, width);
+    let padding = width.saturating_sub(truncated.chars().count());
+
+    format!("{truncated}{}", " ".repeat(padding))
 }
 #[cfg(test)]
 fn should_quit(key: KeyEvent) -> bool {
@@ -2748,6 +2841,54 @@ mod tests {
         assert!(rendered.contains("Navigate"));
         assert!(rendered.contains("Inspector"));
         assert!(rendered.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn hotspot_rows_render_fixed_selector_rank_path_and_score_bar() {
+        let snapshot = test_snapshot();
+        let state = TuiAppState::default();
+        let row = display_rows(&snapshot, &state)
+            .into_iter()
+            .next()
+            .expect("fixture should have a hotspot row");
+
+        let line = render_display_row(&row, true, 80, TuiOptions::default());
+        let rendered = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered.starts_with("> #1"));
+        assert!(rendered.contains("src/lib.rs"));
+        assert!(!rendered.contains("hotspot"));
+        assert!(rendered.contains("6.4"));
+    }
+
+    #[test]
+    fn hotspot_score_bars_start_in_the_same_column() {
+        let short = DisplayHotspotRow {
+            rank: 1,
+            path: "a.rs".to_owned(),
+            score: 0.6,
+        };
+        let long = DisplayHotspotRow {
+            rank: 2,
+            path: "src/deeply/nested/repository/file.rs".to_owned(),
+            score: 0.7,
+        };
+        let short_line = render_hotspot_display_row(&short, true, 80, TuiOptions::default());
+        let long_line = render_hotspot_display_row(&long, false, 80, TuiOptions::default());
+        let short_rendered = line_text(&short_line);
+        let long_rendered = line_text(&long_line);
+
+        assert_eq!(
+            short_rendered.find('■'),
+            long_rendered.find('■'),
+            "score bars should share a stable column"
+        );
+        assert!(short_rendered.starts_with("> #1"));
+        assert!(long_rendered.starts_with("  #2"));
     }
 
     #[test]
@@ -3338,6 +3479,13 @@ mod tests {
             "VISUAL" => editor.map(Into::into),
             _ => None,
         });
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     fn select_visible_row(state: &mut TuiAppState, snapshot: &TuiSnapshot, row_text: &str) {
