@@ -8,24 +8,26 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{
-    params, types::Type, Connection, OpenFlags, OptionalExtension, Row, Statement, Transaction,
+    params, params_from_iter, types::Type, Connection, OpenFlags, OptionalExtension, Row,
+    Statement, ToSql, Transaction,
 };
 use serde::Serialize;
 
-use crate::git::{GitCoChange, GitFileMetrics};
+use crate::git::{GitCoChange, GitFileChange, GitFileMetrics};
 use crate::scoring::{NormalizedScoreMetrics, RankedHotspotScore, ScoreLimitation, WeightedTerm};
 use crate::{
     dependency, ContentKind, FileRecord, FileWarning, ParseReport, ParseSymbolRecord, ScanReport,
     ScanWarning, SCAN_SCHEMA_VERSION,
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 const HOTPATH_DIR: &str = ".hotpath";
 const INDEX_FILE: &str = "index.db";
 const SCHEMA_IDENTIFIER_V1: &str = "hotpath.index.v1";
 const SCHEMA_IDENTIFIER_V2: &str = "hotpath.index.v2";
-const SCHEMA_IDENTIFIER: &str = "hotpath.index.v3";
+const SCHEMA_IDENTIFIER_V3: &str = "hotpath.index.v3";
+const SCHEMA_IDENTIFIER: &str = "hotpath.index.v4";
 const SCHEMA_IDENTIFIER_KEY: &str = "schema_identifier";
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 const GIT_ANALYSIS_KEY: &str = "git-analysis-current";
@@ -42,6 +44,7 @@ const REQUIRED_SCHEMA_TABLES: &[&str] = &[
     "git_co_changes",
     "dependencies",
     "hotspots",
+    "git_commit_diffs",
 ];
 
 #[derive(Debug)]
@@ -1151,6 +1154,181 @@ impl IndexStore {
             source,
         })
     }
+
+    pub fn cached_git_commit_changes(
+        &self,
+        commit_id: &str,
+        analyzer_version: &str,
+    ) -> Result<Option<Vec<GitFileChange>>, IndexError> {
+        let json = self
+            .connection
+            .query_row(
+                "SELECT changes_json
+                 FROM git_commit_diffs
+                 INNER JOIN repos ON repos.id = git_commit_diffs.repo_id
+                 WHERE repos.root_key = '.'
+                   AND commit_id = ?1
+                   AND analyzer_version = ?2;",
+                params![commit_id, analyzer_version],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        json.map(|json| {
+            serde_json::from_str::<Vec<GitFileChange>>(&json).map_err(|source| {
+                IndexError::InvalidGitAnalysisData {
+                    path: self.path.clone(),
+                    message: format!(
+                        "cached Git commit diff for {commit_id} is not valid JSON: {source}"
+                    ),
+                }
+            })
+        })
+        .transpose()
+    }
+
+    pub fn cached_git_commit_changes_batch(
+        &self,
+        commit_ids: &[String],
+        analyzer_version: &str,
+    ) -> Result<BTreeMap<String, Vec<GitFileChange>>, IndexError> {
+        let mut changes_by_commit = BTreeMap::new();
+        if commit_ids.is_empty() {
+            return Ok(changes_by_commit);
+        }
+
+        for chunk in commit_ids.chunks(900) {
+            let placeholders = (0..chunk.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT commit_id, changes_json
+                 FROM git_commit_diffs
+                 INNER JOIN repos ON repos.id = git_commit_diffs.repo_id
+                 WHERE repos.root_key = '.'
+                   AND analyzer_version = ?
+                   AND commit_id IN ({placeholders});"
+            );
+            let mut statement =
+                self.connection
+                    .prepare(&sql)
+                    .map_err(|source| IndexError::ReadIndex {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            let mut query_params = Vec::<&dyn ToSql>::with_capacity(chunk.len() + 1);
+            query_params.push(&analyzer_version);
+            for commit_id in chunk {
+                query_params.push(commit_id);
+            }
+            let rows = statement
+                .query_map(params_from_iter(query_params), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|source| IndexError::ReadIndex {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            for row in rows {
+                let (commit_id, json) = row.map_err(|source| IndexError::ReadIndex {
+                    path: self.path.clone(),
+                    source,
+                })?;
+                let changes =
+                    serde_json::from_str::<Vec<GitFileChange>>(&json).map_err(|source| {
+                        IndexError::InvalidGitAnalysisData {
+                            path: self.path.clone(),
+                            message: format!(
+                                "cached Git commit diff for {commit_id} is not valid JSON: {source}"
+                            ),
+                        }
+                    })?;
+                changes_by_commit.insert(commit_id, changes);
+            }
+        }
+
+        Ok(changes_by_commit)
+    }
+
+    pub fn persist_git_commit_changes(
+        &mut self,
+        commit_id: &str,
+        analyzer_version: &str,
+        changes: &[GitFileChange],
+    ) -> Result<(), IndexError> {
+        self.persist_git_commit_changes_batch(
+            analyzer_version,
+            &[(commit_id.to_owned(), changes.to_vec())],
+        )
+    }
+
+    pub fn persist_git_commit_changes_batch(
+        &mut self,
+        analyzer_version: &str,
+        commits: &[(String, Vec<GitFileChange>)],
+    ) -> Result<(), IndexError> {
+        if commits.is_empty() {
+            return Ok(());
+        }
+
+        let index_path = self.path.clone();
+        let mut payloads = Vec::with_capacity(commits.len());
+        for (commit_id, changes) in commits {
+            let changes_json = serde_json::to_string(changes).map_err(|source| {
+                IndexError::InvalidGitAnalysisData {
+                    path: index_path.clone(),
+                    message: format!("failed to serialize cached Git commit diff: {source}"),
+                }
+            })?;
+            payloads.push((commit_id, changes_json));
+        }
+
+        let transaction =
+            self.connection
+                .transaction()
+                .map_err(|source| IndexError::PersistGitAnalysis {
+                    path: index_path.clone(),
+                    source,
+                })?;
+        let repo_id = ensure_repo_for_git(&transaction, &index_path)?;
+
+        {
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO git_commit_diffs (
+                    repo_id,
+                    commit_id,
+                    analyzer_version,
+                    changes_json
+                )
+                VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(repo_id, commit_id, analyzer_version) DO UPDATE SET
+                    changes_json = excluded.changes_json;",
+                )
+                .map_err(|source| IndexError::PersistGitAnalysis {
+                    path: index_path.clone(),
+                    source,
+                })?;
+
+            for (commit_id, changes_json) in payloads {
+                insert
+                    .execute(params![repo_id, commit_id, analyzer_version, changes_json])
+                    .map_err(|source| IndexError::PersistGitAnalysis {
+                        path: index_path.clone(),
+                        source,
+                    })?;
+            }
+        }
+
+        transaction
+            .commit()
+            .map_err(|source| IndexError::PersistGitAnalysis {
+                path: index_path,
+                source,
+            })
+    }
 }
 
 #[derive(Debug)]
@@ -2106,6 +2284,7 @@ fn read_persisted_git_file_stats(row: &Row<'_>) -> rusqlite::Result<PersistedGit
         owner_count: i64_to_u64(row.get(7)?, 7)?,
         dominant_owner: row.get(8)?,
         dominant_owner_share: row.get(9)?,
+        co_changed_file_count: 0,
         first_commit_id: row.get(10)?,
         first_commit_time: row.get(11)?,
         last_commit_id: row.get(12)?,
@@ -2440,6 +2619,10 @@ fn migrate_to_current(
                 migrate_2_to_3(connection, path)?;
                 version = 3;
             }
+            3 => {
+                migrate_3_to_4(connection, path)?;
+                version = 4;
+            }
             _ => {
                 return Err(IndexError::CorruptMetadata {
                     path: path.to_path_buf(),
@@ -2465,8 +2648,6 @@ fn migrate_2_to_3(connection: &mut Connection, path: &Path) -> Result<(), IndexE
             ",
         )
         .map_err(|source| migration_error(path, 2, 3, source))?;
-    verify_schema_objects(&transaction, path)?;
-
     transaction
         .execute(
             "INSERT INTO hotpath_metadata (key, value)
@@ -2480,7 +2661,7 @@ fn migrate_2_to_3(connection: &mut Connection, path: &Path) -> Result<(), IndexE
             "INSERT INTO hotpath_metadata (key, value)
              VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
-            params![SCHEMA_IDENTIFIER_KEY, SCHEMA_IDENTIFIER],
+            params![SCHEMA_IDENTIFIER_KEY, SCHEMA_IDENTIFIER_V3],
         )
         .map_err(|source| migration_error(path, 2, 3, source))?;
     transaction
@@ -2489,6 +2670,46 @@ fn migrate_2_to_3(connection: &mut Connection, path: &Path) -> Result<(), IndexE
     transaction
         .commit()
         .map_err(|source| migration_error(path, 2, 3, source))?;
+
+    Ok(())
+}
+
+fn migrate_3_to_4(connection: &mut Connection, path: &Path) -> Result<(), IndexError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|source| migration_error(path, 3, 4, source))?;
+
+    create_cache_schema_v4(&transaction, path).map_err(|error| match error {
+        IndexError::Migration {
+            from_version: _,
+            to_version: _,
+            source,
+            ..
+        } => migration_error(path, 3, 4, source),
+        other => other,
+    })?;
+    transaction
+        .execute(
+            "INSERT INTO hotpath_metadata (key, value)
+             VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+            params![SCHEMA_VERSION_KEY, CURRENT_SCHEMA_VERSION.to_string()],
+        )
+        .map_err(|source| migration_error(path, 3, 4, source))?;
+    transaction
+        .execute(
+            "INSERT INTO hotpath_metadata (key, value)
+             VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+            params![SCHEMA_IDENTIFIER_KEY, SCHEMA_IDENTIFIER],
+        )
+        .map_err(|source| migration_error(path, 3, 4, source))?;
+    transaction
+        .execute_batch("PRAGMA user_version = 4;")
+        .map_err(|source| migration_error(path, 3, 4, source))?;
+    transaction
+        .commit()
+        .map_err(|source| migration_error(path, 3, 4, source))?;
 
     Ok(())
 }
@@ -2891,6 +3112,29 @@ fn create_git_schema_v2(connection: &Connection, path: &Path) -> Result<(), Inde
         .map_err(|source| migration_error(path, 1, 2, source))
 }
 
+fn create_cache_schema_v4(connection: &Connection, path: &Path) -> Result<(), IndexError> {
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS git_commit_diffs (
+                repo_id INTEGER NOT NULL,
+                commit_id TEXT NOT NULL,
+                analyzer_version TEXT NOT NULL,
+                changes_json TEXT NOT NULL,
+                PRIMARY KEY (repo_id, commit_id, analyzer_version),
+                CHECK (length(commit_id) > 0),
+                CHECK (length(analyzer_version) > 0),
+                CHECK (length(changes_json) > 0),
+                FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE
+            ) STRICT;
+
+            CREATE INDEX IF NOT EXISTS git_commit_diffs_by_repo_commit
+                ON git_commit_diffs (repo_id, commit_id);
+            ",
+        )
+        .map_err(|source| migration_error(path, 3, 4, source))
+}
+
 fn migration_error(
     path: &Path,
     from_version: u32,
@@ -3029,7 +3273,11 @@ fn verify_existing_metadata_before_initial_migration(
         });
     }
 
-    if metadata_identifier != SCHEMA_IDENTIFIER_V1 && metadata_identifier != SCHEMA_IDENTIFIER {
+    if metadata_identifier != SCHEMA_IDENTIFIER_V1
+        && metadata_identifier != SCHEMA_IDENTIFIER_V2
+        && metadata_identifier != SCHEMA_IDENTIFIER_V3
+        && metadata_identifier != SCHEMA_IDENTIFIER
+    {
         return Err(IndexError::CorruptMetadata {
             path: path.to_path_buf(),
             message: format!(
@@ -3250,6 +3498,13 @@ const HOTSPOTS_COLUMNS: &[ExpectedColumn] = &[
     expected_column("limitation", "TEXT", false, None, 0),
 ];
 
+const GIT_COMMIT_DIFFS_COLUMNS: &[ExpectedColumn] = &[
+    expected_column("repo_id", "INTEGER", true, None, 1),
+    expected_column("commit_id", "TEXT", true, None, 2),
+    expected_column("analyzer_version", "TEXT", true, None, 3),
+    expected_column("changes_json", "TEXT", true, None, 0),
+];
+
 const NO_FOREIGN_KEYS: &[ExpectedForeignKey] = &[];
 const NO_UNIQUE_CONSTRAINTS: &[ExpectedUniqueConstraint] = &[];
 const NO_CHECK_CONSTRAINTS: &[&str] = &[];
@@ -3304,6 +3559,8 @@ const HOTSPOTS_FOREIGN_KEYS: &[ExpectedForeignKey] = &[
     expected_foreign_key("repo_id", "repos", "id", "CASCADE"),
     expected_foreign_key("scan_run_id", "scan_runs", "id", "SET NULL"),
 ];
+const GIT_COMMIT_DIFFS_FOREIGN_KEYS: &[ExpectedForeignKey] =
+    &[expected_foreign_key("repo_id", "repos", "id", "CASCADE")];
 
 const REPOS_UNIQUE_CONSTRAINTS: &[ExpectedUniqueConstraint] =
     &[expected_unique_constraint(&["root_key"])];
@@ -3454,6 +3711,11 @@ const HOTSPOTS_CHECK_CONSTRAINTS: &[&str] = &[
     "CHECK (rank IS NULL OR rank >= 1)",
     "CHECK (length(formula_version) > 0)",
 ];
+const GIT_COMMIT_DIFFS_CHECK_CONSTRAINTS: &[&str] = &[
+    "CHECK (length(commit_id) > 0)",
+    "CHECK (length(analyzer_version) > 0)",
+    "CHECK (length(changes_json) > 0)",
+];
 
 const REQUIRED_INDEXES: &[ExpectedIndex] = &[
     expected_index(
@@ -3511,6 +3773,11 @@ const REQUIRED_INDEXES: &[ExpectedIndex] = &[
         "hotspots_by_repo_score",
         "hotspots",
         &["repo_id", "score", "file_id"],
+    ),
+    expected_index(
+        "git_commit_diffs_by_repo_commit",
+        "git_commit_diffs",
+        &["repo_id", "commit_id"],
     ),
 ];
 
@@ -3663,6 +3930,7 @@ fn expected_columns(table_name: &str) -> &'static [ExpectedColumn] {
         "git_co_changes" => GIT_CO_CHANGES_COLUMNS,
         "dependencies" => DEPENDENCIES_COLUMNS,
         "hotspots" => HOTSPOTS_COLUMNS,
+        "git_commit_diffs" => GIT_COMMIT_DIFFS_COLUMNS,
         _ => &[],
     }
 }
@@ -3680,6 +3948,7 @@ fn expected_foreign_keys(table_name: &str) -> &'static [ExpectedForeignKey] {
         "git_co_changes" => GIT_CO_CHANGES_FOREIGN_KEYS,
         "dependencies" => DEPENDENCIES_FOREIGN_KEYS,
         "hotspots" => HOTSPOTS_FOREIGN_KEYS,
+        "git_commit_diffs" => GIT_COMMIT_DIFFS_FOREIGN_KEYS,
         _ => NO_FOREIGN_KEYS,
     }
 }
@@ -3695,6 +3964,7 @@ fn expected_unique_constraints(table_name: &str) -> &'static [ExpectedUniqueCons
         "git_analysis_runs" => GIT_ANALYSIS_RUNS_UNIQUE_CONSTRAINTS,
         "git_co_changes" => GIT_CO_CHANGES_UNIQUE_CONSTRAINTS,
         "dependencies" => DEPENDENCIES_UNIQUE_CONSTRAINTS,
+        "git_commit_diffs" => NO_UNIQUE_CONSTRAINTS,
         _ => NO_UNIQUE_CONSTRAINTS,
     }
 }
@@ -3712,6 +3982,7 @@ fn expected_check_constraints(table_name: &str) -> &'static [&'static str] {
         "git_co_changes" => GIT_CO_CHANGES_CHECK_CONSTRAINTS,
         "dependencies" => DEPENDENCIES_CHECK_CONSTRAINTS,
         "hotspots" => HOTSPOTS_CHECK_CONSTRAINTS,
+        "git_commit_diffs" => GIT_COMMIT_DIFFS_CHECK_CONSTRAINTS,
         _ => NO_CHECK_CONSTRAINTS,
     }
 }
@@ -5068,6 +5339,7 @@ mod tests {
                 owner_count: 2,
                 dominant_owner: Some("Ada <ada@example.invalid>".to_owned()),
                 dominant_owner_share: Some(0.5),
+                co_changed_file_count: 1,
                 first_commit_id: Some("1111111111111111111111111111111111111111".to_owned()),
                 first_commit_time: Some(1_700_000_000),
                 last_commit_id: Some("2222222222222222222222222222222222222222".to_owned()),
@@ -5085,6 +5357,7 @@ mod tests {
                 owner_count: 1,
                 dominant_owner: Some("Ben <ben@example.invalid>".to_owned()),
                 dominant_owner_share: Some(1.0),
+                co_changed_file_count: 1,
                 first_commit_id: Some("3333333333333333333333333333333333333333".to_owned()),
                 first_commit_time: Some(1_700_086_400),
                 last_commit_id: Some("3333333333333333333333333333333333333333".to_owned()),
@@ -5146,6 +5419,65 @@ mod tests {
             .file_stats
             .iter()
             .all(|stats| !stats.path.contains(&fixture.path.display().to_string())));
+    }
+
+    #[test]
+    fn persist_git_commit_changes_round_trips_cached_diff_artifacts() {
+        let fixture = Fixture::new("persist-git-commit-cache");
+        let mut store = IndexStore::open(&fixture.path).expect("index should open");
+        let changes = vec![GitFileChange {
+            commit_id: "1111111111111111111111111111111111111111".to_owned(),
+            parent_count: 1,
+            is_merge: false,
+            author: "Ada <ada@example.invalid>".to_owned(),
+            commit_time: 1_700_000_000,
+            path: "src/lib.rs".to_owned(),
+            change_kind: crate::git::GitChangeKind::Modified,
+            added_lines: 3,
+            deleted_lines: 1,
+        }];
+
+        store
+            .persist_git_commit_changes(
+                "1111111111111111111111111111111111111111",
+                "test-version",
+                &changes,
+            )
+            .expect("commit cache should persist");
+
+        assert_eq!(
+            store
+                .cached_git_commit_changes(
+                    "1111111111111111111111111111111111111111",
+                    "test-version",
+                )
+                .expect("commit cache should read"),
+            Some(changes.clone())
+        );
+        assert_eq!(
+            store
+                .cached_git_commit_changes(
+                    "1111111111111111111111111111111111111111",
+                    "other-version",
+                )
+                .expect("commit cache miss should read"),
+            None
+        );
+        assert_eq!(
+            store
+                .cached_git_commit_changes_batch(
+                    &[
+                        "1111111111111111111111111111111111111111".to_owned(),
+                        "2222222222222222222222222222222222222222".to_owned(),
+                    ],
+                    "test-version",
+                )
+                .expect("commit cache batch should read"),
+            BTreeMap::from([(
+                "1111111111111111111111111111111111111111".to_owned(),
+                changes,
+            )])
+        );
     }
 
     #[test]
@@ -5482,6 +5814,7 @@ mod tests {
         assert!(is_strict_table(&connection, "git_analysis_runs"));
         assert!(is_strict_table(&connection, "git_file_stats"));
         assert!(is_strict_table(&connection, "git_co_changes"));
+        assert!(is_strict_table(&connection, "git_commit_diffs"));
         assert!(is_strict_table(&connection, "hotspots"));
         assert!(table_has_foreign_key(&connection, "files", "repos"));
         assert!(table_has_foreign_key(
@@ -5520,6 +5853,11 @@ mod tests {
             &connection,
             "git_co_changes",
             "git_analysis_runs"
+        ));
+        assert!(table_has_foreign_key(
+            &connection,
+            "git_commit_diffs",
+            "repos"
         ));
         assert!(table_has_foreign_key(&connection, "dependencies", "files"));
         assert!(table_has_foreign_key(&connection, "hotspots", "files"));
@@ -5833,7 +6171,7 @@ mod tests {
             .expect("index directory should be created");
         let connection = Connection::open(&index_path).expect("test database should open");
         connection
-            .execute_batch("PRAGMA user_version = 4;")
+            .execute_batch("PRAGMA user_version = 5;")
             .expect("test schema version should be set");
         drop(connection);
 
@@ -5842,7 +6180,7 @@ mod tests {
         assert!(matches!(
             error,
             IndexError::IncompatibleFutureSchema {
-                found_version: 4,
+                found_version: 5,
                 supported_version: CURRENT_SCHEMA_VERSION,
                 ..
             }
@@ -5965,7 +6303,7 @@ mod tests {
                     value TEXT NOT NULL
                 ) STRICT;
                 INSERT INTO hotpath_metadata (key, value)
-                VALUES ('schema_version', '4'), ('schema_identifier', 'hotpath.index.v3');",
+                VALUES ('schema_version', '5'), ('schema_identifier', 'hotpath.index.v4');",
             )
             .expect("future metadata should be created");
         drop(connection);
@@ -5976,7 +6314,7 @@ mod tests {
         assert!(matches!(
             error,
             IndexError::IncompatibleFutureSchema {
-                found_version: 4,
+                found_version: 5,
                 supported_version: CURRENT_SCHEMA_VERSION,
                 ..
             }
@@ -6074,7 +6412,7 @@ mod tests {
         let connection = Connection::open(&index_path).expect("test database should reopen");
         connection
             .execute(
-                "UPDATE hotpath_metadata SET value = '4' WHERE key = ?1;",
+                "UPDATE hotpath_metadata SET value = '5' WHERE key = ?1;",
                 params![SCHEMA_VERSION_KEY],
             )
             .expect("metadata schema version should be updated");
@@ -6086,14 +6424,14 @@ mod tests {
         assert!(matches!(
             error,
             IndexError::IncompatibleFutureSchema {
-                found_version: 4,
+                found_version: 5,
                 supported_version: CURRENT_SCHEMA_VERSION,
                 ..
             }
         ));
         let message = error.to_string();
         assert!(message.contains(index_path.to_string_lossy().as_ref()));
-        assert!(message.contains("supports up to version 3"));
+        assert!(message.contains("supports up to version 4"));
     }
 
     #[test]

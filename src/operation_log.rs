@@ -87,7 +87,6 @@ impl OperationLogger {
         }
 
         self.file.write_all(&line)?;
-        self.file.flush()?;
         self.bytes_written += line.len() as u64;
 
         Ok(())
@@ -110,7 +109,6 @@ impl OperationLogger {
         line.push(b'\n');
         if self.bytes_written + line.len() as u64 <= self.max_bytes {
             self.file.write_all(&line)?;
-            self.file.flush()?;
             self.bytes_written += line.len() as u64;
         }
 

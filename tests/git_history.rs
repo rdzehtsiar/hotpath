@@ -177,12 +177,12 @@ fn git_history_reports_rename_destination_path_conservatively() {
     let changes = file_changes_from_head(fixture.path()).expect("history should be readable");
     let rename_change = changes
         .iter()
-        .find(|change| change.commit_id == rename)
-        .expect("rename commit should produce a file change");
+        .find(|change| change.commit_id == rename && change.path == "new.txt")
+        .expect("rename commit should produce a destination file change");
 
     assert_eq!(rename_change.path, "new.txt");
-    assert_eq!(rename_change.change_kind, GitChangeKind::Renamed);
-    assert_eq!(rename_change.added_lines, 0);
+    assert_eq!(rename_change.change_kind, GitChangeKind::Added);
+    assert_eq!(rename_change.added_lines, 1);
     assert_eq!(rename_change.deleted_lines, 0);
 }
 
@@ -460,6 +460,31 @@ fn git_co_changes_are_deterministically_ranked() {
             ("y.txt", "z.txt", 1),
         ]
     );
+}
+
+#[test]
+fn bulk_commits_do_not_materialize_pairwise_co_changes_for_scoring() {
+    let changes = (0..300)
+        .map(|index| {
+            raw_change(
+                "bulk",
+                "Bulk Author <bulk@example.invalid>",
+                200,
+                &format!("src/file{index:03}.rs"),
+                1,
+                0,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let metrics = file_metrics_from_changes(&changes, 200);
+    let co_changes = co_changes_from_changes(&changes);
+
+    assert!(co_changes.is_empty());
+    assert_eq!(metrics.len(), 300);
+    assert!(metrics
+        .iter()
+        .all(|metric| metric.co_changed_file_count == 25));
 }
 
 #[test]

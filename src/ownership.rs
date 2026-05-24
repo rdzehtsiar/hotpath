@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{HashMap, HashSet};
 
 use crate::git::GitFileChange;
 
@@ -36,8 +36,8 @@ pub struct OperationalOwnerShare {
 
 #[derive(Debug, Default)]
 struct ContributorAccumulator {
-    commits: BTreeSet<String>,
-    meaningful_commits: BTreeSet<String>,
+    commits: HashSet<String>,
+    meaningful_commits: HashSet<String>,
     effective_lines: f64,
     weighted_lines: f64,
 }
@@ -47,7 +47,7 @@ pub fn operational_ownership_from_changes(
     head_commit_time: i64,
 ) -> OperationalOwnershipSnapshot {
     let touched_paths_by_commit = touched_paths_by_commit(changes);
-    let mut by_path = BTreeMap::<String, BTreeMap<String, ContributorAccumulator>>::new();
+    let mut by_path = HashMap::<String, HashMap<String, ContributorAccumulator>>::new();
 
     for change in changes {
         let changed_lines = change.added_lines.saturating_add(change.deleted_lines);
@@ -57,7 +57,7 @@ pub fn operational_ownership_from_changes(
 
         let touched_file_count = touched_paths_by_commit
             .get(change.commit_id.as_str())
-            .map_or(1, BTreeSet::len);
+            .map_or(1, HashSet::len);
         let bulk_weight = bulk_change_weight(touched_file_count);
         let recency_weight = recency_weight(head_commit_time, change.commit_time);
         let effective_lines = changed_lines as f64 * bulk_weight;
@@ -75,16 +75,17 @@ pub fn operational_ownership_from_changes(
         accumulator.weighted_lines += effective_lines * recency_weight;
     }
 
-    let by_file = by_path
+    let mut by_file = by_path
         .into_iter()
         .map(|(path, by_author)| ownership_for_path(path, by_author))
-        .collect();
+        .collect::<Vec<_>>();
+    by_file.sort_by(|left, right| left.path.cmp(&right.path));
 
     OperationalOwnershipSnapshot { by_file }
 }
 
-fn touched_paths_by_commit(changes: &[GitFileChange]) -> BTreeMap<&str, BTreeSet<&str>> {
-    let mut by_commit = BTreeMap::<&str, BTreeSet<&str>>::new();
+fn touched_paths_by_commit(changes: &[GitFileChange]) -> HashMap<&str, HashSet<&str>> {
+    let mut by_commit = HashMap::<&str, HashSet<&str>>::new();
 
     for change in changes {
         by_commit
@@ -98,7 +99,7 @@ fn touched_paths_by_commit(changes: &[GitFileChange]) -> BTreeMap<&str, BTreeSet
 
 fn ownership_for_path(
     path: String,
-    by_author: BTreeMap<String, ContributorAccumulator>,
+    by_author: HashMap<String, ContributorAccumulator>,
 ) -> OperationalFileOwnership {
     let total_effective_lines = by_author
         .values()

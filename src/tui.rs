@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::env;
 use std::error::Error as StdError;
 use std::fmt;
 use std::io::{self, Stdout};
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -33,6 +36,8 @@ use crate::{
 };
 
 type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
+const TUI_PROGRESS_THROTTLE: Duration = Duration::from_millis(750);
+const TUI_PROGRESS_PERCENT_STEP: u64 = 2;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TuiOptions {
@@ -47,9 +52,155 @@ pub fn run_tui() -> io::Result<()> {
 }
 
 pub fn run_tui_with_options(options: TuiOptions) -> io::Result<()> {
-    let snapshot = TuiSnapshot::load_current_dir_with_options(options).map_err(io::Error::other)?;
+    let snapshot = TuiSnapshot::loading_with_options(options);
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut progress = TuiProgressEmitter::new(sender.clone());
+        let result = TuiSnapshot::load_current_dir_with_progress(options, |update| {
+            progress.emit(update);
+        })
+        .map_err(|error| error.to_string());
+        let _ = match result {
+            Ok(snapshot) => sender.send(TuiWorkerMessage::Completed(Box::new(snapshot))),
+            Err(error) => sender.send(TuiWorkerMessage::Failed(error)),
+        };
+    });
     let mut terminal = TerminalSession::enter()?;
-    run_app(terminal.terminal_mut(), &snapshot, options)
+    run_app(terminal.terminal_mut(), snapshot, Some(receiver), options)
+}
+
+#[derive(Debug)]
+enum TuiWorkerMessage {
+    Progress(TuiProgressUpdate),
+    Completed(Box<TuiSnapshot>),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TuiProgressUpdate {
+    phase: &'static str,
+    detail: String,
+    completed: Option<u64>,
+    total: Option<u64>,
+    unit: &'static str,
+    rate: Option<TuiProgressRate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TuiProgressRate {
+    completed_at_start: u64,
+    started_at: Instant,
+}
+
+impl TuiProgressUpdate {
+    fn indeterminate(phase: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            phase,
+            detail: detail.into(),
+            completed: None,
+            total: None,
+            unit: "",
+            rate: None,
+        }
+    }
+
+    fn measured(
+        phase: &'static str,
+        detail: impl Into<String>,
+        completed: u64,
+        total: u64,
+        unit: &'static str,
+    ) -> Self {
+        Self {
+            phase,
+            detail: detail.into(),
+            completed: Some(completed),
+            total: Some(total),
+            unit,
+            rate: None,
+        }
+    }
+}
+
+struct TuiProgressEmitter {
+    sender: mpsc::Sender<TuiWorkerMessage>,
+    last_emit: Option<Instant>,
+    last_phase: Option<&'static str>,
+    last_percent: Option<u64>,
+    phase_started_at: Option<Instant>,
+    phase_started_completed: Option<u64>,
+}
+
+impl TuiProgressEmitter {
+    fn new(sender: mpsc::Sender<TuiWorkerMessage>) -> Self {
+        Self {
+            sender,
+            last_emit: None,
+            last_phase: None,
+            last_percent: None,
+            phase_started_at: None,
+            phase_started_completed: None,
+        }
+    }
+
+    fn emit(&mut self, mut update: TuiProgressUpdate) {
+        if !self.should_emit(&update) {
+            return;
+        }
+
+        let now = Instant::now();
+        if self.last_phase != Some(update.phase) {
+            self.phase_started_at = None;
+            self.phase_started_completed = None;
+        }
+        if let Some(completed) = update.completed {
+            if self.phase_started_at.is_none() || self.phase_started_completed.is_none() {
+                self.phase_started_at = Some(now);
+                self.phase_started_completed = Some(0);
+            }
+            if let (Some(started_at), Some(started_completed)) =
+                (self.phase_started_at, self.phase_started_completed)
+            {
+                update.rate = Some(TuiProgressRate {
+                    completed_at_start: started_completed.min(completed),
+                    started_at,
+                });
+            }
+        }
+
+        self.last_emit = Some(now);
+        self.last_phase = Some(update.phase);
+        self.last_percent = progress_percent(&update);
+        let _ = self.sender.send(TuiWorkerMessage::Progress(update));
+    }
+
+    fn should_emit(&self, update: &TuiProgressUpdate) -> bool {
+        if self.last_phase != Some(update.phase) {
+            return true;
+        }
+
+        if progress_percent(update) == Some(100) {
+            return true;
+        }
+
+        if let (Some(current), Some(previous)) = (progress_percent(update), self.last_percent) {
+            if current.saturating_sub(previous) >= TUI_PROGRESS_PERCENT_STEP {
+                return true;
+            }
+        }
+
+        self.last_emit
+            .is_none_or(|last| last.elapsed() >= TUI_PROGRESS_THROTTLE)
+    }
+}
+
+fn progress_percent(update: &TuiProgressUpdate) -> Option<u64> {
+    let completed = update.completed?;
+    let total = update.total?;
+    completed
+        .saturating_mul(100)
+        .checked_div(total)
+        .map(|percent| percent.min(100))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,20 +275,166 @@ pub enum TuiSnapshotError {
 }
 
 impl TuiSnapshot {
+    pub fn loading_with_options(options: TuiOptions) -> Self {
+        let scan = ScanReport {
+            status: "loading",
+            file_walking: "pending",
+            classification: "pending",
+            warnings: Vec::new(),
+            files: Vec::new(),
+        };
+        let parse = parse::scaffold_report_from_scan(&scan);
+        let complexity = complexity::report_from_parse(&parse);
+        let context = estimate_context(&scan.files, options.context);
+        let report = report::report_from_scan_analysis(
+            &scan,
+            &git::GitAnalysis {
+                worktree_root: env::current_dir().unwrap_or_else(|_| ".".into()),
+                head_commit_id: "loading".to_owned(),
+                head_commit_time: 0,
+                recent_window_days: git::RECENT_CHURN_WINDOW_DAYS,
+                changes: Vec::new(),
+                file_metrics: Vec::new(),
+                co_changes: Vec::new(),
+                ownership: OperationalOwnershipSnapshot::default(),
+            },
+            context,
+            Vec::new(),
+            vec![ReportFinding {
+                code: "hotpath.tui.loading",
+                level: report::ReportFindingLevel::Info,
+                path: None,
+                message: "Repository analysis is running in the background".to_owned(),
+                rank: None,
+                score: None,
+            }],
+        );
+
+        Self::from_parts(report, scan, parse, complexity)
+    }
+
     pub fn load_current_dir() -> Result<Self, TuiSnapshotError> {
         Self::load_current_dir_with_options(TuiOptions::default())
     }
 
     pub fn load_current_dir_with_options(options: TuiOptions) -> Result<Self, TuiSnapshotError> {
+        Self::load_current_dir_with_progress(options, |_| {})
+    }
+
+    fn load_current_dir_with_progress<F>(
+        options: TuiOptions,
+        mut progress: F,
+    ) -> Result<Self, TuiSnapshotError>
+    where
+        F: FnMut(TuiProgressUpdate),
+    {
         let current_dir = env::current_dir().map_err(TuiSnapshotError::CurrentDir)?;
-        let analysis = git::analyze_from_head_at(&current_dir)?;
+        progress(TuiProgressUpdate::indeterminate(
+            "Opening repository",
+            "discovering Git worktree",
+        ));
+        let worktree_root = git::worktree_root_at(&current_dir)?;
+        let read_git_cache = RefCell::new(
+            storage::index::IndexStore::open(&worktree_root)
+                .map_err(TuiSnapshotError::PersistScan)?,
+        );
+        let (cache_write_sender, cache_write_receiver) =
+            crossbeam_channel::bounded::<Vec<(String, Vec<git::GitFileChange>)>>(8);
+        let cache_write_root = worktree_root.clone();
+        let cache_writer = thread::spawn(move || {
+            let Ok(mut write_cache) = storage::index::IndexStore::open(&cache_write_root) else {
+                return;
+            };
+            for commits in cache_write_receiver {
+                let _ = write_cache
+                    .persist_git_commit_changes_batch(env!("CARGO_PKG_VERSION"), &commits);
+            }
+        });
+        progress(TuiProgressUpdate::indeterminate(
+            "Git history",
+            "counting reachable commits",
+        ));
+        let analyzer_version = env!("CARGO_PKG_VERSION");
+        let analysis = git::analyze_from_head_at_with_progress_and_cache_batches(
+            &worktree_root,
+            |git_progress| {
+                progress(TuiProgressUpdate::measured(
+                    "Git history",
+                    "diffing reachable commits",
+                    git_progress.completed_commits as u64,
+                    git_progress.total_commits as u64,
+                    "commits",
+                ));
+            },
+            |commit_ids| {
+                read_git_cache
+                    .borrow()
+                    .cached_git_commit_changes_batch(commit_ids, analyzer_version)
+                    .ok()
+                    .unwrap_or_default()
+            },
+            |commits| {
+                if !commits.is_empty() {
+                    let _ = cache_write_sender.send(commits.to_vec());
+                }
+            },
+        );
+        drop(cache_write_sender);
+        let _ = cache_writer.join();
+        let analysis = analysis?;
+        progress(TuiProgressUpdate::measured(
+            "Git history",
+            "diffing reachable commits",
+            analysis.changes.len() as u64,
+            analysis.changes.len() as u64,
+            "changes",
+        ));
+        progress(TuiProgressUpdate::indeterminate(
+            "Scanning repository",
+            "walking files and classifying content",
+        ));
         let scan = crate::scan_repository(&analysis.worktree_root)?;
-        let parse = parse::report_from_scan(&analysis.worktree_root, &scan);
+        progress(TuiProgressUpdate::measured(
+            "Scanning repository",
+            "walking files and classifying content",
+            scan.files.len() as u64,
+            scan.files.len() as u64,
+            "files",
+        ));
+        progress(TuiProgressUpdate::indeterminate(
+            "Parsing symbols",
+            "preparing parser candidates",
+        ));
+        let parse = parse::report_from_scan_with_progress(
+            &analysis.worktree_root,
+            &scan,
+            |parse_progress| {
+                progress(TuiProgressUpdate::measured(
+                    "Parsing symbols",
+                    parse_progress.path,
+                    parse_progress.completed_files as u64,
+                    parse_progress.total_files as u64,
+                    "files",
+                ));
+            },
+        );
+        progress(TuiProgressUpdate::indeterminate(
+            "Complexity",
+            "building symbol, complexity, and coupling facts",
+        ));
         let complexity = complexity::report_from_parse(&parse);
+        progress(TuiProgressUpdate::indeterminate(
+            "Scoring hotspots",
+            "ranking files by advisory risk",
+        ));
         let ranked = ranked_hotspot_scores_from_scan_and_git(&scan.files, &analysis);
         let context = estimate_context(&scan.files, options.context);
         let hotspots = ranked.iter().map(ReportHotspot::from).collect::<Vec<_>>();
         let findings = hotspots.iter().map(ReportFinding::from).collect::<Vec<_>>();
+        progress(TuiProgressUpdate::indeterminate(
+            "Writing index",
+            "persisting scan, parser, Git, and hotspot facts",
+        ));
         let mut index = storage::index::IndexStore::open(&analysis.worktree_root)
             .map_err(TuiSnapshotError::PersistScan)?;
         let scan_run = index
@@ -167,6 +464,10 @@ impl TuiSnapshot {
 
         let mut snapshot = Self::from_parts(report, scan, parse, complexity);
         snapshot.ownership = TuiOwnershipSnapshot::from_operational_ownership(&analysis.ownership);
+        progress(TuiProgressUpdate::indeterminate(
+            "Ready",
+            "repository analysis complete",
+        ));
 
         Ok(snapshot)
     }
@@ -412,16 +713,54 @@ impl From<ScanError> for TuiSnapshotError {
 
 fn run_app(
     terminal: &mut TuiTerminal,
-    snapshot: &TuiSnapshot,
+    mut snapshot: TuiSnapshot,
+    receiver: Option<Receiver<TuiWorkerMessage>>,
     options: TuiOptions,
 ) -> io::Result<()> {
-    let mut state = TuiAppState::default();
+    let mut state = TuiAppState {
+        status: Some("Analyzing repository in background".to_owned()),
+        analysis_running: receiver.is_some(),
+        ..TuiAppState::default()
+    };
 
     loop {
-        terminal.draw(|frame| render_with_options(frame, snapshot, &state, options))?;
+        if let Some(receiver) = &receiver {
+            loop {
+                match receiver.try_recv() {
+                    Ok(TuiWorkerMessage::Progress(update)) => {
+                        state.background_status = Some(update);
+                    }
+                    Ok(TuiWorkerMessage::Completed(loaded)) => {
+                        snapshot = *loaded;
+                        state.status = Some("Repository analysis ready".to_owned());
+                        state.analysis_running = false;
+                        state.background_status = Some(TuiProgressUpdate::indeterminate(
+                            "Ready",
+                            "repository analysis complete",
+                        ));
+                        clamp_current_selection(&mut state, &snapshot);
+                    }
+                    Ok(TuiWorkerMessage::Failed(error)) => {
+                        state.status = Some(format!("Analysis failed: {error}"));
+                        state.analysis_running = false;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        if state.analysis_running {
+                            state.status = Some("Analysis stopped before completing".to_owned());
+                            state.analysis_running = false;
+                            state.background_status = None;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        terminal.draw(|frame| render_with_options(frame, &snapshot, &state, options))?;
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
-                reduce_key_with_editor(&mut state, snapshot, key, |name| env::var_os(name));
+                reduce_key_with_editor(&mut state, &snapshot, key, |name| env::var_os(name));
                 if state.should_exit {
                     return Ok(());
                 }
@@ -613,6 +952,8 @@ pub struct TuiAppState {
     show_help: bool,
     command_palette: bool,
     status: Option<String>,
+    background_status: Option<TuiProgressUpdate>,
+    analysis_running: bool,
     last_action: Option<TuiAction>,
     should_exit: bool,
 }
@@ -643,6 +984,8 @@ impl Default for TuiAppState {
             show_help: false,
             command_palette: false,
             status: None,
+            background_status: None,
+            analysis_running: false,
             last_action: None,
             should_exit: false,
         }
@@ -2091,7 +2434,7 @@ fn render_with_options(
         TuiLayoutMode::Medium => render_medium_body(frame, body, snapshot, state, &rows, options),
         TuiLayoutMode::Narrow => render_narrow_body(frame, body, snapshot, state, &rows, options),
     }
-    render_footer(frame, footer, state);
+    render_footer(frame, footer, state, options);
 
     if state.show_help {
         render_help_overlay(frame, area, options);
@@ -2379,9 +2722,16 @@ fn main_panel_lines(
     lines
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiAppState) {
+fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiAppState, options: TuiOptions) {
     let text = if state.search_editing {
         format!("/{}", state.search_query().unwrap_or(""))
+    } else if state.analysis_running {
+        state
+            .background_status
+            .as_ref()
+            .map(|update| progress_status_text(update, area.width as usize, options))
+            .or_else(|| state.status().map(str::to_owned))
+            .unwrap_or_else(|| "Analyzing repository in background".to_owned())
     } else {
         let default_status = || {
             [
@@ -2402,6 +2752,67 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiAppState) {
             .unwrap_or_else(default_status)
     };
     frame.render_widget(Paragraph::new(text).alignment(Alignment::Left), area);
+}
+
+fn progress_status_text(update: &TuiProgressUpdate, width: usize, options: TuiOptions) -> String {
+    progress_status_text_at(update, width, options, Instant::now())
+}
+
+fn progress_status_text_at(
+    update: &TuiProgressUpdate,
+    width: usize,
+    options: TuiOptions,
+    now: Instant,
+) -> String {
+    let mut text = if let (Some(completed), Some(total)) = (update.completed, update.total) {
+        let percent = progress_percent(update).unwrap_or(0);
+        let bar = progress_bar(percent, options);
+        let unit = if update.unit.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", update.unit)
+        };
+        let rate = if update.unit.is_empty() {
+            String::new()
+        } else {
+            let rate = progress_rate_per_second(update, now).unwrap_or(0);
+            format!("{HOTSPOT_TAG_SEPARATOR}{rate}{unit}/s")
+        };
+        let detail = if update.detail.is_empty() {
+            String::new()
+        } else {
+            format!("{HOTSPOT_TAG_SEPARATOR}{}", update.detail)
+        };
+        format!(
+            "{} [{}] {:>3}%  {}/{}{}{}{}",
+            update.phase, bar, percent, completed, total, unit, rate, detail
+        )
+    } else if update.detail.is_empty() {
+        update.phase.to_owned()
+    } else {
+        format!("{}... {}", update.phase, update.detail)
+    };
+
+    if text.chars().count() > width {
+        text = truncate_end(&text, width);
+    }
+
+    text
+}
+
+fn progress_rate_per_second(update: &TuiProgressUpdate, now: Instant) -> Option<u64> {
+    let completed = update.completed?;
+    let rate = update.rate?;
+    let elapsed = now.duration_since(rate.started_at).as_secs_f64();
+    if elapsed <= 0.0 {
+        return None;
+    }
+    Some(((completed.saturating_sub(rate.completed_at_start) as f64) / elapsed).round() as u64)
+}
+
+fn progress_bar(percent: u64, options: TuiOptions) -> String {
+    let (filled, empty) = score_bar_parts(percent.min(100) as f64 / 100.0, 10, options);
+    format!("{filled}{empty}")
 }
 
 fn visible_display_row_window(
@@ -4053,7 +4464,14 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test terminal should initialize");
 
         terminal
-            .draw(|frame| render_footer(frame, Rect::new(0, 0, 140, 3), &state))
+            .draw(|frame| {
+                render_footer(
+                    frame,
+                    Rect::new(0, 0, 140, 3),
+                    &state,
+                    TuiOptions::default(),
+                )
+            })
             .expect("render should succeed");
 
         let rendered = terminal
@@ -4066,6 +4484,105 @@ mod tests {
         assert!(rendered.contains(&format!("move{HOTSPOT_TAG_SEPARATOR}Enter")));
         assert!(rendered.contains(&format!("help{HOTSPOT_TAG_SEPARATOR}Ctrl-P")));
         assert!(!rendered.contains("move  Enter"));
+    }
+
+    #[test]
+    fn footer_shows_background_progress_while_analysis_runs() {
+        let state = TuiAppState {
+            status: Some("Repo tree".to_owned()),
+            background_status: Some({
+                let mut update = TuiProgressUpdate::measured(
+                    "Git history",
+                    "diffing reachable commits",
+                    500,
+                    1_000,
+                    "commits",
+                );
+                update.rate = Some(TuiProgressRate {
+                    completed_at_start: 0,
+                    started_at: Instant::now() - Duration::from_secs(4),
+                });
+                update
+            }),
+            analysis_running: true,
+            ..TuiAppState::default()
+        };
+        let now = state
+            .background_status
+            .as_ref()
+            .and_then(|update| update.rate)
+            .expect("progress rate exists")
+            .started_at
+            + Duration::from_secs(4);
+        let text = progress_status_text_at(
+            state.background_status.as_ref().expect("progress exists"),
+            120,
+            TuiOptions {
+                ascii: true,
+                ..TuiOptions::default()
+            },
+            now,
+        );
+
+        assert!(text.contains("Git history"));
+        assert!(text.contains("[=====.....]"));
+        assert!(text.contains("50%"));
+        assert!(text.contains("500/1000 commits"));
+        assert!(text.contains("125 commits/s"));
+        assert!(text.contains(&format!(
+            "commits{HOTSPOT_TAG_SEPARATOR}125 commits/s{HOTSPOT_TAG_SEPARATOR}diffing reachable commits"
+        )));
+        assert!(!text.contains("Repo tree"));
+    }
+
+    #[test]
+    fn progress_emitter_throttles_small_repeated_updates() {
+        let (sender, receiver) = mpsc::channel();
+        let mut emitter = TuiProgressEmitter::new(sender);
+
+        emitter.emit(TuiProgressUpdate::measured(
+            "Git history",
+            "a",
+            1,
+            100,
+            "commits",
+        ));
+        emitter.emit(TuiProgressUpdate::measured(
+            "Git history",
+            "b",
+            2,
+            100,
+            "commits",
+        ));
+        emitter.emit(TuiProgressUpdate::measured(
+            "Git history",
+            "c",
+            3,
+            100,
+            "commits",
+        ));
+        emitter.emit(TuiProgressUpdate::measured(
+            "Git history",
+            "done",
+            100,
+            100,
+            "commits",
+        ));
+
+        let messages = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(
+            &messages[0],
+            TuiWorkerMessage::Progress(TuiProgressUpdate { detail, .. }) if detail == "a"
+        ));
+        assert!(matches!(
+            &messages[1],
+            TuiWorkerMessage::Progress(TuiProgressUpdate { detail, .. }) if detail == "c"
+        ));
+        assert!(matches!(
+            &messages[2],
+            TuiWorkerMessage::Progress(TuiProgressUpdate { detail, .. }) if detail == "done"
+        ));
     }
 
     #[test]

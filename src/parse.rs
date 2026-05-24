@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::Path;
 
+use rayon::prelude::*;
 use serde::Serialize;
 use serde_json::json;
 use tree_sitter::{Language, Node, Parser};
@@ -137,6 +138,13 @@ struct FileExtraction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParseProgress {
+    pub completed_files: usize,
+    pub total_files: usize,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ParentSymbol {
     name: String,
     kind: &'static str,
@@ -152,7 +160,26 @@ struct ExtractionState<'source> {
     imports: Vec<ParseImportRecord>,
 }
 
+struct FileParseOutput {
+    file: ParseFileRecord,
+    warnings: Vec<ParseWarning>,
+    symbols: Vec<ParseSymbolRecord>,
+    imports: Vec<ParseImportRecord>,
+    counted_for_progress: bool,
+}
+
 pub(crate) fn report_from_scan(root: &Path, scan: &ScanReport) -> ParseReport {
+    report_from_scan_with_progress(root, scan, |_| {})
+}
+
+pub(crate) fn report_from_scan_with_progress<F>(
+    root: &Path,
+    scan: &ScanReport,
+    mut progress: F,
+) -> ParseReport
+where
+    F: FnMut(ParseProgress),
+{
     operation_log::event(
         "parse_started",
         json!({
@@ -163,118 +190,32 @@ pub(crate) fn report_from_scan(root: &Path, scan: &ScanReport) -> ParseReport {
     let mut files = Vec::with_capacity(scan.files.len());
     let mut symbols = Vec::new();
     let mut imports = Vec::new();
+    let total_parse_files = scan
+        .files
+        .iter()
+        .filter(|file| supported_language(file).is_some() && file.content == ContentKind::Text)
+        .count();
+    let mut completed_parse_files = 0;
 
-    for file in &scan.files {
-        let Some(language) = supported_language(file) else {
-            files.push(parse_file_record(
-                file,
-                ParseFileStatus::Skipped,
-                Some(unsupported_reason(file)),
-                0,
-                0,
-            ));
-            continue;
-        };
+    let outputs = scan
+        .files
+        .par_iter()
+        .map(|file| parse_file_from_scan(root, file))
+        .collect::<Vec<_>>();
 
-        if file.content != ContentKind::Text {
-            files.push(parse_file_record(
-                file,
-                ParseFileStatus::Skipped,
-                Some(ParseFileReason::UnsupportedContent),
-                0,
-                0,
-            ));
-            continue;
+    for output in outputs {
+        if output.counted_for_progress {
+            completed_parse_files += 1;
+            progress(ParseProgress {
+                completed_files: completed_parse_files,
+                total_files: total_parse_files,
+                path: output.file.path.clone(),
+            });
         }
-
-        operation_log::event(
-            "parse_file_started",
-            json!({
-                "path": file.path,
-                "language": language.name(),
-            }),
-        );
-        let source = match fs::read_to_string(root.join(&file.path)) {
-            Ok(source) => source,
-            Err(source) if source.kind() == std::io::ErrorKind::InvalidData => {
-                operation_log::event(
-                    "parse_file_failed_or_skipped",
-                    json!({
-                        "path": file.path,
-                        "language": language.name(),
-                        "reason": "UnsupportedEncoding",
-                    }),
-                );
-                warnings.push(parse_warning(
-                    "parse_unsupported_encoding",
-                    Some(file.path.clone()),
-                    "file contents are no longer valid UTF-8; file skipped".to_owned(),
-                ));
-                files.push(parse_file_record(
-                    file,
-                    ParseFileStatus::Skipped,
-                    Some(ParseFileReason::UnsupportedEncoding),
-                    0,
-                    0,
-                ));
-                continue;
-            }
-            Err(source) => {
-                operation_log::event(
-                    "parse_file_failed_or_skipped",
-                    json!({
-                        "path": file.path,
-                        "language": language.name(),
-                        "reason": "ReadFailed",
-                        "error": source.to_string(),
-                    }),
-                );
-                warnings.push(parse_warning(
-                    "parse_read_failed",
-                    Some(file.path.clone()),
-                    format!("failed to read file contents for parsing: {source}"),
-                ));
-                files.push(parse_file_record(
-                    file,
-                    ParseFileStatus::Skipped,
-                    Some(ParseFileReason::ReadFailed),
-                    0,
-                    0,
-                ));
-                continue;
-            }
-        };
-
-        let extraction = extract_source(&file.path, language, &source);
-        let symbol_count = extraction.symbols.len() as u64;
-        let import_count = extraction.imports.len() as u64;
-        let (status, reason) = if extraction.parsed {
-            (ParseFileStatus::Parsed, None)
-        } else {
-            (ParseFileStatus::Skipped, Some(ParseFileReason::ParseFailed))
-        };
-
-        warnings.extend(extraction.warnings);
-        symbols.extend(extraction.symbols);
-        imports.extend(extraction.imports);
-        operation_log::event(
-            "parse_file_completed",
-            json!({
-                "path": file.path,
-                "language": language.name(),
-                "status": format!("{status:?}"),
-                "reason": reason.map(|value| format!("{value:?}")),
-                "symbol_count": symbol_count,
-                "import_count": import_count,
-            }),
-        );
-        files.push(parse_file_record(
-            file,
-            status,
-            reason,
-            symbol_count,
-            import_count,
-        ));
+        warnings.extend(output.warnings);
+        symbols.extend(output.symbols);
+        imports.extend(output.imports);
+        files.push(output.file);
     }
 
     sort_parse_warnings(&mut warnings);
@@ -286,6 +227,135 @@ pub(crate) fn report_from_scan(root: &Path, scan: &ScanReport) -> ParseReport {
         files,
         symbols,
         imports,
+    }
+}
+
+fn parse_file_from_scan(root: &Path, file: &FileRecord) -> FileParseOutput {
+    let Some(language) = supported_language(file) else {
+        return FileParseOutput {
+            file: parse_file_record(
+                file,
+                ParseFileStatus::Skipped,
+                Some(unsupported_reason(file)),
+                0,
+                0,
+            ),
+            warnings: Vec::new(),
+            symbols: Vec::new(),
+            imports: Vec::new(),
+            counted_for_progress: false,
+        };
+    };
+
+    if file.content != ContentKind::Text {
+        return FileParseOutput {
+            file: parse_file_record(
+                file,
+                ParseFileStatus::Skipped,
+                Some(ParseFileReason::UnsupportedContent),
+                0,
+                0,
+            ),
+            warnings: Vec::new(),
+            symbols: Vec::new(),
+            imports: Vec::new(),
+            counted_for_progress: false,
+        };
+    }
+
+    operation_log::event(
+        "parse_file_started",
+        json!({
+            "path": file.path,
+            "language": language.name(),
+        }),
+    );
+    let source = match fs::read_to_string(root.join(&file.path)) {
+        Ok(source) => source,
+        Err(source) if source.kind() == std::io::ErrorKind::InvalidData => {
+            operation_log::event(
+                "parse_file_failed_or_skipped",
+                json!({
+                    "path": file.path,
+                    "language": language.name(),
+                    "reason": "UnsupportedEncoding",
+                }),
+            );
+            return FileParseOutput {
+                file: parse_file_record(
+                    file,
+                    ParseFileStatus::Skipped,
+                    Some(ParseFileReason::UnsupportedEncoding),
+                    0,
+                    0,
+                ),
+                warnings: vec![parse_warning(
+                    "parse_unsupported_encoding",
+                    Some(file.path.clone()),
+                    "file contents are no longer valid UTF-8; file skipped".to_owned(),
+                )],
+                symbols: Vec::new(),
+                imports: Vec::new(),
+                counted_for_progress: true,
+            };
+        }
+        Err(source) => {
+            operation_log::event(
+                "parse_file_failed_or_skipped",
+                json!({
+                    "path": file.path,
+                    "language": language.name(),
+                    "reason": "ReadFailed",
+                    "error": source.to_string(),
+                }),
+            );
+            return FileParseOutput {
+                file: parse_file_record(
+                    file,
+                    ParseFileStatus::Skipped,
+                    Some(ParseFileReason::ReadFailed),
+                    0,
+                    0,
+                ),
+                warnings: vec![parse_warning(
+                    "parse_read_failed",
+                    Some(file.path.clone()),
+                    format!("failed to read file contents for parsing: {source}"),
+                )],
+                symbols: Vec::new(),
+                imports: Vec::new(),
+                counted_for_progress: true,
+            };
+        }
+    };
+
+    let extraction = extract_source(&file.path, language, &source);
+    let symbol_count = extraction.symbols.len() as u64;
+    let import_count = extraction.imports.len() as u64;
+    let (status, reason) = if extraction.parsed {
+        (ParseFileStatus::Parsed, None)
+    } else {
+        (ParseFileStatus::Skipped, Some(ParseFileReason::ParseFailed))
+    };
+
+    operation_log::event(
+        "parse_file_completed",
+        json!({
+            "path": file.path,
+            "language": language.name(),
+            "status": format!("{status:?}"),
+            "reason": reason.map(|value| format!("{value:?}")),
+            "symbol_count": symbol_count,
+            "import_count": import_count,
+        }),
+    );
+
+    FileParseOutput {
+        file: parse_file_record(file, status, reason, symbol_count, import_count),
+        warnings: extraction.warnings,
+        symbols: extraction.symbols,
+        imports: extraction.imports,
+        counted_for_progress: true,
     }
 }
 

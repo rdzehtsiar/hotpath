@@ -1,22 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::env;
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
+use std::thread;
 
-use git2::{
-    Delta, Diff, DiffFindOptions, DiffOptions, ErrorClass, ErrorCode, Oid, Patch, Repository, Sort,
-};
+use crossbeam_channel::{bounded, Receiver, TrySendError};
+use git2::{Delta, Diff, DiffLineType, DiffOptions, ErrorClass, ErrorCode, Oid, Repository, Sort};
+use serde::{Deserialize, Serialize};
 
 use crate::ownership::{operational_ownership_from_changes, OperationalOwnershipSnapshot};
 
 pub const RECENT_CHURN_WINDOW_DAYS: i64 = 90;
 const SECONDS_PER_DAY: i64 = 86_400;
 const RECENT_CHURN_WINDOW_SECONDS: i64 = RECENT_CHURN_WINDOW_DAYS * SECONDS_PER_DAY;
+const CO_CHANGED_FILE_COUNT_SATURATION: u64 = 25;
+const MAX_PAIRWISE_CO_CHANGE_PATHS: usize = 256;
+const GIT_CACHE_LOOKUP_BATCH_SIZE: usize = 1024;
+const GIT_DIFF_JOB_COMMIT_CHUNK_SIZE: usize = 64;
+const GIT_COMMIT_CACHE_WRITE_BATCH_SIZE: usize = 512;
+const GIT_DIFF_QUEUE_FACTOR: usize = 4;
+const GIT_RESULT_QUEUE_FACTOR: usize = 8;
+const MAX_DEFAULT_GIT_WORKERS: usize = 16;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// A raw repository-relative file change observed in one reachable commit.
 pub struct GitFileChange {
     /// Full hexadecimal commit object id.
@@ -39,7 +51,7 @@ pub struct GitFileChange {
     pub deleted_lines: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 /// File-level change kind reported by Git for a selected commit diff.
 pub enum GitChangeKind {
     Added,
@@ -73,6 +85,12 @@ pub struct GitFileMetrics {
     pub dominant_owner: Option<String>,
     /// Dominant owner's weighted operational ownership share for this path.
     pub dominant_owner_share: Option<f64>,
+    /// Distinct files observed in commits that also touched this path.
+    ///
+    /// This count is saturated at the score formula's current co-change
+    /// normalization ceiling so large mechanical commits cannot dominate
+    /// runtime or memory use.
+    pub co_changed_file_count: u64,
     /// First observed commit id for this path by commit time, then commit id.
     pub first_commit_id: Option<String>,
     /// First observed committer timestamp for this path.
@@ -94,6 +112,46 @@ pub struct GitCoChange {
     pub right_path: String,
     /// Number of distinct commits that touched both paths.
     pub commit_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Progress while walking reachable Git history.
+pub struct GitHistoryProgress {
+    pub completed_commits: usize,
+    pub total_commits: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GitPipelineOptions {
+    pub git_jobs: usize,
+    pub job_commit_chunk_size: usize,
+    pub diff_queue_capacity: usize,
+    pub result_queue_capacity: usize,
+}
+
+impl Default for GitPipelineOptions {
+    fn default() -> Self {
+        let parallelism = thread::available_parallelism()
+            .map(NonZeroUsize::get)
+            .unwrap_or(1);
+        let git_jobs = env::var("HOTPATH_GIT_JOBS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| parallelism.clamp(1, MAX_DEFAULT_GIT_WORKERS));
+        let job_commit_chunk_size = env::var("HOTPATH_GIT_CHUNK_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(GIT_DIFF_JOB_COMMIT_CHUNK_SIZE);
+
+        Self {
+            git_jobs,
+            job_commit_chunk_size,
+            diff_queue_capacity: git_jobs.saturating_mul(GIT_DIFF_QUEUE_FACTOR).max(1),
+            result_queue_capacity: git_jobs.saturating_mul(GIT_RESULT_QUEUE_FACTOR).max(1),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -151,6 +209,9 @@ pub enum GitHistoryError {
     UnsupportedPathEncoding {
         commit_id: String,
     },
+    WorkerFailed {
+        context: &'static str,
+    },
 }
 
 #[derive(Debug)]
@@ -181,7 +242,8 @@ impl StdError for GitHistoryError {
             | Self::ShallowRepository { .. }
             | Self::BareRepository { .. }
             | Self::UnsupportedAuthorIdentity { .. }
-            | Self::UnsupportedPathEncoding { .. } => None,
+            | Self::UnsupportedPathEncoding { .. }
+            | Self::WorkerFailed { .. } => None,
         }
     }
 }
@@ -239,6 +301,9 @@ pub(crate) fn write_git_history_error(
             f,
             "commit {commit_id} changed a path that is not valid UTF-8"
         ),
+        GitHistoryError::WorkerFailed { context } => {
+            write!(f, "failed to traverse Git history while {context}")
+        }
     }
 }
 
@@ -330,10 +395,85 @@ pub fn file_changes_from_head(
     file_changes_from_repository(&repository, head_commit.id())
 }
 
+/// Return the canonical Git worktree root discovered from a path inside a
+/// non-bare repository.
+pub fn worktree_root_at(worktree_path: impl AsRef<Path>) -> Result<PathBuf, GitHistoryError> {
+    let worktree_path = worktree_path.as_ref();
+    let repository = open_repository(worktree_path)?;
+    reject_shallow_repository(&repository, worktree_path)?;
+    head_commit(&repository, worktree_path)?;
+    repository
+        .workdir()
+        .ok_or_else(|| GitHistoryError::BareRepository {
+            path: worktree_path.to_path_buf(),
+        })
+        .map(Path::to_path_buf)
+}
+
 /// Analyze deterministic local Git history reachable from `HEAD`.
 pub fn analyze_from_head_at(
     worktree_path: impl AsRef<Path>,
 ) -> Result<GitAnalysis, GitHistoryError> {
+    analyze_from_head_at_with_progress(worktree_path, |_| {})
+}
+
+/// Analyze deterministic local Git history reachable from `HEAD`, reporting
+/// coarse commit progress to interactive callers.
+pub fn analyze_from_head_at_with_progress<F>(
+    worktree_path: impl AsRef<Path>,
+    progress: F,
+) -> Result<GitAnalysis, GitHistoryError>
+where
+    F: FnMut(GitHistoryProgress),
+{
+    analyze_from_head_at_with_progress_and_cache(worktree_path, progress, |_| None, |_, _| {})
+}
+
+/// Analyze deterministic local Git history reachable from `HEAD`, reusing and
+/// recording per-commit file changes through caller-provided cache callbacks.
+pub fn analyze_from_head_at_with_progress_and_cache<F, L, S>(
+    worktree_path: impl AsRef<Path>,
+    progress: F,
+    mut load_cached_commit: L,
+    mut store_commit: S,
+) -> Result<GitAnalysis, GitHistoryError>
+where
+    F: FnMut(GitHistoryProgress),
+    L: FnMut(&str) -> Option<Vec<GitFileChange>>,
+    S: FnMut(&str, &[GitFileChange]),
+{
+    analyze_from_head_at_with_progress_and_cache_batches(
+        worktree_path,
+        progress,
+        |commit_ids| {
+            commit_ids
+                .iter()
+                .filter_map(|commit_id| {
+                    load_cached_commit(commit_id).map(|changes| (commit_id.clone(), changes))
+                })
+                .collect()
+        },
+        |commits| {
+            for (commit_id, changes) in commits {
+                store_commit(commit_id, changes);
+            }
+        },
+    )
+}
+
+/// Analyze deterministic local Git history reachable from `HEAD`, reusing and
+/// recording per-commit file changes through batch cache callbacks.
+pub fn analyze_from_head_at_with_progress_and_cache_batches<F, L, S>(
+    worktree_path: impl AsRef<Path>,
+    progress: F,
+    load_cached_commits: L,
+    store_commits: S,
+) -> Result<GitAnalysis, GitHistoryError>
+where
+    F: FnMut(GitHistoryProgress),
+    L: FnMut(&[String]) -> BTreeMap<String, Vec<GitFileChange>>,
+    S: FnMut(&[(String, Vec<GitFileChange>)]),
+{
     let worktree_path = worktree_path.as_ref();
     let repository = open_repository(worktree_path)?;
     reject_shallow_repository(&repository, worktree_path)?;
@@ -346,7 +486,15 @@ pub fn analyze_from_head_at(
             path: worktree_path.to_path_buf(),
         })?
         .to_path_buf();
-    let changes = file_changes_from_repository(&repository, head_commit_id)?;
+    let changes = file_changes_from_repository_with_progress_and_cache(
+        &repository,
+        &worktree_root,
+        head_commit_id,
+        progress,
+        load_cached_commits,
+        store_commits,
+        GitPipelineOptions::default(),
+    )?;
     let ownership = operational_ownership_from_changes(&changes, head_commit_time);
     let file_metrics =
         file_metrics_from_changes_with_ownership(&changes, head_commit_time, &ownership);
@@ -368,59 +516,163 @@ fn file_changes_from_repository(
     repository: &Repository,
     head_commit_id: Oid,
 ) -> Result<Vec<GitFileChange>, GitHistoryError> {
+    file_changes_from_repository_with_progress(repository, head_commit_id, |_| {})
+}
+
+fn file_changes_from_repository_with_progress<F>(
+    repository: &Repository,
+    head_commit_id: Oid,
+    progress: F,
+) -> Result<Vec<GitFileChange>, GitHistoryError>
+where
+    F: FnMut(GitHistoryProgress),
+{
+    let worktree_root = repository
+        .workdir()
+        .ok_or_else(|| GitHistoryError::BareRepository {
+            path: PathBuf::from("."),
+        })?
+        .to_path_buf();
+    file_changes_from_repository_with_progress_and_cache(
+        repository,
+        &worktree_root,
+        head_commit_id,
+        progress,
+        |_| BTreeMap::new(),
+        |_| {},
+        GitPipelineOptions::default(),
+    )
+}
+
+fn file_changes_from_repository_with_progress_and_cache<F, L, S>(
+    repository: &Repository,
+    worktree_root: &Path,
+    head_commit_id: Oid,
+    mut progress: F,
+    mut load_cached_commits: L,
+    mut store_commits: S,
+    options: GitPipelineOptions,
+) -> Result<Vec<GitFileChange>, GitHistoryError>
+where
+    F: FnMut(GitHistoryProgress),
+    L: FnMut(&[String]) -> BTreeMap<String, Vec<GitFileChange>>,
+    S: FnMut(&[(String, Vec<GitFileChange>)]),
+{
     let commits = reachable_commits(repository, head_commit_id)?;
     let mut changes = Vec::new();
+    let total_commits = commits.len();
+    if total_commits == 0 {
+        return Ok(changes);
+    }
+    let git_jobs = options.git_jobs.clamp(1, total_commits.max(1));
+    let job_commit_chunk_size = options.job_commit_chunk_size.max(1);
+    let (job_sender, job_receiver) = bounded::<DiffJob>(options.diff_queue_capacity.max(git_jobs));
+    let (result_sender, result_receiver) =
+        bounded::<DiffWorkerResult>(options.result_queue_capacity.max(git_jobs));
+    let mut workers = Vec::with_capacity(git_jobs);
+    for _ in 0..git_jobs {
+        let worktree_root = worktree_root.to_path_buf();
+        let job_receiver = job_receiver.clone();
+        let result_sender = result_sender.clone();
+        workers.push(thread::spawn(move || {
+            diff_worker(&worktree_root, job_receiver, result_sender);
+        }));
+    }
+    drop(result_sender);
 
-    for commit_id in commits {
-        let commit = repository
-            .find_commit(commit_id)
-            .map_err(|source| GitHistoryError::Git {
-                context: "loading a reachable commit",
-                source,
-            })?;
-        let commit_id = commit.id().to_string();
-        let parent_count = commit.parent_count();
-        let author = author_identity(&commit_id, commit.author())?;
-        let commit_time = commit.time().seconds();
-        let tree = commit.tree().map_err(|source| GitHistoryError::Git {
-            context: "loading a commit tree",
-            source,
-        })?;
-        let parent_tree = if parent_count == 0 {
-            None
-        } else {
-            Some(
-                commit
-                    .parent(0)
-                    .and_then(|parent| parent.tree())
-                    .map_err(|source| GitHistoryError::Git {
-                        context: "loading the first parent tree",
-                        source,
-                    })?,
-            )
-        };
-        let mut diff_options = DiffOptions::new();
-        let mut diff = repository
-            .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut diff_options))
-            .map_err(|source| GitHistoryError::Git {
-                context: "diffing commit trees",
-                source,
-            })?;
-        let mut find_options = DiffFindOptions::new();
-        find_options.renames(true).copies(false);
-        diff.find_similar(Some(&mut find_options))
-            .map_err(|source| GitHistoryError::Git {
-                context: "detecting renamed files",
-                source,
-            })?;
+    let mut completed_commits = 0usize;
+    let mut fresh_cache_writes = Vec::<(String, Vec<GitFileChange>)>::new();
+    let mut diff_batch = Vec::<Oid>::with_capacity(job_commit_chunk_size);
 
-        changes.extend(diff_file_changes(
-            &diff,
-            commit_id,
-            parent_count,
-            author,
-            commit_time,
-        )?);
+    for commit_batch in commits.chunks(GIT_CACHE_LOOKUP_BATCH_SIZE) {
+        let commit_ids = commit_batch
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let mut cached_changes = load_cached_commits(&commit_ids);
+        for commit_id in commit_batch {
+            let commit_id_string = commit_id.to_string();
+            if let Some(cached) = cached_changes.remove(&commit_id_string) {
+                changes.extend(cached);
+                completed_commits += 1;
+                progress(GitHistoryProgress {
+                    completed_commits,
+                    total_commits,
+                });
+            } else {
+                diff_batch.push(*commit_id);
+                if diff_batch.len() < job_commit_chunk_size {
+                    continue;
+                }
+                send_diff_job(
+                    std::mem::take(&mut diff_batch),
+                    &job_sender,
+                    &result_receiver,
+                    &mut |result| {
+                        handle_diff_result(
+                            result,
+                            &mut changes,
+                            &mut fresh_cache_writes,
+                            &mut store_commits,
+                            &mut completed_commits,
+                            total_commits,
+                            &mut progress,
+                        )
+                    },
+                )?;
+            }
+        }
+        if !diff_batch.is_empty() {
+            send_diff_job(
+                std::mem::take(&mut diff_batch),
+                &job_sender,
+                &result_receiver,
+                &mut |result| {
+                    handle_diff_result(
+                        result,
+                        &mut changes,
+                        &mut fresh_cache_writes,
+                        &mut store_commits,
+                        &mut completed_commits,
+                        total_commits,
+                        &mut progress,
+                    )
+                },
+            )?;
+        }
+    }
+    drop(job_sender);
+
+    while completed_commits < total_commits {
+        let result = result_receiver
+            .recv()
+            .map_err(|_| GitHistoryError::WorkerFailed {
+                context: "receiving Git diff worker result",
+            })?;
+        handle_diff_result(
+            result,
+            &mut changes,
+            &mut fresh_cache_writes,
+            &mut store_commits,
+            &mut completed_commits,
+            total_commits,
+            &mut progress,
+        )?;
+    }
+
+    if completed_commits != total_commits {
+        return Err(GitHistoryError::WorkerFailed {
+            context: "collecting Git diff worker results",
+        });
+    }
+    store_commits(&fresh_cache_writes);
+    fresh_cache_writes.clear();
+    for worker in workers {
+        if worker.join().is_err() {
+            return Err(GitHistoryError::WorkerFailed {
+                context: "joining Git diff worker",
+            });
+        }
     }
 
     changes.sort_by(|left, right| {
@@ -443,6 +695,148 @@ fn file_changes_from_repository(
     });
 
     Ok(changes)
+}
+
+type DiffJob = Vec<Oid>;
+type DiffWorkerResult = Result<Vec<(String, Vec<GitFileChange>)>, GitHistoryError>;
+
+fn send_diff_job<F>(
+    job: DiffJob,
+    sender: &crossbeam_channel::Sender<DiffJob>,
+    result_receiver: &Receiver<DiffWorkerResult>,
+    handle_result: &mut F,
+) -> Result<(), GitHistoryError>
+where
+    F: FnMut(DiffWorkerResult) -> Result<(), GitHistoryError>,
+{
+    let mut pending = job;
+    loop {
+        match sender.try_send(pending) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Full(job)) => {
+                pending = job;
+                let result = result_receiver
+                    .recv()
+                    .map_err(|_| GitHistoryError::WorkerFailed {
+                        context: "receiving Git diff worker result",
+                    })?;
+                handle_result(result)?;
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                return Err(GitHistoryError::WorkerFailed {
+                    context: "sending Git diff worker job",
+                });
+            }
+        }
+    }
+}
+
+fn handle_diff_result<F, S>(
+    result: DiffWorkerResult,
+    changes: &mut Vec<GitFileChange>,
+    fresh_cache_writes: &mut Vec<(String, Vec<GitFileChange>)>,
+    store_commits: &mut S,
+    completed_commits: &mut usize,
+    total_commits: usize,
+    progress: &mut F,
+) -> Result<(), GitHistoryError>
+where
+    F: FnMut(GitHistoryProgress),
+    S: FnMut(&[(String, Vec<GitFileChange>)]),
+{
+    for (commit_id, commit_changes) in result? {
+        changes.extend(commit_changes.clone());
+        fresh_cache_writes.push((commit_id, commit_changes));
+        if fresh_cache_writes.len() >= GIT_COMMIT_CACHE_WRITE_BATCH_SIZE {
+            store_commits(fresh_cache_writes);
+            fresh_cache_writes.clear();
+        }
+        *completed_commits += 1;
+        progress(GitHistoryProgress {
+            completed_commits: *completed_commits,
+            total_commits,
+        });
+    }
+    Ok(())
+}
+
+fn diff_worker(
+    worktree_root: &Path,
+    receiver: Receiver<DiffJob>,
+    sender: crossbeam_channel::Sender<DiffWorkerResult>,
+) {
+    let repository = match open_repository(worktree_root) {
+        Ok(repository) => repository,
+        Err(error) => {
+            let _ = sender.send(Err(error));
+            return;
+        }
+    };
+
+    for job in receiver {
+        let mut batch = Vec::with_capacity(job.len());
+        for commit_id in job {
+            match diff_commit_file_changes(&repository, commit_id) {
+                Ok(changes) => batch.push(changes),
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    return;
+                }
+            }
+        }
+        if sender.send(Ok(batch)).is_err() {
+            return;
+        }
+    }
+}
+
+fn diff_commit_file_changes(
+    repository: &Repository,
+    commit_id: Oid,
+) -> Result<(String, Vec<GitFileChange>), GitHistoryError> {
+    let commit = repository
+        .find_commit(commit_id)
+        .map_err(|source| GitHistoryError::Git {
+            context: "loading a reachable commit",
+            source,
+        })?;
+    let commit_id_string = commit.id().to_string();
+    let parent_count = commit.parent_count();
+    let author = author_identity(&commit_id_string, commit.author())?;
+    let commit_time = commit.time().seconds();
+    let tree = commit.tree().map_err(|source| GitHistoryError::Git {
+        context: "loading a commit tree",
+        source,
+    })?;
+    let parent_tree = if parent_count == 0 {
+        None
+    } else {
+        Some(
+            commit
+                .parent(0)
+                .and_then(|parent| parent.tree())
+                .map_err(|source| GitHistoryError::Git {
+                    context: "loading the first parent tree",
+                    source,
+                })?,
+        )
+    };
+    let mut diff_options = DiffOptions::new();
+    let diff = repository
+        .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut diff_options))
+        .map_err(|source| GitHistoryError::Git {
+            context: "diffing commit trees",
+            source,
+        })?;
+    let changes = diff_file_changes(
+        &diff,
+        commit_id_string.clone(),
+        parent_count,
+        author,
+        commit_time,
+    )?;
+
+    Ok((commit_id_string, changes))
 }
 
 /// Explain local Git history metrics and co-changes for one requested file.
@@ -525,12 +919,13 @@ fn file_metrics_from_changes_with_ownership(
     ownership: &OperationalOwnershipSnapshot,
 ) -> Vec<GitFileMetrics> {
     let recent_threshold = head_commit_time.saturating_sub(RECENT_CHURN_WINDOW_SECONDS);
-    let mut by_path = BTreeMap::<String, FileMetricAccumulator>::new();
+    let mut by_path = HashMap::<String, FileMetricAccumulator>::new();
+    let co_changed_file_counts = co_changed_file_counts_from_changes(changes);
     let ownership_by_path = ownership
         .by_file
         .iter()
         .map(|file| (file.path.as_str(), file))
-        .collect::<BTreeMap<_, _>>();
+        .collect::<HashMap<_, _>>();
 
     for change in changes {
         let accumulator = by_path
@@ -548,14 +943,20 @@ fn file_metrics_from_changes_with_ownership(
         accumulator.record_touch(change);
     }
 
-    by_path
+    let mut metrics = by_path
         .into_values()
         .map(|accumulator| {
             let file_ownership = ownership_by_path.get(accumulator.path.as_str()).copied();
+            let co_changed_file_count = co_changed_file_counts
+                .get(accumulator.path.as_str())
+                .copied()
+                .unwrap_or(0);
 
-            accumulator.into_metrics(head_commit_time, file_ownership)
+            accumulator.into_metrics(head_commit_time, file_ownership, co_changed_file_count)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    metrics.sort_by(|left, right| left.path.cmp(&right.path));
+    metrics
 }
 
 /// Aggregate raw file changes into deterministic co-change counts.
@@ -564,7 +965,7 @@ fn file_metrics_from_changes_with_ownership(
 /// paths. Returned pairs are ranked by count descending, then left path
 /// ascending, then right path ascending.
 pub fn co_changes_from_changes(changes: &[GitFileChange]) -> Vec<GitCoChange> {
-    let mut paths_by_commit = BTreeMap::<&str, BTreeSet<&str>>::new();
+    let mut paths_by_commit = HashMap::<&str, HashSet<&str>>::new();
 
     for change in changes {
         paths_by_commit
@@ -573,10 +974,14 @@ pub fn co_changes_from_changes(changes: &[GitFileChange]) -> Vec<GitCoChange> {
             .insert(change.path.as_str());
     }
 
-    let mut pair_counts = BTreeMap::<(String, String), u64>::new();
+    let mut pair_counts = HashMap::<(String, String), u64>::new();
 
     for paths in paths_by_commit.into_values() {
-        let paths = paths.into_iter().collect::<Vec<_>>();
+        let mut paths = paths.into_iter().collect::<Vec<_>>();
+        paths.sort_unstable();
+        if paths.len() > MAX_PAIRWISE_CO_CHANGE_PATHS {
+            continue;
+        }
 
         for (left_index, left_path) in paths.iter().enumerate() {
             for right_path in paths.iter().skip(left_index + 1) {
@@ -605,6 +1010,62 @@ pub fn co_changes_from_changes(changes: &[GitFileChange]) -> Vec<GitCoChange> {
     });
 
     co_changes
+}
+
+fn co_changed_file_counts_from_changes(changes: &[GitFileChange]) -> BTreeMap<String, u64> {
+    let mut paths_by_commit = HashMap::<&str, HashSet<&str>>::new();
+
+    for change in changes {
+        paths_by_commit
+            .entry(change.commit_id.as_str())
+            .or_default()
+            .insert(change.path.as_str());
+    }
+
+    let mut related_by_path = HashMap::<String, HashSet<String>>::new();
+    let mut saturated_paths = HashSet::<String>::new();
+
+    for paths in paths_by_commit.into_values() {
+        let paths = paths.into_iter().collect::<Vec<_>>();
+        if paths.len() <= 1 {
+            continue;
+        }
+
+        if paths.len().saturating_sub(1) as u64 >= CO_CHANGED_FILE_COUNT_SATURATION {
+            for path in paths {
+                saturated_paths.insert(path.to_owned());
+            }
+            continue;
+        }
+
+        for (left_index, left_path) in paths.iter().enumerate() {
+            if saturated_paths.contains(*left_path) {
+                continue;
+            }
+
+            let related = related_by_path.entry((*left_path).to_owned()).or_default();
+            for (right_index, right_path) in paths.iter().enumerate() {
+                if left_index != right_index {
+                    related.insert((*right_path).to_owned());
+                    if related.len() as u64 >= CO_CHANGED_FILE_COUNT_SATURATION {
+                        saturated_paths.insert((*left_path).to_owned());
+                        related.clear();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut counts = related_by_path
+        .into_iter()
+        .map(|(path, related)| (path, related.len() as u64))
+        .collect::<BTreeMap<_, _>>();
+    for path in saturated_paths {
+        counts.insert(path, CO_CHANGED_FILE_COUNT_SATURATION);
+    }
+
+    counts
 }
 
 fn open_repository(worktree_path: &Path) -> Result<Repository, GitHistoryError> {
@@ -678,17 +1139,14 @@ fn reachable_commits(repository: &Repository, head: Oid) -> Result<Vec<Oid>, Git
         source,
     })?;
 
-    let mut commits = revwalk
+    revwalk
         .map(|commit| {
             commit.map_err(|source| GitHistoryError::Git {
                 context: "walking commits reachable from HEAD",
                 source,
             })
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    commits.sort();
-
-    Ok(commits)
+        .collect::<Result<Vec<_>, _>>()
 }
 
 fn diff_file_changes(
@@ -698,40 +1156,97 @@ fn diff_file_changes(
     author: String,
     commit_time: i64,
 ) -> Result<Vec<GitFileChange>, GitHistoryError> {
-    let mut changes = Vec::new();
+    #[derive(Debug)]
+    struct PendingChange {
+        path: String,
+        change_kind: GitChangeKind,
+        added_lines: u64,
+        deleted_lines: u64,
+    }
 
-    for (index, delta) in diff.deltas().enumerate() {
+    let pending_changes = RefCell::new(Vec::<PendingChange>::new());
+    let current_change_index = Cell::new(None::<usize>);
+    let callback_error = RefCell::new(None::<GitHistoryError>);
+
+    let mut file_cb = |delta: git2::DiffDelta<'_>, _progress: f32| {
         let Some(change_kind) = change_kind(delta.status()) else {
-            continue;
+            current_change_index.set(None);
+            return true;
         };
-        let path = delta_path(&commit_id, delta)?;
+        let path = match delta_path(&commit_id, delta) {
+            Ok(path) => path,
+            Err(error) => {
+                *callback_error.borrow_mut() = Some(error);
+                return false;
+            }
+        };
         if is_internal_analysis_path(&path) {
-            continue;
+            current_change_index.set(None);
+            return true;
         }
-        let (_context, added_lines, deleted_lines) = Patch::from_diff(diff, index)
-            .map_err(|source| GitHistoryError::Git {
-                context: "loading a file diff patch",
-                source,
-            })?
-            .map_or(Ok((0, 0, 0)), |patch| {
-                patch.line_stats().map_err(|source| GitHistoryError::Git {
+
+        let mut changes = pending_changes.borrow_mut();
+        changes.push(PendingChange {
+            path,
+            change_kind,
+            added_lines: 0,
+            deleted_lines: 0,
+        });
+        current_change_index.set(Some(changes.len() - 1));
+        true
+    };
+    let mut line_cb = |_delta: git2::DiffDelta<'_>,
+                       _hunk: Option<git2::DiffHunk<'_>>,
+                       line: git2::DiffLine<'_>| {
+        let Some(index) = current_change_index.get() else {
+            return true;
+        };
+        let mut changes = pending_changes.borrow_mut();
+        let Some(change) = changes.get_mut(index) else {
+            return true;
+        };
+        match line.origin_value() {
+            DiffLineType::Addition | DiffLineType::AddEOFNL => {
+                change.added_lines += 1;
+            }
+            DiffLineType::Deletion | DiffLineType::DeleteEOFNL => {
+                change.deleted_lines += 1;
+            }
+            _ => {}
+        }
+        true
+    };
+
+    diff.foreach(&mut file_cb, None, None, Some(&mut line_cb))
+        .map_err(|source| {
+            callback_error
+                .borrow_mut()
+                .take()
+                .unwrap_or(GitHistoryError::Git {
                     context: "counting changed lines",
                     source,
                 })
-            })?;
+        })?;
 
-        changes.push(GitFileChange {
+    if let Some(error) = callback_error.into_inner() {
+        return Err(error);
+    }
+
+    let mut changes = pending_changes
+        .into_inner()
+        .into_iter()
+        .map(|change| GitFileChange {
             commit_id: commit_id.clone(),
             parent_count,
             is_merge: parent_count > 1,
             author: author.clone(),
             commit_time,
-            path,
-            change_kind,
-            added_lines: added_lines as u64,
-            deleted_lines: deleted_lines as u64,
-        });
-    }
+            path: change.path,
+            change_kind: change.change_kind,
+            added_lines: change.added_lines,
+            deleted_lines: change.deleted_lines,
+        })
+        .collect::<Vec<_>>();
 
     changes.sort_by(|left, right| {
         (
@@ -1085,8 +1600,8 @@ struct FileMetricAccumulator {
     total_churn_deleted: u64,
     recent_churn_added: u64,
     recent_churn_deleted: u64,
-    commits: BTreeSet<String>,
-    author_touch_counts: BTreeMap<String, u64>,
+    commits: HashSet<String>,
+    author_touch_counts: HashMap<String, u64>,
     first_commit: Option<CommitPoint>,
     last_commit: Option<CommitPoint>,
 }
@@ -1099,8 +1614,8 @@ impl FileMetricAccumulator {
             total_churn_deleted: 0,
             recent_churn_added: 0,
             recent_churn_deleted: 0,
-            commits: BTreeSet::new(),
-            author_touch_counts: BTreeMap::new(),
+            commits: HashSet::new(),
+            author_touch_counts: HashMap::new(),
             first_commit: None,
             last_commit: None,
         }
@@ -1143,6 +1658,7 @@ impl FileMetricAccumulator {
         self,
         head_commit_time: i64,
         ownership: Option<&crate::ownership::OperationalFileOwnership>,
+        co_changed_file_count: u64,
     ) -> GitFileMetrics {
         let commits_per_file = self.commits.len() as u64;
         let author_count = self.author_touch_counts.len() as u64;
@@ -1171,6 +1687,7 @@ impl FileMetricAccumulator {
             owner_count,
             dominant_owner,
             dominant_owner_share,
+            co_changed_file_count,
             first_commit_id: first_commit.as_ref().map(|commit| commit.id.clone()),
             first_commit_time: first_commit.as_ref().map(|commit| commit.time),
             last_commit_id: last_commit.as_ref().map(|commit| commit.id.clone()),

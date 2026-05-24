@@ -642,7 +642,7 @@ fn build_report_and_persist(
     current_dir: &Path,
     excluded_report_path: Option<&Path>,
 ) -> Result<Report, ReportCommandError> {
-    let analysis = git::analyze_from_head_at(current_dir)?;
+    let analysis = crate::analyze_git_cached_at(current_dir)?;
     let excluded_report_path = excluded_report_path
         .and_then(|path| repository_relative_path(&analysis.worktree_root, path));
     let mut scan = crate::scan_repository(&analysis.worktree_root)?;

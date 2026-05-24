@@ -299,11 +299,14 @@ pub fn raw_score_metrics_from_scan_and_git(
                 author_count: Some(metric.map_or(0, |metric| metric.author_count)),
                 owner_count: Some(metric.map_or(0, |metric| metric.owner_count)),
                 dominant_owner_share: metric.and_then(|metric| metric.dominant_owner_share),
-                co_changed_file_count: Some(
-                    co_changed_paths
-                        .get(file.path.as_str())
-                        .map_or(0, |paths| paths.len() as u64),
-                ),
+                co_changed_file_count: Some(metric.map_or_else(
+                    || {
+                        co_changed_paths
+                            .get(file.path.as_str())
+                            .map_or(0, |paths| paths.len() as u64)
+                    },
+                    |metric| metric.co_changed_file_count,
+                )),
                 file_age_days: metric.and_then(|metric| metric.file_age_days),
                 repository_age_days: repository_context.repository_age_days,
                 repository_author_count: repository_context.repository_author_count,
@@ -979,6 +982,7 @@ mod tests {
             owner_count: 2,
             dominant_owner: Some("Ada Lovelace <ada@example.invalid>".to_owned()),
             dominant_owner_share: Some(2.0 / 3.0),
+            co_changed_file_count: 2,
             first_commit_id: Some("a".repeat(40)),
             first_commit_time: Some(1),
             last_commit_id: Some("b".repeat(40)),
@@ -1364,6 +1368,7 @@ mod tests {
                 owner_count: 2,
                 dominant_owner: Some("Ben Bitdiddle <ben@example.invalid>".to_owned()),
                 dominant_owner_share: Some(0.5),
+                co_changed_file_count: 1,
                 first_commit_id: Some("b".repeat(40)),
                 first_commit_time: Some(1_710_892_800),
                 last_commit_id: Some("c".repeat(40)),
@@ -1381,6 +1386,7 @@ mod tests {
                 owner_count: 3,
                 dominant_owner: Some("Ada Lovelace <ada@example.invalid>".to_owned()),
                 dominant_owner_share: Some(1.0 / 3.0),
+                co_changed_file_count: 2,
                 first_commit_id: Some("a".repeat(40)),
                 first_commit_time: Some(1_704_067_200),
                 last_commit_id: Some("c".repeat(40)),
@@ -1398,6 +1404,7 @@ mod tests {
                 owner_count: 1,
                 dominant_owner: Some("Ada Lovelace <ada@example.invalid>".to_owned()),
                 dominant_owner_share: Some(1.0),
+                co_changed_file_count: 1,
                 first_commit_id: Some("a".repeat(40)),
                 first_commit_time: Some(1_704_067_200),
                 last_commit_id: Some("a".repeat(40)),

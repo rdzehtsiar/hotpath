@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::error::Error as StdError;
@@ -7,8 +8,10 @@ use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::thread;
 
 use ignore::{DirEntry, Error as IgnoreError, WalkBuilder};
+use rayon::prelude::*;
 use serde::Serialize;
 use serde_json::json;
 
@@ -789,7 +792,7 @@ pub fn scan_repository(root: impl AsRef<Path>) -> Result<ScanReport, ScanError> 
     })?;
 
     let mut warnings = Vec::new();
-    let mut files = Vec::new();
+    let mut file_paths = Vec::new();
     let internal_filter_root = root.clone();
 
     for entry in WalkBuilder::new(&root)
@@ -827,7 +830,16 @@ pub fn scan_repository(root: impl AsRef<Path>) -> Result<ScanReport, ScanError> 
             continue;
         }
 
-        files.push(classify_file(&root, entry.path())?);
+        file_paths.push(entry.path().to_path_buf());
+    }
+
+    let classified_files = file_paths
+        .par_iter()
+        .map(|path| classify_file(&root, path))
+        .collect::<Vec<_>>();
+    let mut files = Vec::with_capacity(classified_files.len());
+    for classified_file in classified_files {
+        files.push(classified_file?);
     }
 
     warnings.sort_by(|left, right| {
@@ -892,9 +904,51 @@ pub fn parse_scan_report(scan: &ScanReport) -> ParseReport {
     parse::scaffold_report_from_scan(scan)
 }
 
+pub(crate) fn analyze_git_cached_at(root: &Path) -> Result<git::GitAnalysis, git::GitHistoryError> {
+    let worktree_root = git::worktree_root_at(root)?;
+    let read_cache = RefCell::new(storage::index::IndexStore::open(&worktree_root).ok());
+    let (cache_write_sender, cache_write_receiver) =
+        crossbeam_channel::bounded::<Vec<(String, Vec<git::GitFileChange>)>>(8);
+    let cache_write_root = worktree_root.clone();
+    let cache_writer = thread::spawn(move || {
+        let Ok(mut write_cache) = storage::index::IndexStore::open(&cache_write_root) else {
+            return;
+        };
+        for commits in cache_write_receiver {
+            let _ =
+                write_cache.persist_git_commit_changes_batch(env!("CARGO_PKG_VERSION"), &commits);
+        }
+    });
+    let analyzer_version = env!("CARGO_PKG_VERSION");
+
+    let analysis = git::analyze_from_head_at_with_progress_and_cache_batches(
+        &worktree_root,
+        |_| {},
+        |commit_ids| {
+            read_cache
+                .borrow()
+                .as_ref()
+                .and_then(|store| {
+                    store
+                        .cached_git_commit_changes_batch(commit_ids, analyzer_version)
+                        .ok()
+                })
+                .unwrap_or_default()
+        },
+        |commits| {
+            if !commits.is_empty() {
+                let _ = cache_write_sender.send(commits.to_vec());
+            }
+        },
+    );
+    drop(cache_write_sender);
+    let _ = cache_writer.join();
+    analysis
+}
+
 pub fn hotspots(options: HotspotsOptions) -> Result<String, HotspotsCommandError> {
     let root = env::current_dir().map_err(HotspotsCommandError::CurrentDir)?;
-    let analysis = git::analyze_from_head_at(&root)?;
+    let analysis = analyze_git_cached_at(&root)?;
     let scan = scan_repository(&analysis.worktree_root)?;
     let mut index = storage::index::IndexStore::open(&analysis.worktree_root)
         .map_err(HotspotsCommandError::PersistScan)?;
@@ -1106,7 +1160,7 @@ fn context_current_dir_and_persist(
 fn diff_risk_report(range: &str) -> Result<DiffRiskReport, DiffCommandError> {
     let current_dir = env::current_dir().map_err(DiffCommandError::CurrentDir)?;
     let core_report = diff::analyze_committed_tree_diff(&current_dir, range)?;
-    let analysis = git::analyze_from_head_at(&current_dir)?;
+    let analysis = analyze_git_cached_at(&current_dir)?;
     let scan = scan_repository(&analysis.worktree_root)?;
     let ranked = ranked_hotspot_scores_from_scan_and_git(&scan.files, &analysis);
     let touched_hotspots = touched_hotspots(&core_report.changed_files, &scan.files, &ranked);
@@ -2137,7 +2191,11 @@ fn classify_content(path: &Path, record: &mut FileRecord) {
         }
     };
 
-    let mut bytes = Vec::new();
+    let read_capacity = record
+        .byte_size
+        .unwrap_or(0)
+        .min(MAX_TEXT_READ_BYTES.saturating_add(1)) as usize;
+    let mut bytes = Vec::with_capacity(read_capacity);
     let mut bounded = file.take(MAX_TEXT_READ_BYTES.saturating_add(1));
     if let Err(source) = bounded.read_to_end(&mut bytes) {
         record.warnings.push(file_warning(
