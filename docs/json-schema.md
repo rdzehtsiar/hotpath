@@ -9,7 +9,7 @@ hotpath.report.v1
 
 `hotpath report` builds the report from the current local repository state. It
 uses scanner facts, local Git history reachable from `HEAD`, ranked
-`hotpath.score.v1` hotspot rows, and the default context estimate. The command
+`hotpath.score.v3` hotspot rows, and the default context estimate. The command
 does not require network access, telemetry, hosted services, or cloud APIs.
 
 ## Command Surface
@@ -66,7 +66,7 @@ Abbreviated example:
       "path": "src/lib.rs",
       "score": 0.812,
       "formula_version": {
-        "id": "hotpath.score.v1"
+        "id": "hotpath.score.v3"
       },
       "raw_metrics": {},
       "normalized_metrics": {},
@@ -113,8 +113,8 @@ Important fields:
 | `rank` | One-based hotspot rank. |
 | `path` | Repository-relative file path. |
 | `score` | Internal advisory score on the `0.0-1.0` scale. |
-| `formula_version` | Scoring formula metadata, currently `hotpath.score.v1`. |
-| `raw_metrics` | Local scan and Git inputs used by the score when available. |
+| `formula_version` | Scoring formula metadata, currently `hotpath.score.v3`. |
+| `raw_metrics` | Local scan and Git inputs used by the score when available, including compact operational ownership metrics. |
 | `normalized_metrics` | Normalized metric values used by weighted terms. |
 | `weighted_terms` | Per-term contribution details for explainability. |
 | `limitations` | Known missing or approximate inputs for the row. |

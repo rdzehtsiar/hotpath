@@ -43,7 +43,7 @@ change risk, including:
 
 Hotpath should eventually help answer questions such as:
 
-- Which files combine high churn, large size, or fragmented ownership?
+- Which files combine high churn, large size, or concentrated operational ownership?
 - Which modules appear to be growing fastest?
 - Where are complexity and coupling concentrating?
 - Which changes touch known hotspots?

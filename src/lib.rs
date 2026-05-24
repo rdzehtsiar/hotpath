@@ -10,6 +10,7 @@ use std::path::{Component, Path, PathBuf};
 
 use ignore::{DirEntry, Error as IgnoreError, WalkBuilder};
 use serde::Serialize;
+use serde_json::json;
 
 pub mod complexity;
 pub mod context;
@@ -17,6 +18,8 @@ pub mod dependency;
 pub mod diff;
 pub mod git;
 pub mod graph;
+pub mod operation_log;
+pub mod ownership;
 pub mod parse;
 pub mod report;
 pub mod scoring;
@@ -910,11 +913,7 @@ pub fn hotspots(options: HotspotsOptions) -> Result<String, HotspotsCommandError
         )
         .map_err(HotspotsCommandError::PersistGitAnalysis)?;
 
-    let ranked = ranked_hotspot_scores_from_scan_and_git(
-        &scan.files,
-        &analysis.file_metrics,
-        &analysis.co_changes,
-    );
+    let ranked = ranked_hotspot_scores_from_scan_and_git(&scan.files, &analysis);
     index
         .persist_hotspots(scan_run.id, &ranked)
         .map_err(HotspotsCommandError::PersistHotspots)?;
@@ -967,11 +966,7 @@ pub fn explain(requested_path: impl AsRef<Path>) -> Result<String, ExplainComman
         )
         .map_err(ExplainCommandError::PersistGitAnalysis)?;
 
-    let ranked = ranked_hotspot_scores_from_scan_and_git(
-        &scan.files,
-        &analysis.file_metrics,
-        &analysis.co_changes,
-    );
+    let ranked = ranked_hotspot_scores_from_scan_and_git(&scan.files, &analysis);
     index
         .persist_hotspots(scan_run.id, &ranked)
         .map_err(ExplainCommandError::PersistHotspots)?;
@@ -1033,7 +1028,21 @@ pub fn doctor_repository(root: impl AsRef<Path>) -> Result<String, DoctorError> 
 
 fn scan_current_dir_and_persist() -> Result<ScanReport, ScanError> {
     let root = env::current_dir().map_err(ScanError::CurrentDir)?;
+    operation_log::event(
+        "scan_started",
+        json!({
+            "root": root.display().to_string(),
+        }),
+    );
     let report = scan_repository(&root)?;
+    operation_log::event(
+        "scan_completed",
+        json!({
+            "root": root.display().to_string(),
+            "total_files": report.files.len(),
+            "warning_count": report.warnings.len(),
+        }),
+    );
     let mut index = storage::index::IndexStore::open(&root)?;
     index.persist_scan(&report)?;
 
@@ -1042,7 +1051,21 @@ fn scan_current_dir_and_persist() -> Result<ScanReport, ScanError> {
 
 fn parse_current_dir_and_persist() -> Result<ParseReport, ScanError> {
     let root = env::current_dir().map_err(ScanError::CurrentDir)?;
+    operation_log::event(
+        "scan_started",
+        json!({
+            "root": root.display().to_string(),
+        }),
+    );
     let scan = scan_repository(&root)?;
+    operation_log::event(
+        "scan_completed",
+        json!({
+            "root": root.display().to_string(),
+            "total_files": scan.files.len(),
+            "warning_count": scan.warnings.len(),
+        }),
+    );
     let mut index = storage::index::IndexStore::open(&root)?;
     index.persist_scan(&scan)?;
     let report = parse::report_from_scan(&root, &scan);
@@ -1085,11 +1108,7 @@ fn diff_risk_report(range: &str) -> Result<DiffRiskReport, DiffCommandError> {
     let core_report = diff::analyze_committed_tree_diff(&current_dir, range)?;
     let analysis = git::analyze_from_head_at(&current_dir)?;
     let scan = scan_repository(&analysis.worktree_root)?;
-    let ranked = ranked_hotspot_scores_from_scan_and_git(
-        &scan.files,
-        &analysis.file_metrics,
-        &analysis.co_changes,
-    );
+    let ranked = ranked_hotspot_scores_from_scan_and_git(&scan.files, &analysis);
     let touched_hotspots = touched_hotspots(&core_report.changed_files, &scan.files, &ranked);
     let mut index = storage::index::IndexStore::open(&analysis.worktree_root)
         .map_err(DiffCommandError::PersistScan)?;
@@ -1158,10 +1177,16 @@ fn touched_hotspots(
 
 pub(crate) fn ranked_hotspot_scores_from_scan_and_git(
     files: &[FileRecord],
-    git_metrics: &[git::GitFileMetrics],
-    co_changes: &[git::GitCoChange],
+    analysis: &git::GitAnalysis,
 ) -> Vec<scoring::RankedHotspotScore> {
-    let raw_metrics = scoring::raw_score_metrics_from_scan_and_git(files, git_metrics, co_changes);
+    let repository_context =
+        scoring::repository_score_context_from_analysis(analysis, files.len() as u64);
+    let raw_metrics = scoring::raw_score_metrics_from_scan_and_git(
+        files,
+        &analysis.file_metrics,
+        &analysis.co_changes,
+        repository_context,
+    );
     let scores = raw_metrics
         .into_iter()
         .map(scoring::calculate_hotspot_score)
@@ -1450,7 +1475,7 @@ fn render_explain(score: &scoring::HotspotScore, recent_window_days: i64) -> Str
     );
 
     output.push_str(&format!(
-        "\n  byte size: {}\n  line count: {}\n  commits per file: {}\n  total churn lines: {}\n  recent churn lines ({} days): {}\n  author count: {}\n  dominant owner share: {}\n  co-changed file count: {}",
+        "\n  byte size: {}\n  line count: {}\n  commits per file: {}\n  total churn lines: {}\n  recent churn lines ({} days): {}\n  author count: {}\n  owner count: {}\n  dominant owner share: {}\n  co-changed file count: {}\n  file age days: {}\n  repository age days: {}\n  repository author count: {}\n  repository file count: {}",
         render_optional_count(score.raw_metrics.byte_size),
         render_optional_count(score.raw_metrics.line_count),
         render_optional_count(score.raw_metrics.commits_per_file),
@@ -1458,8 +1483,13 @@ fn render_explain(score: &scoring::HotspotScore, recent_window_days: i64) -> Str
         recent_window_days,
         render_optional_count(score.raw_metrics.recent_churn_lines),
         render_optional_count(score.raw_metrics.author_count),
+        render_optional_count(score.raw_metrics.owner_count),
         render_optional_share(score.raw_metrics.dominant_owner_share),
         render_optional_count(score.raw_metrics.co_changed_file_count),
+        render_optional_count(score.raw_metrics.file_age_days),
+        render_optional_count(score.raw_metrics.repository_age_days),
+        render_optional_count(score.raw_metrics.repository_author_count),
+        render_optional_count(score.raw_metrics.repository_file_count),
     ));
 
     output.push_str("\n\nnormalized metrics");
@@ -1529,11 +1559,12 @@ fn render_key_contributors(score: &scoring::HotspotScore) -> String {
 
 fn render_hotspot_raw_summary(raw_metrics: &scoring::RawScoreMetrics) -> String {
     format!(
-        "{} commits, {} churn lines, {} recent churn lines, {} authors, {} co-changed files, {}",
+        "{} commits, {} churn lines, {} recent churn lines, {} authors, {} owners, {} co-changed files, {}",
         render_optional_count(raw_metrics.commits_per_file),
         render_optional_count(raw_metrics.total_churn_lines),
         render_optional_count(raw_metrics.recent_churn_lines),
         render_optional_count(raw_metrics.author_count),
+        render_optional_count(raw_metrics.owner_count),
         render_optional_count(raw_metrics.co_changed_file_count),
         render_size_summary(raw_metrics)
     )
@@ -1583,7 +1614,7 @@ fn normalized_metric_rows(
         ("size", metrics.size),
         ("churn", metrics.churn),
         ("recent_churn", metrics.recent_churn),
-        ("ownership", metrics.ownership),
+        ("ownership_risk", metrics.ownership),
         ("coupling", metrics.coupling),
     ]
 }
@@ -1593,7 +1624,7 @@ fn normalized_metric_name(metric: scoring::NormalizedMetric) -> &'static str {
         scoring::NormalizedMetric::Size => "size",
         scoring::NormalizedMetric::Churn => "churn",
         scoring::NormalizedMetric::RecentChurn => "recent_churn",
-        scoring::NormalizedMetric::Ownership => "ownership",
+        scoring::NormalizedMetric::Ownership => "ownership_risk",
         scoring::NormalizedMetric::Coupling => "coupling",
     }
 }
@@ -1923,48 +1954,92 @@ fn scan_warning_from_entry_error(
 }
 
 fn ignore_error_path(error: &IgnoreError) -> Option<&Path> {
-    match error {
-        IgnoreError::Partial(errors) => errors.iter().find_map(ignore_error_path),
-        IgnoreError::WithLineNumber { err, .. } | IgnoreError::WithDepth { err, .. } => {
-            ignore_error_path(err)
+    let mut stack = vec![error];
+
+    while let Some(error) = stack.pop() {
+        match error {
+            IgnoreError::Partial(errors) => {
+                for error in errors.iter().rev() {
+                    stack.push(error);
+                }
+            }
+            IgnoreError::WithLineNumber { err, .. } | IgnoreError::WithDepth { err, .. } => {
+                stack.push(err);
+            }
+            IgnoreError::WithPath { path, .. } => return Some(path),
+            IgnoreError::Loop { child, .. } => return Some(child),
+            IgnoreError::Io(_)
+            | IgnoreError::Glob { .. }
+            | IgnoreError::UnrecognizedFileType(_)
+            | IgnoreError::InvalidDefinition => {}
         }
-        IgnoreError::WithPath { path, .. } => Some(path),
-        IgnoreError::Loop { child, .. } => Some(child),
-        IgnoreError::Io(_)
-        | IgnoreError::Glob { .. }
-        | IgnoreError::UnrecognizedFileType(_)
-        | IgnoreError::InvalidDefinition => None,
     }
+
+    None
 }
 
 fn ignore_error_message(error: &IgnoreError) -> String {
-    match error {
-        IgnoreError::Partial(errors) => match errors.as_slice() {
-            [] => "unknown partial error".to_owned(),
-            [error] => ignore_error_message(error),
-            errors => format!("multiple errors occurred ({} errors)", errors.len()),
-        },
-        IgnoreError::WithLineNumber { line, err } => {
-            format!("line {line}: {}", ignore_error_message(err))
+    let mut error = error;
+    let mut line_prefixes = Vec::new();
+
+    loop {
+        match error {
+            IgnoreError::Partial(errors) => match errors.as_slice() {
+                [] => return format_ignore_error_message(line_prefixes, "unknown partial error"),
+                [single_error] => error = single_error,
+                errors => {
+                    return format_ignore_error_message(
+                        line_prefixes,
+                        &format!("multiple errors occurred ({} errors)", errors.len()),
+                    );
+                }
+            },
+            IgnoreError::WithLineNumber { line, err } => {
+                line_prefixes.push(format!("line {line}: "));
+                error = err;
+            }
+            IgnoreError::WithPath { err, .. } | IgnoreError::WithDepth { err, .. } => {
+                error = err;
+            }
+            IgnoreError::Loop { .. } => {
+                return format_ignore_error_message(line_prefixes, "filesystem loop detected");
+            }
+            IgnoreError::Io(error) => {
+                return format_ignore_error_message(line_prefixes, &io_error_message(error));
+            }
+            IgnoreError::Glob {
+                glob: Some(glob),
+                err,
+            } => {
+                return format_ignore_error_message(
+                    line_prefixes,
+                    &format!("error parsing glob '{glob}': {err}"),
+                );
+            }
+            IgnoreError::Glob { glob: _, err } => {
+                return format_ignore_error_message(line_prefixes, err);
+            }
+            IgnoreError::UnrecognizedFileType(file_type) => {
+                return format_ignore_error_message(
+                    line_prefixes,
+                    &format!("unrecognized file type: {file_type}"),
+                );
+            }
+            IgnoreError::InvalidDefinition => {
+                return format_ignore_error_message(
+                    line_prefixes,
+                    "invalid file type definition; expected type:glob",
+                );
+            }
         }
-        IgnoreError::WithPath { err, .. } | IgnoreError::WithDepth { err, .. } => {
-            ignore_error_message(err)
-        }
-        IgnoreError::Loop { .. } => "filesystem loop detected".to_owned(),
-        IgnoreError::Io(error) => io_error_message(error),
-        IgnoreError::Glob {
-            glob: Some(glob),
-            err,
-        } => {
-            format!("error parsing glob '{glob}': {err}")
-        }
-        IgnoreError::Glob { glob: _, err } => err.to_owned(),
-        IgnoreError::UnrecognizedFileType(file_type) => {
-            format!("unrecognized file type: {file_type}")
-        }
-        IgnoreError::InvalidDefinition => {
-            "invalid file type definition; expected type:glob".to_owned()
-        }
+    }
+}
+
+fn format_ignore_error_message(line_prefixes: Vec<String>, message: &str) -> String {
+    if line_prefixes.is_empty() {
+        message.to_owned()
+    } else {
+        format!("{}{}", line_prefixes.concat(), message)
     }
 }
 
@@ -2445,8 +2520,13 @@ mod tests {
             total_churn_lines: Some(2),
             recent_churn_lines: Some(3),
             author_count: Some(1),
+            owner_count: Some(1),
             dominant_owner_share: Some(1.0),
             co_changed_file_count: Some(0),
+            file_age_days: Some(365),
+            repository_age_days: Some(730),
+            repository_author_count: Some(10),
+            repository_file_count: Some(200),
         }
     }
 

@@ -89,7 +89,7 @@ tokenizers, external APIs, telemetry, network access, or cloud calls.
 
 Diff and PR reports currently combine changed files with the existing local
 hotspot ranking. A touched hotspot means a changed current file is present in
-the current top hotspot rows from `hotpath.score.v1`.
+the current top hotspot rows from `hotpath.score.v3`.
 
 Architecture violations are reported as `not_evaluated` until architecture
 rules exist. The current command should not be read as enforcing architecture

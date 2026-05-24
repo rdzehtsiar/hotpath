@@ -10,6 +10,8 @@ use git2::{
     Delta, Diff, DiffFindOptions, DiffOptions, ErrorClass, ErrorCode, Oid, Patch, Repository, Sort,
 };
 
+use crate::ownership::{operational_ownership_from_changes, OperationalOwnershipSnapshot};
+
 pub const RECENT_CHURN_WINDOW_DAYS: i64 = 90;
 const SECONDS_PER_DAY: i64 = 86_400;
 const RECENT_CHURN_WINDOW_SECONDS: i64 = RECENT_CHURN_WINDOW_DAYS * SECONDS_PER_DAY;
@@ -65,9 +67,11 @@ pub struct GitFileMetrics {
     pub recent_churn_deleted: u64,
     /// Number of distinct exact author identities that touched this path.
     pub author_count: u64,
-    /// Author identity with the most file-touching commits for this path.
+    /// Number of meaningful operational owners identified for this path.
+    pub owner_count: u64,
+    /// Operational owner with the highest weighted ownership share for this path.
     pub dominant_owner: Option<String>,
-    /// Dominant owner's share of file-touching commits for this path.
+    /// Dominant owner's weighted operational ownership share for this path.
     pub dominant_owner_share: Option<f64>,
     /// First observed commit id for this path by commit time, then commit id.
     pub first_commit_id: Option<String>,
@@ -109,6 +113,8 @@ pub struct GitAnalysis {
     pub file_metrics: Vec<GitFileMetrics>,
     /// Aggregated co-change pairs ranked by count, then paths.
     pub co_changes: Vec<GitCoChange>,
+    /// Weighted operational ownership by current file path.
+    pub ownership: OperationalOwnershipSnapshot,
 }
 
 #[derive(Debug)]
@@ -341,7 +347,9 @@ pub fn analyze_from_head_at(
         })?
         .to_path_buf();
     let changes = file_changes_from_repository(&repository, head_commit_id)?;
-    let file_metrics = file_metrics_from_changes(&changes, head_commit_time);
+    let ownership = operational_ownership_from_changes(&changes, head_commit_time);
+    let file_metrics =
+        file_metrics_from_changes_with_ownership(&changes, head_commit_time, &ownership);
     let co_changes = co_changes_from_changes(&changes);
 
     Ok(GitAnalysis {
@@ -352,6 +360,7 @@ pub fn analyze_from_head_at(
         changes,
         file_metrics,
         co_changes,
+        ownership,
     })
 }
 
@@ -505,8 +514,23 @@ pub fn file_metrics_from_changes(
     changes: &[GitFileChange],
     head_commit_time: i64,
 ) -> Vec<GitFileMetrics> {
+    let ownership = operational_ownership_from_changes(changes, head_commit_time);
+
+    file_metrics_from_changes_with_ownership(changes, head_commit_time, &ownership)
+}
+
+fn file_metrics_from_changes_with_ownership(
+    changes: &[GitFileChange],
+    head_commit_time: i64,
+    ownership: &OperationalOwnershipSnapshot,
+) -> Vec<GitFileMetrics> {
     let recent_threshold = head_commit_time.saturating_sub(RECENT_CHURN_WINDOW_SECONDS);
     let mut by_path = BTreeMap::<String, FileMetricAccumulator>::new();
+    let ownership_by_path = ownership
+        .by_file
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect::<BTreeMap<_, _>>();
 
     for change in changes {
         let accumulator = by_path
@@ -526,7 +550,11 @@ pub fn file_metrics_from_changes(
 
     by_path
         .into_values()
-        .map(|accumulator| accumulator.into_metrics(head_commit_time))
+        .map(|accumulator| {
+            let file_ownership = ownership_by_path.get(accumulator.path.as_str()).copied();
+
+            accumulator.into_metrics(head_commit_time, file_ownership)
+        })
         .collect()
 }
 
@@ -846,7 +874,7 @@ fn render_file_explanation(
         let total_churn = metric.total_churn_added + metric.total_churn_deleted;
 
         output.push_str(&format!(
-            "\n  commits per file: {}\n  total churn: {} added, {} deleted, {} combined\n  recent churn (90 days): {} added, {} deleted, {} combined\n  author count: {}",
+            "\n  commits per file: {}\n  total churn: {} added, {} deleted, {} combined\n  recent churn (90 days): {} added, {} deleted, {} combined\n  author count: {}\n  owner count: {}",
             metric.commits_per_file,
             metric.total_churn_added,
             metric.total_churn_deleted,
@@ -854,12 +882,13 @@ fn render_file_explanation(
             metric.recent_churn_added,
             metric.recent_churn_deleted,
             recent_churn,
-            metric.author_count
+            metric.author_count,
+            metric.owner_count
         ));
 
         if let (Some(owner), Some(share)) = (&metric.dominant_owner, metric.dominant_owner_share) {
             output.push_str(&format!(
-                "\n  dominant owner: {owner} ({:.2}% of file-touching commits)",
+                "\n  dominant owner: {owner} ({:.2}% weighted operational ownership)",
                 share * 100.0
             ));
         } else {
@@ -877,7 +906,7 @@ fn render_file_explanation(
         ));
     } else {
         output.push_str(
-            "\n  commits per file: 0\n  total churn: 0 added, 0 deleted, 0 combined\n  recent churn (90 days): 0 added, 0 deleted, 0 combined\n  author count: 0\n  dominant owner: unavailable\n  first observed commit: unavailable\n  last observed commit: unavailable\n  file age: unavailable",
+            "\n  commits per file: 0\n  total churn: 0 added, 0 deleted, 0 combined\n  recent churn (90 days): 0 added, 0 deleted, 0 combined\n  author count: 0\n  owner count: 0\n  dominant owner: unavailable\n  first observed commit: unavailable\n  last observed commit: unavailable\n  file age: unavailable",
         );
     }
 
@@ -894,7 +923,7 @@ fn render_file_explanation(
     }
 
     output.push_str(
-        "\n\ncalculation notes\n  - Uses local Git history reachable from HEAD only.\n  - Root commits are diffed against the empty tree; merge commits are diffed against their first parent.\n  - Recent churn uses the 90-day window before the HEAD committer timestamp.\n  - A commit counts once per file for commit counts, authorship, ownership, and co-change pairs.\n  - Co-change rows count commits that touched the requested path and the listed path.",
+        "\n\ncalculation notes\n  - Uses local Git history reachable from HEAD only.\n  - Root commits are diffed against the empty tree; merge commits are diffed against their first parent.\n  - Recent churn uses the 90-day window before the HEAD committer timestamp.\n  - Operational ownership weights changed lines, recency, and sustained file activity.\n  - Co-change rows count commits that touched the requested path and the listed path.",
     );
     output.push_str(
         "\n\nlimitations\n  - Rename handling is conservative: the rename commit counts for the destination path, but earlier history remains under the old path.\n  - Binary changes or unavailable line statistics contribute 0 line churn.\n  - Author identity is the exact commit author string; .mailmap, bot detection, and identity merging are not applied.\n  - File age is clamped to 0 days if commit timestamps place the first observed file touch after HEAD.\n  - Results are advisory and should be treated as local derived cache data when persisted.",
@@ -1110,22 +1139,17 @@ impl FileMetricAccumulator {
         }
     }
 
-    fn into_metrics(self, head_commit_time: i64) -> GitFileMetrics {
+    fn into_metrics(
+        self,
+        head_commit_time: i64,
+        ownership: Option<&crate::ownership::OperationalFileOwnership>,
+    ) -> GitFileMetrics {
         let commits_per_file = self.commits.len() as u64;
         let author_count = self.author_touch_counts.len() as u64;
-        let dominant = self.author_touch_counts.iter().max_by(
-            |(left_author, left_count), (right_author, right_count)| {
-                left_count
-                    .cmp(right_count)
-                    .then_with(|| right_author.cmp(left_author))
-            },
-        );
-        let dominant_owner = dominant.map(|(author, _count)| author.clone());
-        let dominant_owner_share = dominant.map(|(_author, count)| {
-            let count = *count as f64;
-
-            count / commits_per_file as f64
-        });
+        let owner_count = ownership.map_or(0, |ownership| ownership.owners.len() as u64);
+        let dominant = ownership.and_then(|ownership| ownership.owners.first());
+        let dominant_owner = dominant.map(|owner| owner.author.clone());
+        let dominant_owner_share = dominant.map(|owner| owner.share);
         let first_commit = self.first_commit;
         let last_commit = self.last_commit;
         let file_age_days = first_commit.as_ref().map(|commit| {
@@ -1144,6 +1168,7 @@ impl FileMetricAccumulator {
             recent_churn_added: self.recent_churn_added,
             recent_churn_deleted: self.recent_churn_deleted,
             author_count,
+            owner_count,
             dominant_owner,
             dominant_owner_share,
             first_commit_id: first_commit.as_ref().map(|commit| commit.id.clone()),

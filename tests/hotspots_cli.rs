@@ -93,7 +93,7 @@ fn hotspots_ranks_current_files_and_persists_scan_and_git_inputs() {
     assert!(
         stdout.contains("scope: current scanned files plus local Git history reachable from HEAD")
     );
-    assert!(stdout.contains("formula: hotpath.score.v1"));
+    assert!(stdout.contains("formula: hotpath.score.v3"));
     assert!(stdout.contains("\nrank  score  path\n"));
     assert!(stdout.contains("key contributors:"));
     assert!(stdout.contains("why:"));
@@ -104,7 +104,7 @@ fn hotspots_ranks_current_files_and_persists_scan_and_git_inputs() {
 
     assert_eq!(
         ranked_paths(&stdout),
-        vec!["src/risky.rs", "src/related.rs", "src/stable.rs"]
+        vec!["src/related.rs", "src/risky.rs", "src/stable.rs"]
     );
 
     let persisted = IndexStore::open(fixture.path())
@@ -155,17 +155,21 @@ fn hotspots_ranks_current_files_and_persists_scan_and_git_inputs() {
             .map(|hotspot| (hotspot.rank, hotspot.path.as_str()))
             .collect::<Vec<_>>(),
         vec![
-            (1, "src/risky.rs"),
-            (2, "src/related.rs"),
+            (1, "src/related.rs"),
+            (2, "src/risky.rs"),
             (3, "src/stable.rs"),
         ]
     );
     assert!(persisted_hotspots
         .iter()
-        .all(|hotspot| hotspot.formula_version == "hotpath.score.v1"));
+        .all(|hotspot| hotspot.formula_version == "hotpath.score.v3"));
     assert_eq!(hotspot_row_count(fixture.path()), 3);
+    let risky_hotspot = persisted_hotspots
+        .iter()
+        .find(|hotspot| hotspot.path == "src/risky.rs")
+        .expect("risky hotspot should be persisted");
     let risky_raw_metrics = serde_json::from_str::<serde_json::Value>(
-        persisted_hotspots[0]
+        risky_hotspot
             .raw_metrics_json
             .as_deref()
             .expect("raw metrics JSON should be stored"),
@@ -174,7 +178,7 @@ fn hotspots_ranks_current_files_and_persists_scan_and_git_inputs() {
     assert_eq!(risky_raw_metrics["path"], "src/risky.rs");
     assert_eq!(risky_raw_metrics["line_count"], 100);
     let risky_explanation = serde_json::from_str::<serde_json::Value>(
-        persisted_hotspots[0]
+        risky_hotspot
             .explanation
             .as_deref()
             .expect("explanation JSON should be stored"),
@@ -182,7 +186,7 @@ fn hotspots_ranks_current_files_and_persists_scan_and_git_inputs() {
     .expect("explanation JSON should parse");
     assert_eq!(
         risky_explanation["weighted_terms"][0]["formula_version"]["id"],
-        "hotpath.score.v1"
+        "hotpath.score.v3"
     );
 }
 
@@ -399,10 +403,10 @@ fn hotspots_renders_zero_contributors_for_current_file_without_git_history() {
 
     assert!(section.contains("key contributors: none observed"));
     assert!(section.contains(
-        "why: 0 commits, 0 churn lines, 0 recent churn lines, 0 authors, 0 co-changed files, 0 lines"
+        "why: 0 commits, 0 churn lines, 0 recent churn lines, 0 authors, 0 owners, 0 co-changed files, 0 lines"
     ));
     assert!(section.contains(
-        "limitations: dominant owner share is unavailable; author fragmentation uses author count only"
+        "limitations: dominant operational owner share is unavailable; owner risk uses owner count only"
     ));
     assert!(!contains_path(&stdout, fixture.path()));
 }
@@ -472,7 +476,8 @@ fn hotspots_rejects_non_git_directory_without_report_output_or_path_leak() {
     assert!(stderr.contains("run hotspots from inside a repository"));
     assert!(!stderr.contains("Hotpath hotspots"));
     assert!(!contains_path(&stderr, fixture.path()));
-    assert!(!fixture.path().join(".hotpath").exists());
+    assert!(fixture.path().join(".hotpath").join("logs").exists());
+    assert!(!fixture.path().join(".hotpath").join("index.db").exists());
 }
 
 #[test]
@@ -486,7 +491,8 @@ fn hotspots_rejects_missing_head_without_report_output_or_path_leak() {
     assert!(stderr.contains("create an initial commit before analyzing hotspots"));
     assert!(!stderr.contains("Hotpath hotspots"));
     assert!(!contains_path(&stderr, fixture.path()));
-    assert!(!fixture.path().join(".hotpath").exists());
+    assert!(fixture.path().join(".hotpath").join("logs").exists());
+    assert!(!fixture.path().join(".hotpath").join("index.db").exists());
 }
 
 #[test]
@@ -512,7 +518,8 @@ fn hotspots_rejects_shallow_repository_without_report_output_or_path_leak() {
     assert!(stderr.contains("fetch complete local history"));
     assert!(!stderr.contains("Hotpath hotspots"));
     assert!(!contains_path(&stderr, fixture.path()));
-    assert!(!fixture.path().join(".hotpath").exists());
+    assert!(fixture.path().join(".hotpath").join("logs").exists());
+    assert!(!fixture.path().join(".hotpath").join("index.db").exists());
 }
 
 #[test]

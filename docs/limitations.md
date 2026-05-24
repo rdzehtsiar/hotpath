@@ -64,8 +64,8 @@ Expected limitations include:
 
 - churn can reflect healthy active development, not only instability
 - file size can reflect generated code, data, or deliberate consolidation
-- ownership metrics can be distorted by bots, bulk rewrites, pair programming,
-  imports, or history rewrites
+- operational ownership metrics can be distorted by unmerged identities, bots,
+  pair programming, imports, history rewrites, or non-code bulk changes
 - complexity metrics can miss domain context and intentional tradeoffs
 - coupling metrics can be incomplete when language support is partial
 - AI context estimates are approximations, not tokenizer-specific guarantees
@@ -76,7 +76,7 @@ can mislead.
 ## Git Metric Limits
 
 The current `hotpath explain-git` command calculates Git metrics from local
-history reachable from `HEAD` and writes derived rows to index v2 after
+history reachable from `HEAD` and writes derived rows to index v3 after
 successful analysis. These metrics are advisory and are not a stable report
 contract.
 
@@ -143,8 +143,8 @@ or resolved dependency fan metrics.
 
 The current `hotpath hotspots` and `hotpath explain` commands combine scanner
 facts with local Git metrics to produce advisory hotspot scores using the
-documented `hotpath.score.v1` formula. Successful hotspot analysis writes
-derived score rows to index v2.
+documented `hotpath.score.v3` formula. Successful hotspot analysis writes
+derived score rows to index v3.
 
 Known hotspot score limitations include:
 
@@ -156,7 +156,7 @@ Known hotspot score limitations include:
   coverage, runtime incidents, ownership policy, and architecture rules are not
   formula inputs
 - generated and vendor classifications are visible scanner facts but are not
-  weighted terms in `hotpath.score.v1`
+  weighted terms in `hotpath.score.v3`
 - missing source facts are not guessed; missing normalized inputs contribute
   `0.0` for their fixed-weight terms and are listed as limitations
 - a higher score means "worth investigating sooner," not "bad code"
@@ -189,7 +189,7 @@ collect telemetry, or require network access.
 ## Repository Report And CI Limits
 
 The current `hotpath report` command builds an aggregate current-repository
-report from scanner facts, local Git analysis, `hotpath.score.v1` hotspot
+report from scanner facts, local Git analysis, `hotpath.score.v3` hotspot
 ranking, and the default context estimate. It can print Markdown, JSON with
 schema identifier `hotpath.report.v1`, SARIF 2.1.0, or write a self-contained
 static HTML file.

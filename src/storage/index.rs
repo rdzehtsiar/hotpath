@@ -19,12 +19,13 @@ use crate::{
     ScanWarning, SCAN_SCHEMA_VERSION,
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 const HOTPATH_DIR: &str = ".hotpath";
 const INDEX_FILE: &str = "index.db";
 const SCHEMA_IDENTIFIER_V1: &str = "hotpath.index.v1";
-const SCHEMA_IDENTIFIER: &str = "hotpath.index.v2";
+const SCHEMA_IDENTIFIER_V2: &str = "hotpath.index.v2";
+const SCHEMA_IDENTIFIER: &str = "hotpath.index.v3";
 const SCHEMA_IDENTIFIER_KEY: &str = "schema_identifier";
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 const GIT_ANALYSIS_KEY: &str = "git-analysis-current";
@@ -553,6 +554,7 @@ impl IndexStore {
                         recent_churn_added,
                         recent_churn_deleted,
                         author_count,
+                        owner_count,
                         dominant_owner,
                         dominant_owner_share,
                         first_commit_id,
@@ -561,7 +563,7 @@ impl IndexStore {
                         last_commit_time,
                         file_age_days
                     )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16);",
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17);",
                 )
                 .map_err(|source| IndexError::PersistGitAnalysis {
                     path: index_path.clone(),
@@ -601,6 +603,7 @@ impl IndexStore {
                             "recent_churn_deleted"
                         )?,
                         u64_to_i64_for_git(metric.author_count, &index_path, "author_count")?,
+                        u64_to_i64_for_git(metric.owner_count, &index_path, "owner_count")?,
                         metric.dominant_owner.as_deref(),
                         metric.dominant_owner_share,
                         metric.first_commit_id.as_deref(),
@@ -2060,6 +2063,7 @@ fn read_git_file_stats(
                 git_file_stats.recent_churn_added,
                 git_file_stats.recent_churn_deleted,
                 git_file_stats.author_count,
+                git_file_stats.owner_count,
                 git_file_stats.dominant_owner,
                 git_file_stats.dominant_owner_share,
                 git_file_stats.first_commit_id,
@@ -2099,13 +2103,14 @@ fn read_persisted_git_file_stats(row: &Row<'_>) -> rusqlite::Result<PersistedGit
         recent_churn_added: i64_to_u64(row.get(4)?, 4)?,
         recent_churn_deleted: i64_to_u64(row.get(5)?, 5)?,
         author_count: i64_to_u64(row.get(6)?, 6)?,
-        dominant_owner: row.get(7)?,
-        dominant_owner_share: row.get(8)?,
-        first_commit_id: row.get(9)?,
-        first_commit_time: row.get(10)?,
-        last_commit_id: row.get(11)?,
-        last_commit_time: row.get(12)?,
-        file_age_days: optional_i64_to_u64(row.get(13)?, 13)?,
+        owner_count: i64_to_u64(row.get(7)?, 7)?,
+        dominant_owner: row.get(8)?,
+        dominant_owner_share: row.get(9)?,
+        first_commit_id: row.get(10)?,
+        first_commit_time: row.get(11)?,
+        last_commit_id: row.get(12)?,
+        last_commit_time: row.get(13)?,
+        file_age_days: optional_i64_to_u64(row.get(14)?, 14)?,
     })
 }
 
@@ -2431,6 +2436,10 @@ fn migrate_to_current(
                 migrate_1_to_2(connection, path)?;
                 version = 2;
             }
+            2 => {
+                migrate_2_to_3(connection, path)?;
+                version = 3;
+            }
             _ => {
                 return Err(IndexError::CorruptMetadata {
                     path: path.to_path_buf(),
@@ -2439,6 +2448,47 @@ fn migrate_to_current(
             }
         }
     }
+
+    Ok(())
+}
+
+fn migrate_2_to_3(connection: &mut Connection, path: &Path) -> Result<(), IndexError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|source| migration_error(path, 2, 3, source))?;
+
+    transaction
+        .execute_batch(
+            "
+            ALTER TABLE git_file_stats
+                ADD COLUMN owner_count INTEGER NOT NULL DEFAULT 0;
+            ",
+        )
+        .map_err(|source| migration_error(path, 2, 3, source))?;
+    verify_schema_objects(&transaction, path)?;
+
+    transaction
+        .execute(
+            "INSERT INTO hotpath_metadata (key, value)
+             VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+            params![SCHEMA_VERSION_KEY, CURRENT_SCHEMA_VERSION.to_string()],
+        )
+        .map_err(|source| migration_error(path, 2, 3, source))?;
+    transaction
+        .execute(
+            "INSERT INTO hotpath_metadata (key, value)
+             VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+            params![SCHEMA_IDENTIFIER_KEY, SCHEMA_IDENTIFIER],
+        )
+        .map_err(|source| migration_error(path, 2, 3, source))?;
+    transaction
+        .execute_batch("PRAGMA user_version = 3;")
+        .map_err(|source| migration_error(path, 2, 3, source))?;
+    transaction
+        .commit()
+        .map_err(|source| migration_error(path, 2, 3, source))?;
 
     Ok(())
 }
@@ -2496,14 +2546,13 @@ fn migrate_1_to_2(connection: &mut Connection, path: &Path) -> Result<(), IndexE
         .map_err(|source| migration_error(path, 1, 2, source))?;
 
     create_git_schema_v2(&transaction, path)?;
-    verify_schema_objects(&transaction, path)?;
 
     transaction
         .execute(
             "INSERT INTO hotpath_metadata (key, value)
              VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
-            params![SCHEMA_VERSION_KEY, CURRENT_SCHEMA_VERSION.to_string()],
+            params![SCHEMA_VERSION_KEY, "2"],
         )
         .map_err(|source| migration_error(path, 1, 2, source))?;
     transaction
@@ -2511,7 +2560,7 @@ fn migrate_1_to_2(connection: &mut Connection, path: &Path) -> Result<(), IndexE
             "INSERT INTO hotpath_metadata (key, value)
              VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
-            params![SCHEMA_IDENTIFIER_KEY, SCHEMA_IDENTIFIER],
+            params![SCHEMA_IDENTIFIER_KEY, SCHEMA_IDENTIFIER_V2],
         )
         .map_err(|source| migration_error(path, 1, 2, source))?;
     transaction
@@ -3164,6 +3213,7 @@ const GIT_FILE_STATS_COLUMNS: &[ExpectedColumn] = &[
     expected_column("last_commit_id", "TEXT", false, None, 0),
     expected_column("last_commit_time", "INTEGER", false, None, 0),
     expected_column("file_age_days", "INTEGER", false, None, 0),
+    expected_column("owner_count", "INTEGER", true, Some("0"), 0),
 ];
 
 const GIT_CO_CHANGES_COLUMNS: &[ExpectedColumn] = &[
@@ -5015,6 +5065,7 @@ mod tests {
                 recent_churn_added: 4,
                 recent_churn_deleted: 1,
                 author_count: 2,
+                owner_count: 2,
                 dominant_owner: Some("Ada <ada@example.invalid>".to_owned()),
                 dominant_owner_share: Some(0.5),
                 first_commit_id: Some("1111111111111111111111111111111111111111".to_owned()),
@@ -5031,6 +5082,7 @@ mod tests {
                 recent_churn_added: 5,
                 recent_churn_deleted: 0,
                 author_count: 1,
+                owner_count: 1,
                 dominant_owner: Some("Ben <ben@example.invalid>".to_owned()),
                 dominant_owner_share: Some(1.0),
                 first_commit_id: Some("3333333333333333333333333333333333333333".to_owned()),
@@ -5121,8 +5173,13 @@ mod tests {
                 total_churn_lines: Some(1),
                 recent_churn_lines: Some(0),
                 author_count: Some(1),
+                owner_count: Some(1),
                 dominant_owner_share: Some(1.0),
                 co_changed_file_count: Some(0),
+                file_age_days: Some(1),
+                repository_age_days: Some(1),
+                repository_author_count: Some(1),
+                repository_file_count: Some(2),
             }),
             calculate_hotspot_score(RawScoreMetrics {
                 path: "src/risky.rs".to_owned(),
@@ -5132,8 +5189,13 @@ mod tests {
                 total_churn_lines: Some(2_000),
                 recent_churn_lines: Some(200),
                 author_count: Some(4),
+                owner_count: Some(4),
                 dominant_owner_share: Some(0.25),
                 co_changed_file_count: Some(3),
+                file_age_days: Some(365),
+                repository_age_days: Some(730),
+                repository_author_count: Some(10),
+                repository_file_count: Some(200),
             }),
         ];
         let ranked = rank_hotspot_scores(&scores);
@@ -5150,7 +5212,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(1, "src/risky.rs"), (2, "src/stable.rs")]
         );
-        assert_eq!(persisted[0].formula_version, "hotpath.score.v1");
+        assert_eq!(persisted[0].formula_version, "hotpath.score.v3");
         assert!(persisted[0].score > persisted[1].score);
 
         let raw_metrics = serde_json::from_str::<serde_json::Value>(
@@ -5175,7 +5237,7 @@ mod tests {
         assert_eq!(explanation["weighted_terms"][0]["name"], "churn_score");
         assert_eq!(
             explanation["weighted_terms"][0]["formula_version"]["id"],
-            "hotpath.score.v1"
+            "hotpath.score.v3"
         );
 
         let limitation = serde_json::from_str::<serde_json::Value>(
@@ -5383,6 +5445,7 @@ mod tests {
                 "last_commit_id",
                 "last_commit_time",
                 "file_age_days",
+                "owner_count",
             ]
         );
         assert_eq!(
@@ -5770,7 +5833,7 @@ mod tests {
             .expect("index directory should be created");
         let connection = Connection::open(&index_path).expect("test database should open");
         connection
-            .execute_batch("PRAGMA user_version = 3;")
+            .execute_batch("PRAGMA user_version = 4;")
             .expect("test schema version should be set");
         drop(connection);
 
@@ -5779,7 +5842,7 @@ mod tests {
         assert!(matches!(
             error,
             IndexError::IncompatibleFutureSchema {
-                found_version: 3,
+                found_version: 4,
                 supported_version: CURRENT_SCHEMA_VERSION,
                 ..
             }
@@ -5902,7 +5965,7 @@ mod tests {
                     value TEXT NOT NULL
                 ) STRICT;
                 INSERT INTO hotpath_metadata (key, value)
-                VALUES ('schema_version', '3'), ('schema_identifier', 'hotpath.index.v2');",
+                VALUES ('schema_version', '4'), ('schema_identifier', 'hotpath.index.v3');",
             )
             .expect("future metadata should be created");
         drop(connection);
@@ -5913,7 +5976,7 @@ mod tests {
         assert!(matches!(
             error,
             IndexError::IncompatibleFutureSchema {
-                found_version: 3,
+                found_version: 4,
                 supported_version: CURRENT_SCHEMA_VERSION,
                 ..
             }
@@ -6011,7 +6074,7 @@ mod tests {
         let connection = Connection::open(&index_path).expect("test database should reopen");
         connection
             .execute(
-                "UPDATE hotpath_metadata SET value = '3' WHERE key = ?1;",
+                "UPDATE hotpath_metadata SET value = '4' WHERE key = ?1;",
                 params![SCHEMA_VERSION_KEY],
             )
             .expect("metadata schema version should be updated");
@@ -6023,14 +6086,14 @@ mod tests {
         assert!(matches!(
             error,
             IndexError::IncompatibleFutureSchema {
-                found_version: 3,
+                found_version: 4,
                 supported_version: CURRENT_SCHEMA_VERSION,
                 ..
             }
         ));
         let message = error.to_string();
         assert!(message.contains(index_path.to_string_lossy().as_ref()));
-        assert!(message.contains("supports up to version 2"));
+        assert!(message.contains("supports up to version 3"));
     }
 
     #[test]
@@ -6048,8 +6111,8 @@ mod tests {
                     extra TEXT
                 ) STRICT;
                 INSERT INTO hotpath_metadata (key, value)
-                VALUES ('schema_version', '2');
-                PRAGMA user_version = 2;",
+                VALUES ('schema_version', '3');
+                PRAGMA user_version = 3;",
             )
             .expect("malformed current metadata should be created");
         drop(connection);

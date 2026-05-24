@@ -23,7 +23,7 @@ Current machine-readable schema identifiers include:
 | Parser report | `hotpath parse --json` | `hotpath.parse.v1` |
 | Complexity report | `hotpath complexity --json` | `hotpath.complexity.v1` |
 | Dependency graph report | `hotpath graph --module <selector> --json` | `hotpath.graph.v1` |
-| Hotspot scoring | `hotpath hotspots`, `hotpath explain` | `hotpath.score.v1` |
+| Hotspot scoring | `hotpath hotspots`, `hotpath explain` | `hotpath.score.v3` |
 | Context estimate | `hotpath context --json` | `hotpath.context.v1` |
 | Repository report | `hotpath report --json` | `hotpath.report.v1` |
 | Diff and PR risk | `hotpath diff <base>...<head> --json`, `hotpath pr --base <base> --head <head> --json` | `hotpath.diff.v1` |
@@ -43,7 +43,7 @@ semantics.
 | `line_count` | Text line count when Hotpath can read the file as supported text. | Line count is a simple size signal and is used by hotspot size and recent-growth scoring. | Unsupported encodings, binary files, minified files, and generated files can limit usefulness. |
 | language guess | Best-effort language classification from path and extension. | Language classification controls parser eligibility and report grouping. | It is not a compiler or build-system decision and can be wrong for unusual layouts. |
 | content kind | Classification such as text or binary where detectable. | Avoids treating binary content as normal source text. | Detection is conservative and may not capture every encoding or generated artifact. |
-| generated/vendor flags | Best-effort path-based generated and vendor classification. | Helps users distinguish authored source from code they may not want to optimize manually. | Current hotspot scoring stores these facts but does not weight or exclude them in `hotpath.score.v1`. |
+| generated/vendor flags | Best-effort path-based generated and vendor classification. | Helps users distinguish authored source from code they may not want to optimize manually. | Current hotspot scoring stores these facts but does not weight or exclude them in `hotpath.score.v3`. |
 
 Current scan summaries expose:
 
@@ -153,23 +153,25 @@ handle absent modules deterministically.
 ## Git Metrics
 
 Git metrics are derived from local history reachable from `HEAD`. They include
-per-file commit counts, total churn, recent churn, author count, dominant owner
-share, file age, and co-change pairs. The default recent-history window is `90`
-days before the `HEAD` committer timestamp.
+per-file commit counts, total churn, recent churn, exact author count, compact
+operational owner count, dominant operational owner share, file age, and
+co-change pairs. The default recent-history window is `90` days before the
+`HEAD` committer timestamp.
 
-See [Git metric semantics](git-metrics.md) for formulas, ordering rules, and
-known limitations.
+See [Git metric semantics](git-metrics.md) and
+[Operational ownership](ownership.md) for formulas, ordering rules, and known
+limitations.
 
 ## Hotspot Scores
 
 Hotspot scores currently combine scanner facts with local Git metrics using the
-documented `hotpath.score.v1` formula:
+documented `hotpath.score.v3` formula:
 
 ```text
 score =
   0.35 * churn
 + 0.20 * size
-+ 0.20 * ownership
++ 0.20 * ownership_risk
 + 0.15 * recent_churn
 + 0.10 * coupling
 ```
@@ -218,7 +220,7 @@ Current report metrics include:
 
 | Metric | Definition | Formula or derivation | Why it matters | Limitations |
 | --- | --- | --- | --- | --- |
-| report hotspot count | Number of current files ranked by the shared hotspot scorer. | Count of report hotspot rows derived from `hotpath.score.v1`. | Shows the breadth of files with available advisory hotspot scores. | It depends on current scan facts and local Git analysis; unsupported repositories produce no report. |
+| report hotspot count | Number of current files ranked by the shared hotspot scorer. | Count of report hotspot rows derived from `hotpath.score.v3`. | Shows the breadth of files with available advisory hotspot scores. | It depends on current scan facts and local Git analysis; unsupported repositories produce no report. |
 | report context estimate | Default context estimate for the current scanned files. | Same `ceil(byte_size / 4)` estimate used by `hotpath context` with default options. | Shows approximate context cost next to hotspot risk. | It is not tokenizer-specific and includes generated/vendor files by default. |
 | report finding | Advisory row derived from a ranked hotspot. | One finding per report hotspot, with path, rank, score, and code `hotpath.hotspot.risk`. | Gives machine consumers a compact list of hotspot-related findings. | Findings are advisory and currently focus on hotspot risk, not architecture, tests, runtime incidents, or security. |
 | CI risk | Public `0-10` risk value used by `hotpath ci --fail-on-risk <threshold>`. | Internal hotspot score multiplied by `10.0`; CI compares the maximum risk with the threshold using `>=`. | Lets CI fail when current repository hotspot risk reaches a chosen advisory threshold. | It gates the current repository report risk, not diff-specific touched-hotspot risk or architecture policy. |
@@ -245,7 +247,7 @@ Current diff and PR report metrics include:
 | --- | --- | --- | --- | --- |
 | changed file count | Number of changed files in the merge-base-to-head tree diff. | Count of supported Git diff deltas after rename detection. | Shows the file breadth of the committed change. | It excludes uncommitted changes and depends on local Git diff behavior. |
 | added/deleted lines | Line counts reported by the Git patch for each changed file. | Git patch line statistics for each changed file in the selected tree diff. | Gives a rough size signal for individual changed files. | Binary changes and some type changes may have no meaningful line statistics. |
-| touched hotspot count | Number of changed current files that also appear in the default top hotspot rows. | Intersection of changed file paths with the current top `DEFAULT_HOTSPOTS_LIMIT` `hotpath.score.v1` hotspot rows. | Highlights changes touching already-ranked local risk signals. | Deleted files are not current files, output filters are not applied, and hotspot scoring is advisory and incomplete. |
+| touched hotspot count | Number of changed current files that also appear in the default top hotspot rows. | Intersection of changed file paths with the current top `DEFAULT_HOTSPOTS_LIMIT` `hotpath.score.v3` hotspot rows. | Highlights changes touching already-ranked local risk signals. | Deleted files are not current files, output filters are not applied, and hotspot scoring is advisory and incomplete. |
 | context token delta | Approximate new context size minus old context size for changed Git blob sides. | `ceil(byte_size / 4)` for each readable UTF-8 blob side, then new-side tokens minus old-side tokens. | Estimates whether the committed change grows or shrinks AI context cost. | Binary and invalid UTF-8 sides are skipped and contribute `0`; this is not tokenizer-specific. |
 | architecture status | Current architecture rule evaluation status for the diff. | Always `not_evaluated` until architecture rules exist. | Reserves an explicit report field for future rule checks. | No architecture violations are evaluated or enforced today. |
 

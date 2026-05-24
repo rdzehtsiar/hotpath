@@ -79,6 +79,44 @@ fn parse_json(current_dir: &Path) -> (String, Value) {
     (stdout, value)
 }
 
+fn operation_log_values(current_dir: &Path) -> Vec<Value> {
+    let logs_root = current_dir
+        .ancestors()
+        .find(|path| path.join(".git").exists())
+        .unwrap_or(current_dir);
+    let logs_dir = logs_root.join(".hotpath").join("logs");
+    let mut entries = fs::read_dir(&logs_dir)
+        .unwrap_or_else(|error| panic!("operation logs should be readable: {error}"))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("operation log entries should read");
+    entries.sort_by_key(|entry| entry.file_name());
+    let expected_cwd = current_dir.display().to_string();
+    entries
+        .iter()
+        .rev()
+        .map(|entry| {
+            fs::read_to_string(entry.path())
+                .expect("operation log should be readable")
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<Value>(line).expect("operation log line should be JSON")
+                })
+                .collect::<Vec<_>>()
+        })
+        .find(|values| {
+            values.iter().any(|value| {
+                value["event"] == "command_started" && value["fields"]["cwd"] == expected_cwd
+            })
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected at least one operation log for {} in {}",
+                expected_cwd,
+                logs_dir.display(),
+            )
+        })
+}
+
 fn file_paths(value: &Value) -> Vec<&str> {
     value["files"]
         .as_array()
@@ -149,26 +187,46 @@ fn collect_json_path_leaks(
     needles: &[String],
     leaks: &mut Vec<(String, String)>,
 ) {
-    match value {
-        Value::String(text) => {
-            let text = comparable_path_string(text);
+    let mut stack = vec![(value, location.to_owned())];
 
-            if needles.iter().any(|needle| text.contains(needle)) {
-                leaks.push((location.to_owned(), text));
+    while let Some((value, location)) = stack.pop() {
+        match value {
+            Value::String(text) => {
+                let text = comparable_path_string(text);
+
+                if needles.iter().any(|needle| text.contains(needle)) {
+                    leaks.push((location, text));
+                }
             }
-        }
-        Value::Array(items) => {
-            for (index, item) in items.iter().enumerate() {
-                collect_json_path_leaks(item, &format!("{location}[{index}]"), needles, leaks);
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate().rev() {
+                    stack.push((item, format!("{location}[{index}]")));
+                }
             }
-        }
-        Value::Object(entries) => {
-            for (key, item) in entries {
-                collect_json_path_leaks(item, &format!("{location}.{key}"), needles, leaks);
+            Value::Object(entries) => {
+                let entries = entries.iter().collect::<Vec<_>>();
+                for (key, item) in entries.into_iter().rev() {
+                    stack.push((item, format!("{location}.{key}")));
+                }
             }
+            Value::Bool(_) | Value::Number(_) | Value::Null => {}
         }
-        Value::Bool(_) | Value::Number(_) | Value::Null => {}
     }
+}
+
+#[test]
+fn json_path_leak_collection_handles_deep_json_iteratively() {
+    let mut value = Value::String("needle".to_owned());
+    for _ in 0..2_000 {
+        value = Value::Array(vec![value]);
+    }
+    let needles = vec!["needle".to_owned()];
+    let mut leaks = Vec::new();
+
+    collect_json_path_leaks(&value, "$", &needles, &mut leaks);
+
+    assert_eq!(leaks.len(), 1);
+    assert_eq!(leaks[0].1, "needle");
 }
 
 #[cfg(windows)]
@@ -205,6 +263,32 @@ fn parse_summary_persists_parser_symbols() {
             .collect::<Vec<_>>(),
         vec![("src/lib.rs", "lib", "function", Some(1), Some(1), None)]
     );
+}
+
+#[test]
+fn parse_writes_operation_log_with_file_breadcrumbs() {
+    let fixture = Fixture::new("parse-operation-log");
+    git2::Repository::init(&fixture.path).expect("fixture git repository should initialize");
+    fixture.write("src/lib.rs", "pub fn render() {}\n");
+
+    let stdout = successful_stdout(&["parse"], &fixture.path);
+    let logs = operation_log_values(&fixture.path);
+    let events = logs
+        .iter()
+        .map(|value| value["event"].as_str().expect("event should be a string"))
+        .collect::<Vec<_>>();
+
+    assert!(stdout.starts_with("Hotpath parse summary\n"));
+    assert!(events.contains(&"command_started"));
+    assert!(events.contains(&"scan_started"));
+    assert!(events.contains(&"scan_completed"));
+    assert!(events.contains(&"parse_started"));
+    assert!(events.contains(&"parse_file_started"));
+    assert!(events.contains(&"parse_file_completed"));
+    assert!(events.contains(&"command_completed"));
+    assert!(logs.iter().any(|value| {
+        value["event"] == "parse_file_started" && value["fields"]["path"] == "src/lib.rs"
+    }));
 }
 
 #[test]

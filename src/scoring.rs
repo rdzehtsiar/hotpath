@@ -4,19 +4,18 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
-use crate::git::{GitCoChange, GitFileMetrics};
+use crate::git::{GitAnalysis, GitCoChange, GitFileMetrics};
 use crate::FileRecord;
 
 /// Current score formula identifier.
 ///
 /// Formula identifiers are part of score explanations and persisted output.
 /// Changing the formula semantics should introduce a new identifier.
-pub const CURRENT_SCORE_FORMULA_ID: &str = "hotpath.score.v1";
+pub const CURRENT_SCORE_FORMULA_ID: &str = "hotpath.score.v3";
 const SIZE_LINE_COUNT_SATURATION: u64 = 1_000;
 const SIZE_BYTE_SATURATION: u64 = 128 * 1024;
 const CHURN_LINE_SATURATION: u64 = 2_000;
 const RECENT_GROWTH_SATURATION: f64 = 1.0;
-const AUTHOR_FRAGMENTATION_SATURATION: u64 = 5;
 const CO_CHANGED_FILE_SATURATION: u64 = 25;
 const INITIAL_RISK_FORMULA_TERMS: [RiskFormulaTerm; 5] = [
     RiskFormulaTerm {
@@ -30,7 +29,7 @@ const INITIAL_RISK_FORMULA_TERMS: [RiskFormulaTerm; 5] = [
         weight: 0.20,
     },
     RiskFormulaTerm {
-        name: "author_fragmentation",
+        name: "ownership_risk",
         metric: NormalizedMetric::Ownership,
         weight: 0.20,
     },
@@ -69,10 +68,17 @@ impl FormulaVersion {
     pub fn current() -> Self {
         Self {
             id: CURRENT_SCORE_FORMULA_ID.to_owned(),
-            major: 1,
+            major: 3,
             minor: 0,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RepositoryScoreContext {
+    pub repository_age_days: Option<u64>,
+    pub repository_author_count: Option<u64>,
+    pub repository_file_count: Option<u64>,
 }
 
 /// Raw repository facts available to a score formula for one path.
@@ -92,10 +98,20 @@ pub struct RawScoreMetrics {
     pub recent_churn_lines: Option<u64>,
     /// Number of distinct exact author identities that touched this path.
     pub author_count: Option<u64>,
-    /// Dominant owner's share of file-touching commits.
+    /// Number of meaningful operational owners identified for this path.
+    pub owner_count: Option<u64>,
+    /// Dominant owner's weighted operational ownership share.
     pub dominant_owner_share: Option<f64>,
     /// Number of observed files that co-changed with this path.
     pub co_changed_file_count: Option<u64>,
+    /// Whole days between the first observed file touch and HEAD.
+    pub file_age_days: Option<u64>,
+    /// Whole days between the first observed repository file touch and HEAD.
+    pub repository_age_days: Option<u64>,
+    /// Number of distinct exact author identities observed in local history.
+    pub repository_author_count: Option<u64>,
+    /// Number of current scanned files in the repository.
+    pub repository_file_count: Option<u64>,
 }
 
 /// Normalized formula inputs for one path.
@@ -249,6 +265,7 @@ pub fn raw_score_metrics_from_scan_and_git(
     files: &[FileRecord],
     git_metrics: &[GitFileMetrics],
     co_changes: &[GitCoChange],
+    repository_context: RepositoryScoreContext,
 ) -> Vec<RawScoreMetrics> {
     let metrics_by_path = git_metrics
         .iter()
@@ -280,15 +297,43 @@ pub fn raw_score_metrics_from_scan_and_git(
                         .saturating_add(metric.recent_churn_deleted)
                 })),
                 author_count: Some(metric.map_or(0, |metric| metric.author_count)),
+                owner_count: Some(metric.map_or(0, |metric| metric.owner_count)),
                 dominant_owner_share: metric.and_then(|metric| metric.dominant_owner_share),
                 co_changed_file_count: Some(
                     co_changed_paths
                         .get(file.path.as_str())
                         .map_or(0, |paths| paths.len() as u64),
                 ),
+                file_age_days: metric.and_then(|metric| metric.file_age_days),
+                repository_age_days: repository_context.repository_age_days,
+                repository_author_count: repository_context.repository_author_count,
+                repository_file_count: repository_context.repository_file_count,
             }
         })
         .collect()
+}
+
+pub fn repository_score_context_from_analysis(
+    analysis: &GitAnalysis,
+    current_file_count: u64,
+) -> RepositoryScoreContext {
+    let repository_age_days = analysis
+        .file_metrics
+        .iter()
+        .filter_map(|metric| metric.file_age_days)
+        .max();
+    let repository_author_count = analysis
+        .changes
+        .iter()
+        .map(|change| change.author.as_str())
+        .collect::<BTreeSet<_>>()
+        .len() as u64;
+
+    RepositoryScoreContext {
+        repository_age_days,
+        repository_author_count: Some(repository_author_count),
+        repository_file_count: Some(current_file_count),
+    }
 }
 
 /// Convert raw facts into bounded normalized score inputs.
@@ -307,7 +352,7 @@ pub fn normalize_score_metrics(raw_metrics: &RawScoreMetrics) -> ScoreNormalizat
         "total churn is unavailable; churn normalization is omitted",
     );
     let recent_churn = normalize_recent_growth(raw_metrics, &mut limitations);
-    let ownership = normalize_author_fragmentation(raw_metrics, &mut limitations);
+    let ownership = normalize_ownership_risk(raw_metrics, &mut limitations);
     let coupling = normalize_count(
         raw_metrics.co_changed_file_count,
         CO_CHANGED_FILE_SATURATION,
@@ -394,54 +439,148 @@ fn normalize_recent_growth(
     ))
 }
 
-fn normalize_author_fragmentation(
+fn normalize_ownership_risk(
     raw_metrics: &RawScoreMetrics,
     limitations: &mut Vec<ScoreLimitation>,
 ) -> Option<f64> {
     let owner_share_was_missing = raw_metrics.dominant_owner_share.is_none();
-    let author_component = raw_metrics
-        .author_count
-        .map(saturating_author_fragmentation);
-    let owner_component = normalize_owner_dispersion(raw_metrics.dominant_owner_share, limitations);
+    let owner_count_component = raw_metrics.owner_count.map(normalize_owner_count_risk);
+    let concentration_component =
+        normalize_owner_concentration(raw_metrics.dominant_owner_share, limitations);
 
-    match (author_component, owner_component) {
-        (Some(author_component), Some(owner_component)) => {
-            Some((author_component + owner_component) / 2.0)
+    let base = match (owner_count_component, concentration_component) {
+        (Some(owner_count_component), Some(concentration_component)) => {
+            Some((owner_count_component + concentration_component) / 2.0)
         }
-        (Some(author_component), None) => {
+        (Some(owner_count_component), None) => {
             if owner_share_was_missing {
                 limitations.push(score_limitation(
-                    "author_fragmentation_missing_owner_share",
-                    "dominant owner share is unavailable; author fragmentation uses author count only",
+                    "ownership_risk_missing_owner_share",
+                    "dominant operational owner share is unavailable; owner risk uses owner count only",
                 ));
             }
-            Some(author_component)
+            Some(owner_count_component)
         }
-        (None, Some(owner_component)) => {
+        (None, Some(concentration_component)) => {
             limitations.push(score_limitation(
-                "author_fragmentation_missing_author_count",
-                "author count is unavailable; author fragmentation uses dominant owner share only",
+                "ownership_risk_missing_owner_count",
+                "owner count is unavailable; owner risk uses dominant owner share only",
             ));
-            Some(owner_component)
+            Some(concentration_component)
         }
         (None, None) if owner_share_was_missing => {
             limitations.push(score_limitation(
-                "missing_author_fragmentation_metrics",
-                "author count and dominant owner share are unavailable; author fragmentation is omitted",
+                "missing_ownership_risk_metrics",
+                "owner count and dominant owner share are unavailable; owner risk normalization is omitted",
             ));
             None
         }
         (None, None) => {
             limitations.push(score_limitation(
-                "author_fragmentation_missing_author_count",
-                "author count is unavailable; author fragmentation is omitted",
+                "ownership_risk_missing_owner_count",
+                "owner count is unavailable; owner risk normalization is omitted",
             ));
             None
         }
-    }
+    };
+
+    base.map(|value| {
+        let repository_maturity = repository_maturity_factor(raw_metrics, limitations);
+        let file_pressure = ownership_file_pressure(raw_metrics);
+
+        value * (0.20 + 0.80 * repository_maturity) * (0.30 + 0.70 * file_pressure)
+    })
 }
 
-fn normalize_owner_dispersion(
+fn repository_maturity_factor(
+    raw_metrics: &RawScoreMetrics,
+    limitations: &mut Vec<ScoreLimitation>,
+) -> f64 {
+    let repository_age = raw_metrics
+        .repository_age_days
+        .map(|days| saturating_ratio(days, 730))
+        .unwrap_or_else(|| {
+            limitations.push(score_limitation(
+                "ownership_risk_missing_repository_age",
+                "repository age is unavailable; ownership risk uses lower maturity",
+            ));
+            0.0
+        });
+    let repository_contributors = raw_metrics
+        .repository_author_count
+        .map(|authors| {
+            if authors <= 1 {
+                0.0
+            } else {
+                ((authors - 1) as f64 / 9.0).clamp(0.0, 1.0)
+            }
+        })
+        .unwrap_or_else(|| {
+            limitations.push(score_limitation(
+                "ownership_risk_missing_repository_author_count",
+                "repository author count is unavailable; ownership risk uses lower maturity",
+            ));
+            0.0
+        });
+    let repository_size = raw_metrics
+        .repository_file_count
+        .map(|files| saturating_ratio(files, 200))
+        .unwrap_or_else(|| {
+            limitations.push(score_limitation(
+                "ownership_risk_missing_repository_file_count",
+                "repository file count is unavailable; ownership risk uses lower maturity",
+            ));
+            0.0
+        });
+    let file_age = raw_metrics
+        .file_age_days
+        .map(|days| saturating_ratio(days, 365))
+        .unwrap_or(0.0);
+
+    (repository_age * 0.35
+        + repository_contributors * 0.35
+        + repository_size * 0.15
+        + file_age * 0.15)
+        .clamp(0.0, 1.0)
+}
+
+fn ownership_file_pressure(raw_metrics: &RawScoreMetrics) -> f64 {
+    let churn = raw_metrics
+        .total_churn_lines
+        .map(|lines| saturating_ratio(lines, CHURN_LINE_SATURATION))
+        .unwrap_or(0.0);
+    let recent = normalize_recent_growth_without_limitations(raw_metrics).unwrap_or(0.0);
+    let coupling = raw_metrics
+        .co_changed_file_count
+        .map(|count| saturating_ratio(count, CO_CHANGED_FILE_SATURATION))
+        .unwrap_or(0.0);
+    let size = raw_metrics
+        .line_count
+        .map(|lines| saturating_ratio(lines, SIZE_LINE_COUNT_SATURATION))
+        .or_else(|| {
+            raw_metrics
+                .byte_size
+                .map(|bytes| saturating_ratio(bytes, SIZE_BYTE_SATURATION))
+        })
+        .unwrap_or(0.0);
+
+    (churn * 0.35 + recent * 0.25 + coupling * 0.25 + size * 0.15).clamp(0.0, 1.0)
+}
+
+fn normalize_recent_growth_without_limitations(raw_metrics: &RawScoreMetrics) -> Option<f64> {
+    let recent_churn_lines = raw_metrics.recent_churn_lines?;
+    let line_count = raw_metrics.line_count?;
+
+    if line_count == 0 {
+        return Some(if recent_churn_lines == 0 { 0.0 } else { 1.0 });
+    }
+
+    Some(clamp_unit(
+        recent_churn_lines as f64 / line_count as f64 / RECENT_GROWTH_SATURATION,
+    ))
+}
+
+fn normalize_owner_concentration(
     dominant_owner_share: Option<f64>,
     limitations: &mut Vec<ScoreLimitation>,
 ) -> Option<f64> {
@@ -450,7 +589,7 @@ fn normalize_owner_dispersion(
     if !dominant_owner_share.is_finite() {
         limitations.push(score_limitation(
             "invalid_dominant_owner_share",
-            "dominant owner share is not finite; owner-share normalization is omitted",
+            "dominant owner share is not finite; owner risk normalization is omitted",
         ));
         return None;
     }
@@ -462,7 +601,7 @@ fn normalize_owner_dispersion(
         ));
     }
 
-    Some(1.0 - clamp_unit(dominant_owner_share))
+    Some(clamp_unit(dominant_owner_share))
 }
 
 fn normalize_count(
@@ -542,11 +681,14 @@ fn co_changed_paths_by_file(co_changes: &[GitCoChange]) -> BTreeMap<&str, BTreeS
     paths_by_file
 }
 
-fn saturating_author_fragmentation(author_count: u64) -> f64 {
-    saturating_ratio(
-        author_count.saturating_sub(1),
-        AUTHOR_FRAGMENTATION_SATURATION,
-    )
+fn normalize_owner_count_risk(owner_count: u64) -> f64 {
+    match owner_count {
+        0 => 0.0,
+        1 => 1.0,
+        2 => 0.60,
+        3 => 0.30,
+        _ => 0.0,
+    }
 }
 
 fn saturating_ratio(value: u64, saturation: u64) -> f64 {
@@ -572,8 +714,8 @@ mod tests {
     fn current_formula_version_is_stable_and_explicit() {
         let version = FormulaVersion::current();
 
-        assert_eq!(version.id, "hotpath.score.v1");
-        assert_eq!(version.major, 1);
+        assert_eq!(version.id, "hotpath.score.v3");
+        assert_eq!(version.major, 3);
         assert_eq!(version.minor, 0);
     }
 
@@ -587,8 +729,13 @@ mod tests {
             total_churn_lines: Some(42),
             recent_churn_lines: Some(12),
             author_count: Some(2),
+            owner_count: Some(2),
             dominant_owner_share: Some(0.75),
             co_changed_file_count: Some(4),
+            file_age_days: Some(365),
+            repository_age_days: Some(730),
+            repository_author_count: Some(10),
+            repository_file_count: Some(200),
         };
         let normalized_metrics = NormalizedScoreMetrics {
             size: Some(0.2),
@@ -647,8 +794,13 @@ mod tests {
             total_churn_lines: Some(1_000),
             recent_churn_lines: Some(200),
             author_count: Some(3),
+            owner_count: Some(3),
             dominant_owner_share: Some(0.5),
             co_changed_file_count: Some(10),
+            file_age_days: Some(365),
+            repository_age_days: Some(730),
+            repository_author_count: Some(10),
+            repository_file_count: Some(200),
         };
 
         let score = calculate_hotspot_score(raw_metrics.clone());
@@ -663,11 +815,11 @@ mod tests {
                 size: Some(0.4),
                 churn: Some(0.5),
                 recent_churn: Some(0.5),
-                ownership: Some(0.45),
+                ownership: Some(0.24880000000000002),
                 coupling: Some(0.4),
             }
         );
-        assert_f64_near(score.value, 0.46);
+        assert_f64_near(score.value, 0.41976);
 
         let expected_terms = [
             (
@@ -679,11 +831,11 @@ mod tests {
             ),
             ("size_score", NormalizedMetric::Size, 0.20, Some(0.4), 0.08),
             (
-                "author_fragmentation",
+                "ownership_risk",
                 NormalizedMetric::Ownership,
                 0.20,
-                Some(0.45),
-                0.09,
+                Some(0.2488),
+                0.049760000000000006,
             ),
             (
                 "recent_growth",
@@ -728,8 +880,13 @@ mod tests {
             total_churn_lines: None,
             recent_churn_lines: None,
             author_count: None,
+            owner_count: None,
             dominant_owner_share: None,
             co_changed_file_count: None,
+            file_age_days: None,
+            repository_age_days: None,
+            repository_author_count: None,
+            repository_file_count: None,
         });
 
         assert_eq!(score.value, 0.0);
@@ -739,7 +896,7 @@ mod tests {
                 "missing_size_metric",
                 "missing_total_churn_lines",
                 "missing_recent_churn_lines",
-                "missing_author_fragmentation_metrics",
+                "missing_ownership_risk_metrics",
                 "missing_co_changed_file_count",
             ]
         );
@@ -819,6 +976,7 @@ mod tests {
             recent_churn_added: 10,
             recent_churn_deleted: 1,
             author_count: 2,
+            owner_count: 2,
             dominant_owner: Some("Ada Lovelace <ada@example.invalid>".to_owned()),
             dominant_owner_share: Some(2.0 / 3.0),
             first_commit_id: Some("a".repeat(40)),
@@ -840,7 +998,16 @@ mod tests {
             },
         ];
 
-        let raw_metrics = raw_score_metrics_from_scan_and_git(&files, &git_metrics, &co_changes);
+        let raw_metrics = raw_score_metrics_from_scan_and_git(
+            &files,
+            &git_metrics,
+            &co_changes,
+            RepositoryScoreContext {
+                repository_age_days: Some(100),
+                repository_author_count: Some(2),
+                repository_file_count: Some(2),
+            },
+        );
 
         assert_eq!(
             raw_metrics,
@@ -853,8 +1020,13 @@ mod tests {
                     total_churn_lines: Some(35),
                     recent_churn_lines: Some(11),
                     author_count: Some(2),
+                    owner_count: Some(2),
                     dominant_owner_share: Some(2.0 / 3.0),
                     co_changed_file_count: Some(2),
+                    file_age_days: Some(10),
+                    repository_age_days: Some(100),
+                    repository_author_count: Some(2),
+                    repository_file_count: Some(2),
                 },
                 RawScoreMetrics {
                     path: "src/stable.rs".to_owned(),
@@ -864,8 +1036,13 @@ mod tests {
                     total_churn_lines: Some(0),
                     recent_churn_lines: Some(0),
                     author_count: Some(0),
+                    owner_count: Some(0),
                     dominant_owner_share: None,
                     co_changed_file_count: Some(1),
+                    file_age_days: None,
+                    repository_age_days: Some(100),
+                    repository_author_count: Some(2),
+                    repository_file_count: Some(2),
                 },
             ]
         );
@@ -877,6 +1054,7 @@ mod tests {
             total_churn_lines: Some(1_000),
             recent_churn_lines: Some(250),
             author_count: Some(3),
+            owner_count: Some(3),
             dominant_owner_share: Some(0.75),
             co_changed_file_count: Some(5),
             ..raw_metrics()
@@ -887,9 +1065,49 @@ mod tests {
         assert_eq!(normalization.normalized_metrics.size, Some(0.5));
         assert_eq!(normalization.normalized_metrics.churn, Some(0.5));
         assert_eq!(normalization.normalized_metrics.recent_churn, Some(0.5));
-        assert_near(normalization.normalized_metrics.ownership, 0.325);
+        assert_near(normalization.normalized_metrics.ownership, 0.3136875);
         assert_eq!(normalization.normalized_metrics.coupling, Some(0.2));
         assert!(normalization.limitations.is_empty());
+    }
+
+    #[test]
+    fn single_owner_new_small_repository_has_low_owner_risk() {
+        let normalization = normalize_score_metrics(&RawScoreMetrics {
+            owner_count: Some(1),
+            dominant_owner_share: Some(1.0),
+            commits_per_file: Some(1),
+            total_churn_lines: Some(1),
+            recent_churn_lines: Some(0),
+            line_count: Some(50),
+            co_changed_file_count: Some(0),
+            file_age_days: Some(0),
+            repository_age_days: Some(0),
+            repository_author_count: Some(1),
+            repository_file_count: Some(1),
+            ..raw_metrics()
+        });
+
+        assert_near(normalization.normalized_metrics.ownership, 0.0612577235);
+    }
+
+    #[test]
+    fn mature_high_pressure_single_owner_file_has_high_owner_risk() {
+        let normalization = normalize_score_metrics(&RawScoreMetrics {
+            owner_count: Some(1),
+            dominant_owner_share: Some(1.0),
+            commits_per_file: Some(20),
+            total_churn_lines: Some(CHURN_LINE_SATURATION),
+            recent_churn_lines: Some(SIZE_LINE_COUNT_SATURATION),
+            line_count: Some(SIZE_LINE_COUNT_SATURATION),
+            co_changed_file_count: Some(CO_CHANGED_FILE_SATURATION),
+            file_age_days: Some(365),
+            repository_age_days: Some(730),
+            repository_author_count: Some(10),
+            repository_file_count: Some(200),
+            ..raw_metrics()
+        });
+
+        assert_eq!(normalization.normalized_metrics.ownership, Some(1.0));
     }
 
     #[test]
@@ -900,10 +1118,15 @@ mod tests {
             commits_per_file: Some(0),
             total_churn_lines: Some(0),
             recent_churn_lines: Some(0),
-            author_count: Some(1),
-            dominant_owner_share: Some(1.0),
+            author_count: Some(4),
+            owner_count: Some(4),
+            dominant_owner_share: Some(0.0),
             co_changed_file_count: Some(0),
             path: "src/min.rs".to_owned(),
+            file_age_days: Some(0),
+            repository_age_days: Some(0),
+            repository_author_count: Some(1),
+            repository_file_count: Some(1),
         });
 
         assert_eq!(minimum.normalized_metrics.size, Some(0.0));
@@ -920,9 +1143,14 @@ mod tests {
             total_churn_lines: Some(u64::MAX),
             recent_churn_lines: Some(u64::MAX),
             author_count: Some(u64::MAX),
-            dominant_owner_share: Some(0.0),
+            owner_count: Some(1),
+            dominant_owner_share: Some(1.0),
             co_changed_file_count: Some(u64::MAX),
             path: "src/max.rs".to_owned(),
+            file_age_days: Some(u64::MAX),
+            repository_age_days: Some(u64::MAX),
+            repository_author_count: Some(u64::MAX),
+            repository_file_count: Some(u64::MAX),
         });
 
         assert_eq!(maximum.normalized_metrics.size, Some(1.0));
@@ -941,10 +1169,15 @@ mod tests {
             commits_per_file: Some(10),
             total_churn_lines: Some(CHURN_LINE_SATURATION),
             recent_churn_lines: Some(SIZE_LINE_COUNT_SATURATION),
-            author_count: Some(AUTHOR_FRAGMENTATION_SATURATION + 1),
-            dominant_owner_share: Some(0.0),
+            author_count: Some(6),
+            owner_count: Some(1),
+            dominant_owner_share: Some(1.0),
             co_changed_file_count: Some(CO_CHANGED_FILE_SATURATION),
             path: "src/saturated.rs".to_owned(),
+            file_age_days: Some(365),
+            repository_age_days: Some(730),
+            repository_author_count: Some(10),
+            repository_file_count: Some(200),
         });
 
         assert_eq!(
@@ -970,8 +1203,13 @@ mod tests {
             total_churn_lines: None,
             recent_churn_lines: None,
             author_count: None,
+            owner_count: None,
             dominant_owner_share: None,
             co_changed_file_count: None,
+            file_age_days: None,
+            repository_age_days: None,
+            repository_author_count: None,
+            repository_file_count: None,
         });
 
         assert_eq!(
@@ -990,7 +1228,7 @@ mod tests {
                 "missing_size_metric",
                 "missing_total_churn_lines",
                 "missing_recent_churn_lines",
-                "missing_author_fragmentation_metrics",
+                "missing_ownership_risk_metrics",
                 "missing_co_changed_file_count",
             ]
         );
@@ -1037,42 +1275,46 @@ mod tests {
     }
 
     #[test]
-    fn author_fragmentation_records_partial_and_invalid_inputs() {
+    fn ownership_risk_records_partial_and_invalid_inputs() {
         let missing_owner_share = normalize_score_metrics(&RawScoreMetrics {
             author_count: Some(3),
+            owner_count: Some(3),
             dominant_owner_share: None,
             ..raw_metrics()
         });
-        assert_eq!(missing_owner_share.normalized_metrics.ownership, Some(0.4));
+        assert_near(missing_owner_share.normalized_metrics.ownership, 0.1169535);
         assert!(limitation_codes(&missing_owner_share.limitations)
-            .contains(&"author_fragmentation_missing_owner_share"));
+            .contains(&"ownership_risk_missing_owner_share"));
 
         let missing_author_count = normalize_score_metrics(&RawScoreMetrics {
             author_count: None,
+            owner_count: None,
             dominant_owner_share: Some(0.25),
             ..raw_metrics()
         });
-        assert_eq!(
+        assert_near(
             missing_author_count.normalized_metrics.ownership,
-            Some(0.75)
+            0.09746125,
         );
         assert!(limitation_codes(&missing_author_count.limitations)
-            .contains(&"author_fragmentation_missing_author_count"));
+            .contains(&"ownership_risk_missing_owner_count"));
 
         let out_of_range_owner_share = normalize_score_metrics(&RawScoreMetrics {
             author_count: Some(1),
+            owner_count: Some(1),
             dominant_owner_share: Some(1.5),
             ..raw_metrics()
         });
-        assert_eq!(
+        assert_near(
             out_of_range_owner_share.normalized_metrics.ownership,
-            Some(0.0)
+            0.389845,
         );
         assert!(limitation_codes(&out_of_range_owner_share.limitations)
             .contains(&"dominant_owner_share_out_of_range"));
 
         let non_finite_owner_share = normalize_score_metrics(&RawScoreMetrics {
             author_count: None,
+            owner_count: None,
             dominant_owner_share: Some(f64::NAN),
             ..raw_metrics()
         });
@@ -1081,20 +1323,21 @@ mod tests {
             limitation_codes(&non_finite_owner_share.limitations),
             vec![
                 "invalid_dominant_owner_share",
-                "author_fragmentation_missing_author_count",
+                "ownership_risk_missing_owner_count",
             ]
         );
 
         let author_count_with_non_finite_owner_share = normalize_score_metrics(&RawScoreMetrics {
             author_count: Some(3),
+            owner_count: Some(3),
             dominant_owner_share: Some(f64::NAN),
             ..raw_metrics()
         });
-        assert_eq!(
+        assert_near(
             author_count_with_non_finite_owner_share
                 .normalized_metrics
                 .ownership,
-            Some(0.4)
+            0.1169535,
         );
         assert_eq!(
             limitation_codes(&author_count_with_non_finite_owner_share.limitations),
@@ -1118,6 +1361,7 @@ mod tests {
                 recent_churn_added: 2,
                 recent_churn_deleted: 0,
                 author_count: 2,
+                owner_count: 2,
                 dominant_owner: Some("Ben Bitdiddle <ben@example.invalid>".to_owned()),
                 dominant_owner_share: Some(0.5),
                 first_commit_id: Some("b".repeat(40)),
@@ -1134,6 +1378,7 @@ mod tests {
                 recent_churn_added: 50,
                 recent_churn_deleted: 0,
                 author_count: 3,
+                owner_count: 3,
                 dominant_owner: Some("Ada Lovelace <ada@example.invalid>".to_owned()),
                 dominant_owner_share: Some(1.0 / 3.0),
                 first_commit_id: Some("a".repeat(40)),
@@ -1150,6 +1395,7 @@ mod tests {
                 recent_churn_added: 0,
                 recent_churn_deleted: 0,
                 author_count: 1,
+                owner_count: 1,
                 dominant_owner: Some("Ada Lovelace <ada@example.invalid>".to_owned()),
                 dominant_owner_share: Some(1.0),
                 first_commit_id: Some("a".repeat(40)),
@@ -1172,36 +1418,45 @@ mod tests {
             },
         ];
 
-        let scores = raw_score_metrics_from_scan_and_git(&files, &git_metrics, &co_changes)
-            .into_iter()
-            .map(calculate_hotspot_score)
-            .collect::<Vec<_>>();
+        let scores = raw_score_metrics_from_scan_and_git(
+            &files,
+            &git_metrics,
+            &co_changes,
+            RepositoryScoreContext {
+                repository_age_days: Some(100),
+                repository_author_count: Some(3),
+                repository_file_count: Some(3),
+            },
+        )
+        .into_iter()
+        .map(calculate_hotspot_score)
+        .collect::<Vec<_>>();
         let related = score_for_path(&scores, "src/related.rs");
         let risky = score_for_path(&scores, "src/risky.rs");
         let stable = score_for_path(&scores, "src/stable.rs");
 
-        assert_f64_near(related.value, 0.22475);
+        assert_f64_near(related.value, 0.17116363753718417);
         assert_eq!(
             related.normalized_metrics,
             NormalizedScoreMetrics {
                 size: Some(0.002),
                 churn: Some(0.001),
                 recent_churn: Some(1.0),
-                ownership: Some(0.35),
+                ownership: Some(0.08206818768592086),
                 coupling: Some(0.04),
             }
         );
-        assert_f64_near(risky.value, 0.22716666666666668);
+        assert_f64_near(risky.value, 0.12950802512912227);
         assert_eq!(risky.normalized_metrics.size, Some(0.1));
         assert_eq!(risky.normalized_metrics.churn, Some(0.05));
         assert_eq!(risky.normalized_metrics.recent_churn, Some(0.5));
-        assert_near(risky.normalized_metrics.ownership, 0.5333333333333333);
+        assert_near(risky.normalized_metrics.ownership, 0.045040125645611356);
         assert_eq!(risky.normalized_metrics.coupling, Some(0.08));
-        assert_f64_near(stable.value, 0.004375);
+        assert_f64_near(stable.value, 0.024974917181582953);
 
         assert_eq!(
             ranked_paths(&rank_hotspot_scores(&scores)),
-            vec!["src/risky.rs", "src/related.rs", "src/stable.rs"]
+            vec!["src/related.rs", "src/risky.rs", "src/stable.rs"]
         );
     }
 
@@ -1253,8 +1508,13 @@ mod tests {
             total_churn_lines: Some(42),
             recent_churn_lines: Some(12),
             author_count: Some(2),
+            owner_count: Some(2),
             dominant_owner_share: Some(0.75),
             co_changed_file_count: Some(4),
+            file_age_days: Some(365),
+            repository_age_days: Some(730),
+            repository_author_count: Some(10),
+            repository_file_count: Some(200),
         }
     }
 

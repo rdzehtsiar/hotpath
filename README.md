@@ -45,7 +45,7 @@ reports local file facts and warnings, scan and analysis commands persist
 derived local SQLite index data at
 `.hotpath/index.db`, Git analysis explains local history for requested paths,
 hotspot commands rank and explain current files with the documented
-`hotpath.score.v1` formula, parse commands print an early parser report for
+`hotpath.score.v3` formula, parse commands print an early parser report for
 supported source files, complexity commands summarize parser-derived symbol
 complexity and fan metrics, graph commands expose conservative resolved local
 dependency edges for a selected module scope, and context commands estimate AI
@@ -122,7 +122,7 @@ Hotpath is intended for:
 
 Hotpath should make it easier to answer questions such as:
 
-- which files combine high churn, large size, and fragmented ownership
+- which files combine high churn, large size, and concentrated operational ownership
 - which modules are growing fastest
 - where complexity or coupling is concentrating
 - which changes touch known hotspots

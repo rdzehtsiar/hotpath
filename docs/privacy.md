@@ -74,6 +74,13 @@ They do not include source-file contents. `hotpath context` estimates from
 local scanner facts and should not make network calls, use external APIs, run
 cloud tokenizers, or collect telemetry.
 
+Hotpath also writes local operation logs under `.hotpath/logs/` for
+troubleshooting. These JSONL files are stored inside the analyzed working tree,
+are never sent over the network by Hotpath, and are bounded to the latest 20
+run logs with a 10 MiB cap per log. They can include command names, elapsed
+times, diagnostic events, and repository-relative file paths, but not
+source-file contents.
+
 Repository reports can include derived repository-relative paths, scan summary
 counts, local Git summary metadata, ranked hotspot scores and score
 explanations, context estimate summaries, and advisory finding rows. JSON,

@@ -232,6 +232,7 @@ fn git_file_metrics_report_exact_fixture_values() {
     assert_eq!(metrics[0].recent_churn_added, 1);
     assert_eq!(metrics[0].recent_churn_deleted, 0);
     assert_eq!(metrics[0].author_count, 1);
+    assert_eq!(metrics[0].owner_count, 1);
     assert_eq!(
         metrics[0].dominant_owner.as_deref(),
         Some("Cara Committer <cara@example.invalid>")
@@ -250,11 +251,12 @@ fn git_file_metrics_report_exact_fixture_values() {
     assert_eq!(metrics[1].recent_churn_added, 3);
     assert_eq!(metrics[1].recent_churn_deleted, 1);
     assert_eq!(metrics[1].author_count, 2);
+    assert_eq!(metrics[1].owner_count, 2);
     assert_eq!(
         metrics[1].dominant_owner.as_deref(),
         Some("Ada Lovelace <ada@example.invalid>")
     );
-    assert_eq!(metrics[1].dominant_owner_share, Some(2.0 / 3.0));
+    assert_eq!(metrics[1].dominant_owner_share, Some(0.7071389092381258));
     assert_eq!(
         metrics[1].first_commit_id.as_deref(),
         Some(first_src.as_str())
@@ -269,7 +271,7 @@ fn git_file_metrics_report_exact_fixture_values() {
 }
 
 #[test]
-fn git_file_metrics_break_dominant_owner_ties_by_author_identity() {
+fn git_file_metrics_use_recency_before_author_identity_for_operational_owner() {
     let changes = vec![
         raw_change(
             "b",
@@ -294,9 +296,11 @@ fn git_file_metrics_break_dominant_owner_ties_by_author_identity() {
     assert_eq!(metrics.len(), 1);
     assert_eq!(
         metrics[0].dominant_owner.as_deref(),
-        Some("Ada Ada <ada@example.invalid>")
+        Some("Zed Zed <zed@example.invalid>")
     );
-    assert_eq!(metrics[0].dominant_owner_share, Some(0.5));
+    assert!(metrics[0]
+        .dominant_owner_share
+        .is_some_and(|share| share > 0.5));
 }
 
 #[test]

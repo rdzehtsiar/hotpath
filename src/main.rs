@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::env;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Instant;
 
 use clap::{Args, Parser, Subcommand};
 
@@ -55,6 +58,45 @@ enum Commands {
 
     /// Open the early keyboard-first terminal user interface.
     Tui(TuiArgs),
+}
+
+impl Commands {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Scan(_) => "scan",
+            Self::Parse(_) => "parse",
+            Self::Complexity(_) => "complexity",
+            Self::Graph(_) => "graph",
+            Self::Explain(_) => "explain",
+            Self::ExplainGit(_) => "explain-git",
+            Self::Hotspots(_) => "hotspots",
+            Self::Context(_) => "context",
+            Self::Diff(_) => "diff",
+            Self::Pr(_) => "pr",
+            Self::Report(_) => "report",
+            Self::Ci(_) => "ci",
+            Self::Doctor => "doctor",
+            Self::Tui(_) => "tui",
+        }
+    }
+
+    fn output_mode(&self) -> &'static str {
+        match self {
+            Self::Scan(args) if args.json => "json",
+            Self::Parse(args) if args.json => "json",
+            Self::Complexity(args) if args.json => "json",
+            Self::Graph(args) if args.json => "json",
+            Self::Context(args) if args.json => "json",
+            Self::Diff(args) if args.json => "json",
+            Self::Pr(args) if args.json => "json",
+            Self::Report(args) if args.json => "json",
+            Self::Report(args) if args.markdown => "markdown",
+            Self::Report(args) if args.sarif => "sarif",
+            Self::Report(args) if args.html.is_some() => "html",
+            Self::Tui(_) => "tui",
+            _ => "text",
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -172,6 +214,10 @@ struct TuiArgs {
     #[arg(long)]
     exclude_vendor: bool,
 
+    /// Include generated, vendored, lockfile, and minified files in TUI hotspot rows.
+    #[arg(long)]
+    include_generated_hotspots: bool,
+
     /// Use ASCII-only TUI drawing characters.
     #[arg(long)]
     ascii: bool,
@@ -219,10 +265,25 @@ struct GraphArgs {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let command_name = cli.command.name();
+    let output_mode = cli.command.output_mode();
+    let started = Instant::now();
+    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
+    let log_root = operation_log_root(&cwd);
+    hotpath::operation_log::init(&log_root);
+    hotpath::operation_log::event(
+        "command_started",
+        serde_json::json!({
+            "command": command_name,
+            "output_mode": output_mode,
+            "cwd": cwd.display().to_string(),
+            "log_root": log_root.display().to_string(),
+        }),
+    );
 
     let command = match cli.command {
-        Commands::Ci(args) => return run_ci(args),
-        Commands::Tui(args) => return run_tui(args),
+        Commands::Ci(args) => return run_ci(args, command_name, output_mode, started),
+        Commands::Tui(args) => return run_tui(args, command_name, output_mode, started),
         command => command,
     };
 
@@ -278,37 +339,62 @@ fn main() -> ExitCode {
     match result {
         Ok(output) => {
             println!("{output}");
+            log_command_completed(command_name, output_mode, started);
             ExitCode::SUCCESS
         }
         Err(error) => {
             eprintln!("hotpath: {error}");
+            log_command_failed(command_name, output_mode, started, &error.to_string());
             ExitCode::FAILURE
         }
     }
 }
 
-fn run_tui(args: TuiArgs) -> ExitCode {
+fn operation_log_root(cwd: &Path) -> PathBuf {
+    git2::Repository::discover(cwd)
+        .ok()
+        .and_then(|repository| repository.workdir().map(Path::to_path_buf))
+        .unwrap_or_else(|| cwd.to_path_buf())
+}
+
+fn run_tui(
+    args: TuiArgs,
+    command_name: &'static str,
+    output_mode: &'static str,
+    started: Instant,
+) -> ExitCode {
     match hotpath::run_tui_with_options(hotpath::TuiOptions {
         context: hotpath::ContextOptions {
             exclude_generated: args.exclude_generated,
             exclude_vendor: args.exclude_vendor,
             budget_tokens: args.budget,
         },
+        include_generated_hotspots: args.include_generated_hotspots,
         ascii: args.ascii,
         no_color: args.no_color,
     }) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            log_command_completed(command_name, output_mode, started);
+            ExitCode::SUCCESS
+        }
         Err(error) => {
             eprintln!("hotpath: {error}");
+            log_command_failed(command_name, output_mode, started, &error.to_string());
             ExitCode::FAILURE
         }
     }
 }
 
-fn run_ci(args: CiArgs) -> ExitCode {
+fn run_ci(
+    args: CiArgs,
+    command_name: &'static str,
+    output_mode: &'static str,
+    started: Instant,
+) -> ExitCode {
     match hotpath::report::ci_risk_gate(args.fail_on_risk) {
         Ok(evaluation) => {
             print!("{}", hotpath::report::render_ci_risk(&evaluation));
+            log_command_completed(command_name, output_mode, started);
             if evaluation.threshold_breached {
                 ExitCode::FAILURE
             } else {
@@ -317,9 +403,38 @@ fn run_ci(args: CiArgs) -> ExitCode {
         }
         Err(error) => {
             eprintln!("hotpath: {error}");
+            log_command_failed(command_name, output_mode, started, &error.to_string());
             ExitCode::from(2)
         }
     }
+}
+
+fn log_command_completed(command_name: &'static str, output_mode: &'static str, started: Instant) {
+    hotpath::operation_log::event(
+        "command_completed",
+        serde_json::json!({
+            "command": command_name,
+            "output_mode": output_mode,
+            "elapsed_ms": started.elapsed().as_millis(),
+        }),
+    );
+}
+
+fn log_command_failed(
+    command_name: &'static str,
+    output_mode: &'static str,
+    started: Instant,
+    error: &str,
+) {
+    hotpath::operation_log::event(
+        "command_failed",
+        serde_json::json!({
+            "command": command_name,
+            "output_mode": output_mode,
+            "elapsed_ms": started.elapsed().as_millis(),
+            "error": error,
+        }),
+    );
 }
 
 fn parse_positive_limit(value: &str) -> Result<usize, String> {

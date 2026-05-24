@@ -14,8 +14,8 @@ promise for future versions.
 The implemented hotspot formula is:
 
 ```text
-id: hotpath.score.v1
-major: 1
+id: hotpath.score.v3
+major: 3
 minor: 0
 ```
 
@@ -29,7 +29,7 @@ The final score is the sum of fixed weighted contributions:
 score =
   0.35 * churn
 + 0.20 * size
-+ 0.20 * ownership
++ 0.20 * ownership_risk
 + 0.15 * recent_churn
 + 0.10 * coupling
 ```
@@ -43,7 +43,7 @@ The weighted terms exposed by explanations are:
 | --- | --- | ---: |
 | `churn_score` | `churn` | `0.35` |
 | `size_score` | `size` | `0.20` |
-| `author_fragmentation` | `ownership` | `0.20` |
+| `ownership_risk` | `ownership_risk` | `0.20` |
 | `recent_growth` | `recent_churn` | `0.15` |
 | `cochange_score` | `coupling` | `0.10` |
 
@@ -59,16 +59,21 @@ those current files from local history reachable from `HEAD`.
 
 The raw inputs are:
 
-| Raw metric | Definition | Used by v1 formula |
+| Raw metric | Definition | Used by v3 formula |
 | --- | --- | --- |
 | `byte_size` | File size from scanner metadata, when available. | Size fallback |
 | `line_count` | Text line count from scanner metadata, when available. | Size and recent churn |
 | `commits_per_file` | Number of local Git commits that touched the path. | Context only |
 | `total_churn_lines` | Added plus deleted lines across observed local history. | Churn |
 | `recent_churn_lines` | Added plus deleted lines in the recent-history window. | Recent churn |
-| `author_count` | Number of distinct exact author identities that touched the path. | Ownership |
-| `dominant_owner_share` | Highest author's share of file-touching commits. | Ownership |
+| `author_count` | Number of distinct exact author identities that touched the path. | Context only |
+| `owner_count` | Number of compact displayed operational owners retained for the path. | Ownership risk |
+| `dominant_owner_share` | Highest weighted operational owner's share. | Ownership shape and risk |
 | `co_changed_file_count` | Number of distinct observed files that co-changed with the path. | Coupling |
+| `file_age_days` | Whole days between the file's first observed touch and `HEAD`. | Ownership risk |
+| `repository_age_days` | Whole days between the repository's first observed file touch and `HEAD`. | Ownership risk |
+| `repository_author_count` | Number of distinct exact author identities in local history. | Ownership risk |
+| `repository_file_count` | Number of current scanned files. | Ownership risk |
 
 The default recent-history window is `90` days before the `HEAD` committer
 timestamp. It uses local Git metadata, not the machine's current wall-clock
@@ -134,38 +139,81 @@ For zero-line files:
 - `line_count = 0` and nonzero `recent_churn_lines` normalizes to `1.0` and
   records `zero_line_count_recent_growth`.
 
-### Ownership
+### Ownership Risk
 
-Ownership is an author-fragmentation signal. Higher values mean authorship is
-more dispersed in the observed local history.
+Ownership risk is an interpretive signal. It starts with operational ownership
+concentration, then suppresses or amplifies that concentration using repository
+maturity and file pressure. Single ownership in a small or new repository can
+therefore produce low owner risk.
 
-The author-count component is:
+The owner-count component is:
 
 ```text
-author_component = min(max(author_count - 1, 0) / 5, 1.0)
+owner_count_component =
+  0.0  when owner_count = 0
+  1.0  when owner_count = 1
+  0.60 when owner_count = 2
+  0.30 when owner_count = 3
+  0.0  when owner_count >= 4
 ```
 
-The owner-share component is:
+The concentration component is:
 
 ```text
-owner_component = 1.0 - clamp(dominant_owner_share, 0.0, 1.0)
+concentration_component = clamp(dominant_owner_share, 0.0, 1.0)
 ```
 
 When both components are available:
 
 ```text
-ownership = (author_component + owner_component) / 2
+base_concentration = (owner_count_component + concentration_component) / 2
 ```
 
 When only one component is available, that component is used by itself and a
 limitation is recorded. Missing `dominant_owner_share` records
-`author_fragmentation_missing_owner_share`; missing `author_count` records
-`author_fragmentation_missing_author_count`. If both are unavailable, ownership
-normalization is omitted and records `missing_author_fragmentation_metrics`.
+`ownership_risk_missing_owner_share`; missing `owner_count` records
+`ownership_risk_missing_owner_count`. If both are unavailable, ownership
+risk normalization is omitted and records `missing_ownership_risk_metrics`.
+
+Repository maturity uses local history age, repository contributor breadth,
+current file count, and file age. Missing maturity context contributes `0.0`
+for that maturity component and records a limitation when the repository-level
+fact is unavailable.
+
+```text
+repository_maturity =
+  0.35 * min(repository_age_days / 730, 1.0)
++ 0.35 * clamp((repository_author_count - 1) / 9, 0.0, 1.0)
++ 0.15 * min(repository_file_count / 200, 1.0)
++ 0.15 * min(file_age_days / 365, 1.0)
+```
+
+File pressure uses non-ownership work and coordination signals:
+
+```text
+file_pressure =
+  0.35 * churn
++ 0.25 * recent_churn
++ 0.25 * coupling
++ 0.15 * size
+```
+
+The final normalized ownership-risk input is:
+
+```text
+ownership_risk =
+  base_concentration
+  * (0.20 + 0.80 * repository_maturity)
+  * (0.30 + 0.70 * file_pressure)
+```
 
 If `dominant_owner_share` is outside `0.0..=1.0`, it is clamped and records
 `dominant_owner_share_out_of_range`. If it is not finite, the owner-share
 component is omitted and records `invalid_dominant_owner_share`.
+
+See [Operational ownership](ownership.md) for the changed-line, recency, and
+sustained-activity model that produces `owner_count` and
+`dominant_owner_share`.
 
 ### Coupling
 
@@ -208,16 +256,19 @@ Current limitation codes produced by scoring normalization are:
 | `missing_recent_churn_lines` | Recent churn is unavailable. |
 | `missing_recent_growth_line_count` | Line count is unavailable for recent churn normalization. |
 | `zero_line_count_recent_growth` | Recent churn exists for a zero-line file, so recent churn saturates. |
-| `author_fragmentation_missing_owner_share` | Ownership uses author count only. |
-| `author_fragmentation_missing_author_count` | Ownership uses dominant owner share only, or is omitted if owner share is also unusable. |
-| `missing_author_fragmentation_metrics` | Neither author count nor dominant owner share is available. |
+| `ownership_risk_missing_owner_share` | Owner risk uses owner count only. |
+| `ownership_risk_missing_owner_count` | Owner risk uses dominant owner share only, or is omitted if owner share is also unusable. |
+| `missing_ownership_risk_metrics` | Neither owner count nor dominant owner share is available. |
+| `ownership_risk_missing_repository_age` | Repository age is unavailable, so maturity is lower. |
+| `ownership_risk_missing_repository_author_count` | Repository author count is unavailable, so maturity is lower. |
+| `ownership_risk_missing_repository_file_count` | Repository file count is unavailable, so maturity is lower. |
 | `invalid_dominant_owner_share` | Dominant owner share is not finite and is omitted. |
 | `dominant_owner_share_out_of_range` | Dominant owner share is clamped to `0.0..=1.0`. |
 | `missing_co_changed_file_count` | Co-change breadth is unavailable. |
 
 ## Limitations
 
-The v1 score intentionally uses a small set of local, explainable signals. Known
+The v3 score intentionally uses a small set of local, explainable signals. Known
 limitations include:
 
 - Scores are based on scanner facts and local Git history reachable from
@@ -230,19 +281,21 @@ limitations include:
   file touches.
 - Author identity is the exact commit author string. `.mailmap`, bot detection,
   case folding, domain normalization, and account merging are not applied.
+  Operational ownership filters drive-by history, but it does not infer teams or
+  review responsibility.
 - Binary changes or unavailable Git line statistics contribute `0` line churn.
   Scanner byte size can still provide a size fallback when line count is absent.
 - `commits_per_file` is preserved as raw context but is not a weighted term in
-  `hotpath.score.v1`.
+  `hotpath.score.v3`.
 - Although `hotpath parse` can extract parser-backed symbols and basic
   function/method complexity approximations for Rust, Go, TypeScript, and TSX,
-  `hotpath.score.v1` does not consume parser data.
+  `hotpath.score.v3` does not consume parser data.
 - The formula does not include parser-derived symbol coupling, resolved
   dependency edges, dependency fan-in/fan-out, test coverage, runtime
   incidents, ownership policy, or architectural rule checks.
-- Generated and vendor classifications are not part of the v1 weighted formula.
+- Generated and vendor classifications are not part of the v3 weighted formula.
 
-These general limitations are interpretation guidance for v1 scores. The CLI
+These general limitations are interpretation guidance for v3 scores. The CLI
 prints normalization limitations and calculation notes for specific score
 records, but a higher score still means "worth looking at sooner," not "bad
 code."

@@ -76,7 +76,7 @@ fn explain_reports_score_inputs_formula_contributions_and_persists_inputs() {
     assert!(
         stdout.contains("scope: current scanned file plus local Git history reachable from HEAD")
     );
-    assert!(stdout.contains("formula version: hotpath.score.v1 (major 1, minor 0)"));
+    assert!(stdout.contains("formula version: hotpath.score.v3 (major 3, minor 0)"));
     assert!(stdout.contains("final score:"));
     assert!(stdout.contains("\nraw metrics\n"));
     assert!(stdout.contains("  line count: 4"));
@@ -84,18 +84,19 @@ fn explain_reports_score_inputs_formula_contributions_and_persists_inputs() {
     assert!(stdout.contains("  total churn lines: 4"));
     assert!(stdout.contains("  recent churn lines (90 days): 2"));
     assert!(stdout.contains("  author count: 2"));
-    assert!(stdout.contains("  dominant owner share: 50.00%"));
+    assert!(stdout.contains("  owner count: 2"));
+    assert!(stdout.contains("  dominant owner share:"));
     assert!(stdout.contains("  co-changed file count: 1"));
     assert!(stdout.contains("\nnormalized metrics\n"));
     assert!(stdout.contains("  size:"));
     assert!(stdout.contains("  churn:"));
     assert!(stdout.contains("  recent_churn:"));
-    assert!(stdout.contains("  ownership:"));
+    assert!(stdout.contains("  ownership_risk:"));
     assert!(stdout.contains("  coupling:"));
     assert!(stdout.contains("\nweighted contributions\n"));
     assert!(stdout.contains("churn_score: weight 0.350 * churn"));
     assert!(stdout.contains("size_score: weight 0.200 * size"));
-    assert!(stdout.contains("author_fragmentation: weight 0.200 * ownership"));
+    assert!(stdout.contains("ownership_risk: weight 0.200 * ownership_risk"));
     assert!(stdout.contains("recent_growth: weight 0.150 * recent_churn"));
     assert!(stdout.contains("cochange_score: weight 0.100 * coupling"));
     assert!(stdout.contains("\nlimitations\n"));
@@ -145,7 +146,7 @@ fn explain_reports_score_inputs_formula_contributions_and_persists_inputs() {
     );
     assert!(persisted_hotspots
         .iter()
-        .all(|hotspot| hotspot.formula_version == "hotpath.score.v1"));
+        .all(|hotspot| hotspot.formula_version == "hotpath.score.v3"));
     let risky_raw_metrics = serde_json::from_str::<serde_json::Value>(
         persisted_hotspots[0]
             .raw_metrics_json
@@ -188,10 +189,11 @@ fn explain_reports_zero_git_metrics_for_untracked_existing_file() {
     assert!(stdout.contains("  total churn lines: 0"));
     assert!(stdout.contains("  recent churn lines (90 days): 0"));
     assert!(stdout.contains("  author count: 0"));
+    assert!(stdout.contains("  owner count: 0"));
     assert!(stdout.contains("  dominant owner share: unavailable"));
     assert!(stdout.contains("  co-changed file count: 0"));
     assert!(stdout.contains(
-        "dominant owner share is unavailable; author fragmentation uses author count only"
+        "dominant operational owner share is unavailable; owner risk uses owner count only"
     ));
     assert!(!contains_path(&stdout, fixture.path()));
 
@@ -284,7 +286,7 @@ fn explain_rejects_ambiguous_subdirectory_paths_without_persisting() {
     assert!(stderr.contains("'src/lib.rs'"));
     assert!(!stderr.contains("Hotpath score explanation"));
     assert!(!contains_path(&stderr, fixture.path()));
-    assert!(!fixture.path().join(".hotpath").exists());
+    assert!(!fixture.path().join(".hotpath").join("index.db").exists());
 }
 
 #[test]
@@ -304,7 +306,8 @@ fn explain_rejects_paths_outside_worktree_without_path_leaks() {
     assert!(stderr.starts_with("hotpath: requested path is outside the Git worktree"));
     assert!(!stderr.contains("Hotpath score explanation"));
     assert!(!contains_path(&stderr, fixture.path()));
-    assert!(!fixture.path().join(".hotpath").exists());
+    assert!(fixture.path().join(".hotpath").join("logs").exists());
+    assert!(!fixture.path().join(".hotpath").join("index.db").exists());
 }
 
 #[test]
@@ -333,7 +336,8 @@ fn explain_rejects_non_current_file_without_output_or_persistence() {
     assert!(stderr.contains("pass an existing file under the worktree"));
     assert!(!stderr.contains("Hotpath score explanation"));
     assert!(!contains_path(&stderr, fixture.path()));
-    assert!(!fixture.path().join(".hotpath").exists());
+    assert!(fixture.path().join(".hotpath").join("logs").exists());
+    assert!(!fixture.path().join(".hotpath").join("index.db").exists());
 }
 
 #[test]
@@ -347,7 +351,8 @@ fn explain_rejects_non_git_directory_without_output_or_path_leak() {
     assert!(stderr.contains("run explain from inside a repository"));
     assert!(!stderr.contains("Hotpath score explanation"));
     assert!(!contains_path(&stderr, fixture.path()));
-    assert!(!fixture.path().join(".hotpath").exists());
+    assert!(fixture.path().join(".hotpath").join("logs").exists());
+    assert!(!fixture.path().join(".hotpath").join("index.db").exists());
 }
 
 #[test]
@@ -361,7 +366,8 @@ fn explain_rejects_missing_head_without_output_or_path_leak() {
     assert!(stderr.contains("create an initial commit before explaining hotspot scores"));
     assert!(!stderr.contains("Hotpath score explanation"));
     assert!(!contains_path(&stderr, fixture.path()));
-    assert!(!fixture.path().join(".hotpath").exists());
+    assert!(fixture.path().join(".hotpath").join("logs").exists());
+    assert!(!fixture.path().join(".hotpath").join("index.db").exists());
 }
 
 #[test]
@@ -387,7 +393,8 @@ fn explain_rejects_shallow_repository_without_output_or_path_leak() {
     assert!(stderr.contains("fetch complete local history"));
     assert!(!stderr.contains("Hotpath score explanation"));
     assert!(!contains_path(&stderr, fixture.path()));
-    assert!(!fixture.path().join(".hotpath").exists());
+    assert!(fixture.path().join(".hotpath").join("logs").exists());
+    assert!(!fixture.path().join(".hotpath").join("index.db").exists());
 }
 
 #[test]

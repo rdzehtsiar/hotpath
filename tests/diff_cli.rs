@@ -140,11 +140,11 @@ fn diff_success_persists_scan_git_analysis_and_hotspots() {
             .iter()
             .map(|hotspot| (hotspot.rank, hotspot.path.as_str()))
             .collect::<Vec<_>>(),
-        vec![(1, "src/risky.rs"), (2, "src/new.rs"), (3, "src/stable.rs"),]
+        vec![(1, "src/risky.rs"), (2, "src/stable.rs"), (3, "src/new.rs"),]
     );
     assert!(persisted_hotspots
         .iter()
-        .all(|hotspot| hotspot.formula_version == "hotpath.score.v1"));
+        .all(|hotspot| hotspot.formula_version == "hotpath.score.v3"));
 }
 
 #[test]
@@ -267,7 +267,8 @@ fn diff_rejects_non_git_directory_without_report_output_or_index_creation() {
     assert!(stderr.contains("run diff analysis from inside a repository"));
     assert!(!stderr.contains("Hotpath diff risk"));
     assert!(!contains_path(&stderr, fixture.path()));
-    assert!(!fixture.path().join(".hotpath").exists());
+    assert!(fixture.path().join(".hotpath").join("logs").exists());
+    assert!(!fixture.path().join(".hotpath").join("index.db").exists());
 }
 
 #[test]
@@ -281,7 +282,8 @@ fn diff_rejects_missing_head_without_report_output_or_index_creation() {
     assert!(stderr.contains("create an initial commit before analyzing a diff"));
     assert!(!stderr.contains("Hotpath diff risk"));
     assert!(!contains_path(&stderr, fixture.path()));
-    assert!(!fixture.path().join(".hotpath").exists());
+    assert!(fixture.path().join(".hotpath").join("logs").exists());
+    assert!(!fixture.path().join(".hotpath").join("index.db").exists());
 }
 
 #[test]
@@ -307,7 +309,8 @@ fn diff_rejects_shallow_repository_without_report_output_or_index_creation() {
     assert!(stderr.contains("fetch complete local history"));
     assert!(!stderr.contains("Hotpath diff risk"));
     assert!(!contains_path(&stderr, fixture.path()));
-    assert!(!fixture.path().join(".hotpath").exists());
+    assert!(fixture.path().join(".hotpath").join("logs").exists());
+    assert!(!fixture.path().join(".hotpath").join("index.db").exists());
 }
 
 fn numbered_lines(prefix: &str, count: usize) -> String {
@@ -360,20 +363,38 @@ fn assert_no_path_leaks_in_json(value: &Value, fixture_path: &Path) {
 }
 
 fn collect_json_strings<'a>(value: &'a Value, strings: &mut Vec<&'a str>) {
-    match value {
-        Value::String(text) => strings.push(text),
-        Value::Array(values) => {
-            for value in values {
-                collect_json_strings(value, strings);
+    let mut stack = vec![value];
+
+    while let Some(value) = stack.pop() {
+        match value {
+            Value::String(text) => strings.push(text),
+            Value::Array(values) => {
+                for value in values.iter().rev() {
+                    stack.push(value);
+                }
             }
-        }
-        Value::Object(values) => {
-            for value in values.values() {
-                collect_json_strings(value, strings);
+            Value::Object(values) => {
+                let values = values.values().collect::<Vec<_>>();
+                for value in values.into_iter().rev() {
+                    stack.push(value);
+                }
             }
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
         }
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
+}
+
+#[test]
+fn json_string_collection_handles_deep_json_iteratively() {
+    let mut value = Value::String("needle".to_owned());
+    for _ in 0..2_000 {
+        value = Value::Array(vec![value]);
+    }
+    let mut strings = Vec::new();
+
+    collect_json_strings(&value, &mut strings);
+
+    assert_eq!(strings, vec!["needle"]);
 }
 
 fn contains_path(output: &str, path: &Path) -> bool {

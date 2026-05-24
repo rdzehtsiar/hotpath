@@ -94,9 +94,9 @@ fn explain_git_reports_file_metrics_and_ranked_co_changes() {
     assert!(stdout.contains("  total churn: 5 added, 1 deleted, 6 combined"));
     assert!(stdout.contains("  recent churn (90 days): 3 added, 1 deleted, 4 combined"));
     assert!(stdout.contains("  author count: 2"));
-    assert!(stdout.contains(
-        "  dominant owner: Ada Lovelace <ada@example.invalid> (66.67% of file-touching commits)"
-    ));
+    assert!(stdout.contains("  owner count: 2"));
+    assert!(stdout.contains("  dominant owner: Ada Lovelace <ada@example.invalid>"));
+    assert!(stdout.contains("weighted operational ownership"));
     assert!(stdout.contains("  file age: 100 days"));
     assert!(stdout.contains("\nco-changes\n  2  src/alpha.rs\n  2  src/beta.rs"));
     assert!(stdout.contains("\ncalculation notes\n"));
@@ -233,7 +233,7 @@ fn explain_git_rejects_ambiguous_subdirectory_paths_without_persisting() {
     assert!(stderr.contains("'src/lib.rs'"));
     assert!(!stderr.contains("raw metrics"));
     assert!(!contains_path(&stderr, fixture.path()));
-    assert!(!fixture.path().join(".hotpath").exists());
+    assert!(!fixture.path().join(".hotpath").join("index.db").exists());
 }
 
 #[test]
@@ -257,6 +257,7 @@ fn explain_git_reports_zero_metrics_for_existing_file_without_history() {
     assert!(stdout.contains("  total churn: 0 added, 0 deleted, 0 combined"));
     assert!(stdout.contains("  recent churn (90 days): 0 added, 0 deleted, 0 combined"));
     assert!(stdout.contains("  author count: 0"));
+    assert!(stdout.contains("  owner count: 0"));
     assert!(stdout.contains("  dominant owner: unavailable"));
     assert!(stdout.contains("  first observed commit: unavailable"));
     assert!(stdout.contains("  last observed commit: unavailable"));
@@ -318,7 +319,8 @@ fn explain_git_rejects_non_git_directory_without_metric_output_or_path_leak() {
     assert!(stderr.starts_with("hotpath: path is not a readable Git worktree"));
     assert!(!stderr.contains("raw metrics"));
     assert!(!contains_path(&stderr, fixture.path()));
-    assert!(!fixture.path().join(".hotpath").exists());
+    assert!(fixture.path().join(".hotpath").join("logs").exists());
+    assert!(!fixture.path().join(".hotpath").join("index.db").exists());
 }
 
 #[test]
@@ -332,7 +334,8 @@ fn explain_git_rejects_missing_head_without_metric_output_or_path_leak() {
     assert!(stderr.contains("create an initial commit before analyzing history"));
     assert!(!stderr.contains("raw metrics"));
     assert!(!contains_path(&stderr, fixture.path()));
-    assert!(!fixture.path().join(".hotpath").exists());
+    assert!(fixture.path().join(".hotpath").join("logs").exists());
+    assert!(!fixture.path().join(".hotpath").join("index.db").exists());
 }
 
 #[test]
@@ -359,7 +362,8 @@ fn explain_git_rejects_shallow_repository_before_output_or_persistence() {
     assert!(!stderr.contains("Hotpath Git explanation"));
     assert!(!stderr.contains("raw metrics"));
     assert!(!contains_path(&stderr, fixture.path()));
-    assert!(!fixture.path().join(".hotpath").exists());
+    assert!(fixture.path().join(".hotpath").join("logs").exists());
+    assert!(!fixture.path().join(".hotpath").join("index.db").exists());
 }
 
 fn contains_path(output: &str, path: &Path) -> bool {

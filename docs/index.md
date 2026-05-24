@@ -31,10 +31,20 @@ doctor` can inspect this location, but it does not create a missing index.
 The `.hotpath/index.db` file is local working data, not a portable report
 format. Users should not commit it, share it, or edit it by hand.
 
+Hotpath also writes bounded local operation logs under:
+
+```text
+.hotpath/logs/
+```
+
+These JSONL logs are troubleshooting breadcrumbs for command runs. They are
+local derived data, not telemetry, and should not be committed. Hotpath keeps
+only the latest 20 run logs, and each log is capped at 10 MiB.
+
 ## Current Schema
 
-The current SQLite schema version is `2`. The index also stores the schema
-identifier `hotpath.index.v2` in metadata. Hotpath rejects indexes with missing,
+The current SQLite schema version is `3`. The index also stores the schema
+identifier `hotpath.index.v3` in metadata. Hotpath rejects indexes with missing,
 unknown, malformed, corrupt, or future schema metadata instead of reading them
 best-effort.
 
@@ -113,8 +123,9 @@ after successful local history analysis:
 
 - Git analysis metadata, including analyzer version, `HEAD` commit id, `HEAD`
   committer timestamp, recent churn window, and observed row counts
-- per-file Git metrics such as commit count, total churn, recent churn, author
-  count, dominant owner/share, first/last observed commits, and file age
+- per-file Git metrics such as commit count, total churn, recent churn, exact
+  author count, compact operational owner count, dominant operational
+  owner/share, first/last observed commits, and file age
 - co-change pairs with deterministic left/right repository-relative paths and
   commit counts
 
@@ -123,7 +134,7 @@ They inherit the limitations documented in [Git metric semantics](git-metrics.md
 including conservative rename handling, first-parent merge diffs, rejection of
 shallow history, exact author identity matching, binary line churn limits, and
 timestamp skew. Generated and vendor scanner flags are stored separately from
-Git metrics; index v2 does not imply those paths are excluded from Git-derived
+Git metrics; index v3 does not imply those paths are excluded from Git-derived
 rows.
 
 Currently populated by `hotpath hotspots`, `hotpath explain`, `hotpath report`,
@@ -201,7 +212,7 @@ succeeds and reports a healthy index:
 ```text
 Hotpath doctor
 index path: .hotpath/index.db
-schema version: 2
+schema version: 3
 readable: yes
 health: healthy
 ```

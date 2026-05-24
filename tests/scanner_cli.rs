@@ -105,7 +105,7 @@ fn expected_doctor_stdout() -> &'static str {
     concat!(
         "Hotpath doctor\n",
         "index path: .hotpath/index.db\n",
-        "schema version: 2\n",
+        "schema version: 3\n",
         "readable: yes\n",
         "health: healthy\n",
     )
@@ -325,26 +325,46 @@ fn collect_json_path_leaks(
     needles: &[String],
     leaks: &mut Vec<(String, String)>,
 ) {
-    match value {
-        Value::String(text) => {
-            let text = comparable_path_string(text);
+    let mut stack = vec![(value, location.to_owned())];
 
-            if needles.iter().any(|needle| text.contains(needle)) {
-                leaks.push((location.to_owned(), text));
+    while let Some((value, location)) = stack.pop() {
+        match value {
+            Value::String(text) => {
+                let text = comparable_path_string(text);
+
+                if needles.iter().any(|needle| text.contains(needle)) {
+                    leaks.push((location, text));
+                }
             }
-        }
-        Value::Array(items) => {
-            for (index, item) in items.iter().enumerate() {
-                collect_json_path_leaks(item, &format!("{location}[{index}]"), needles, leaks);
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate().rev() {
+                    stack.push((item, format!("{location}[{index}]")));
+                }
             }
-        }
-        Value::Object(entries) => {
-            for (key, item) in entries {
-                collect_json_path_leaks(item, &format!("{location}.{key}"), needles, leaks);
+            Value::Object(entries) => {
+                let entries = entries.iter().collect::<Vec<_>>();
+                for (key, item) in entries.into_iter().rev() {
+                    stack.push((item, format!("{location}.{key}")));
+                }
             }
+            Value::Bool(_) | Value::Number(_) | Value::Null => {}
         }
-        Value::Bool(_) | Value::Number(_) | Value::Null => {}
     }
+}
+
+#[test]
+fn json_path_leak_collection_handles_deep_json_iteratively() {
+    let mut value = Value::String("needle".to_owned());
+    for _ in 0..2_000 {
+        value = Value::Array(vec![value]);
+    }
+    let needles = vec!["needle".to_owned()];
+    let mut leaks = Vec::new();
+
+    collect_json_path_leaks(&value, "$", &needles, &mut leaks);
+
+    assert_eq!(leaks.len(), 1);
+    assert_eq!(leaks[0].1, "needle");
 }
 
 #[cfg(windows)]
@@ -388,6 +408,7 @@ fn create_symlink_or_skip(
 #[test]
 fn doctor_reports_missing_index_without_initializing() {
     let fixture = Fixture::new("doctor-missing");
+    git2::Repository::init(&fixture.path).expect("fixture git repository should initialize");
 
     assert!(!fixture.path.join(".hotpath").exists());
 
@@ -395,6 +416,7 @@ fn doctor_reports_missing_index_without_initializing() {
 
     assert_eq!(stdout, expected_missing_doctor_stdout());
     assert!(!stdout.contains("health: healthy"));
+    assert!(fixture.path.join(".hotpath").join("logs").exists());
     assert!(!fixture.path.join(".hotpath").join("index.db").exists());
 }
 

@@ -253,11 +253,11 @@ fn render_markdown_hotspots(output: &mut String, report: &Report) {
         return;
     }
 
-    output.push_str("| Rank | Path | Score | Risk /10 | Commits | Churn lines | Recent churn | Authors | Co-changed files |\n");
-    output.push_str("| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    output.push_str("| Rank | Path | Score | Risk /10 | Commits | Churn lines | Recent churn | Authors | Owners | Co-changed files |\n");
+    output.push_str("| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
     for hotspot in report.hotspots.iter().take(10) {
         output.push_str(&format!(
-            "| {} | {} | {:.3} | {:.1} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {:.3} | {:.1} | {} | {} | {} | {} | {} | {} |\n",
             hotspot.rank,
             markdown_code_span(&hotspot.path),
             hotspot.score,
@@ -266,6 +266,7 @@ fn render_markdown_hotspots(output: &mut String, report: &Report) {
             optional_u64(hotspot.raw_metrics.total_churn_lines),
             optional_u64(hotspot.raw_metrics.recent_churn_lines),
             optional_u64(hotspot.raw_metrics.author_count),
+            optional_u64(hotspot.raw_metrics.owner_count),
             optional_u64(hotspot.raw_metrics.co_changed_file_count)
         ));
     }
@@ -427,10 +428,10 @@ fn render_html_hotspots(output: &mut String, report: &Report) {
         return;
     }
 
-    output.push_str("<table>\n<thead><tr><th class=\"numeric\">Rank</th><th>Path</th><th class=\"numeric\">Score</th><th class=\"numeric\">Risk /10</th><th class=\"numeric\">Commits</th><th class=\"numeric\">Churn lines</th><th class=\"numeric\">Recent churn</th><th class=\"numeric\">Authors</th><th class=\"numeric\">Co-changed files</th></tr></thead>\n<tbody>\n");
+    output.push_str("<table>\n<thead><tr><th class=\"numeric\">Rank</th><th>Path</th><th class=\"numeric\">Score</th><th class=\"numeric\">Risk /10</th><th class=\"numeric\">Commits</th><th class=\"numeric\">Churn lines</th><th class=\"numeric\">Recent churn</th><th class=\"numeric\">Authors</th><th class=\"numeric\">Owners</th><th class=\"numeric\">Co-changed files</th></tr></thead>\n<tbody>\n");
     for hotspot in report.hotspots.iter().take(10) {
         output.push_str(&format!(
-            "<tr><td class=\"numeric\">{}</td><td>{}</td><td class=\"numeric\">{:.3}</td><td class=\"numeric\">{:.1}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td></tr>\n",
+            "<tr><td class=\"numeric\">{}</td><td>{}</td><td class=\"numeric\">{:.3}</td><td class=\"numeric\">{:.1}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td></tr>\n",
             hotspot.rank,
             html_escape(&hotspot.path),
             hotspot.score,
@@ -439,6 +440,7 @@ fn render_html_hotspots(output: &mut String, report: &Report) {
             optional_u64(hotspot.raw_metrics.total_churn_lines),
             optional_u64(hotspot.raw_metrics.recent_churn_lines),
             optional_u64(hotspot.raw_metrics.author_count),
+            optional_u64(hotspot.raw_metrics.owner_count),
             optional_u64(hotspot.raw_metrics.co_changed_file_count)
         ));
     }
@@ -666,11 +668,7 @@ fn build_report_and_persist(
         )
         .map_err(ReportCommandError::PersistGitAnalysis)?;
 
-    let ranked = crate::ranked_hotspot_scores_from_scan_and_git(
-        &scan.files,
-        &analysis.file_metrics,
-        &analysis.co_changes,
-    );
+    let ranked = crate::ranked_hotspot_scores_from_scan_and_git(&scan.files, &analysis);
     index
         .persist_hotspots(scan_run.id, &ranked)
         .map_err(ReportCommandError::PersistHotspots)?;

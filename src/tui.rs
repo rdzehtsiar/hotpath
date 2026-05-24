@@ -16,13 +16,15 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 use ratatui::{Frame, Terminal};
 
 use crate::complexity::{self, ComplexityReport, ComplexitySummary, ComplexitySymbolRecord};
 use crate::dependency::{self, FileDependencyFan, ResolvedDependencyEdge};
 use crate::git;
+use crate::ownership::OperationalOwnershipSnapshot;
 use crate::report::{self, Report, ReportFinding, ReportHotspot};
+use crate::scoring::{NormalizedMetric, WeightedTerm};
 use crate::storage;
 use crate::{
     estimate_context, parse, ranked_hotspot_scores_from_scan_and_git, ContextBudgetStatus,
@@ -35,6 +37,7 @@ type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TuiOptions {
     pub context: ContextOptions,
+    pub include_generated_hotspots: bool,
     pub ascii: bool,
     pub no_color: bool,
 }
@@ -56,6 +59,7 @@ pub struct TuiSnapshot {
     pub symbols: TuiSymbolSnapshot,
     pub complexity: TuiComplexitySnapshot,
     pub coupling: TuiCouplingSnapshot,
+    pub ownership: TuiOwnershipSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +94,24 @@ pub struct TuiFileFan {
     pub fan_out: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TuiOwnershipSnapshot {
+    pub by_file: Vec<TuiFileOwnership>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TuiFileOwnership {
+    pub path: String,
+    pub owners: Vec<TuiOwnerShare>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TuiOwnerShare {
+    pub author: String,
+    pub touch_count: u64,
+    pub share: f64,
+}
+
 #[derive(Debug)]
 pub enum TuiSnapshotError {
     CurrentDir(io::Error),
@@ -112,11 +134,7 @@ impl TuiSnapshot {
         let scan = crate::scan_repository(&analysis.worktree_root)?;
         let parse = parse::report_from_scan(&analysis.worktree_root, &scan);
         let complexity = complexity::report_from_parse(&parse);
-        let ranked = ranked_hotspot_scores_from_scan_and_git(
-            &scan.files,
-            &analysis.file_metrics,
-            &analysis.co_changes,
-        );
+        let ranked = ranked_hotspot_scores_from_scan_and_git(&scan.files, &analysis);
         let context = estimate_context(&scan.files, options.context);
         let hotspots = ranked.iter().map(ReportHotspot::from).collect::<Vec<_>>();
         let findings = hotspots.iter().map(ReportFinding::from).collect::<Vec<_>>();
@@ -141,10 +159,16 @@ impl TuiSnapshot {
         index
             .persist_hotspots(scan_run.id, &ranked)
             .map_err(TuiSnapshotError::PersistHotspots)?;
-        let report =
+        let mut report =
             report::report_from_scan_analysis(&scan, &analysis, context, hotspots, findings);
+        if !options.include_generated_hotspots {
+            suppress_generated_hotspots(&scan.files, &mut report);
+        }
 
-        Ok(Self::from_parts(report, scan, parse, complexity))
+        let mut snapshot = Self::from_parts(report, scan, parse, complexity);
+        snapshot.ownership = TuiOwnershipSnapshot::from_operational_ownership(&analysis.ownership);
+
+        Ok(snapshot)
     }
 
     pub fn from_parts(
@@ -162,7 +186,42 @@ impl TuiSnapshot {
             symbols: TuiSymbolSnapshot::from_parse(parse),
             complexity: TuiComplexitySnapshot::from_complexity(complexity),
             coupling: TuiCouplingSnapshot::from_dependency_facts(edges, fan.by_path),
+            ownership: TuiOwnershipSnapshot::default(),
         }
+    }
+}
+
+impl TuiOwnershipSnapshot {
+    fn from_operational_ownership(ownership: &OperationalOwnershipSnapshot) -> Self {
+        let by_file = ownership
+            .by_file
+            .iter()
+            .map(|file| {
+                let mut owners = file
+                    .owners
+                    .iter()
+                    .map(|owner| TuiOwnerShare {
+                        author: owner.author.clone(),
+                        touch_count: owner.meaningful_commits,
+                        share: owner.share,
+                    })
+                    .collect::<Vec<_>>();
+                if file.others_share > 0.0 {
+                    owners.push(TuiOwnerShare {
+                        author: "others".to_owned(),
+                        touch_count: 1,
+                        share: file.others_share,
+                    });
+                }
+
+                TuiFileOwnership {
+                    path: file.path.clone(),
+                    owners,
+                }
+            })
+            .collect();
+
+        Self { by_file }
     }
 }
 
@@ -259,6 +318,48 @@ fn sorted_report(mut report: Report) -> Report {
     report
 }
 
+fn suppress_generated_hotspots(files: &[FileRecord], report: &mut Report) {
+    report.hotspots.retain(|hotspot| {
+        files
+            .iter()
+            .find(|file| file.path == hotspot.path)
+            .is_none_or(|file| !is_suppressed_hotspot_file(file))
+    });
+    for (index, hotspot) in report.hotspots.iter_mut().enumerate() {
+        hotspot.rank = index as u64 + 1;
+    }
+    report.summary.hotspot_count = report.hotspots.len() as u64;
+    report.findings = report.hotspots.iter().map(ReportFinding::from).collect();
+}
+
+fn is_suppressed_hotspot_file(file: &FileRecord) -> bool {
+    file.is_generated
+        || file.is_vendor
+        || is_lockfile_path(&file.path)
+        || is_minified_path(&file.path)
+}
+
+fn is_lockfile_path(path: &str) -> bool {
+    matches!(
+        path.rsplit('/').next().unwrap_or(path),
+        "Cargo.lock"
+            | "package-lock.json"
+            | "yarn.lock"
+            | "pnpm-lock.yaml"
+            | "bun.lockb"
+            | "Gemfile.lock"
+            | "poetry.lock"
+            | "Pipfile.lock"
+            | "composer.lock"
+            | "go.sum"
+            | "flake.lock"
+    )
+}
+
+fn is_minified_path(path: &str) -> bool {
+    path.rsplit('/').next().unwrap_or(path).contains(".min.")
+}
+
 impl fmt::Display for TuiSnapshotError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -348,7 +449,14 @@ const PRIMARY_VIEWS: [TuiView; 4] = [
     TuiView::ContextBudgeting,
 ];
 const METRIC_BAR_WIDTH: usize = 14;
-const METRIC_LABEL_WIDTH: usize = 10;
+const METRIC_LABEL_WIDTH: usize = 12;
+const HOTSPOT_SELECTOR_WIDTH: usize = 2;
+const HOTSPOT_SCORE_WIDTH: usize = 4;
+const HOTSPOT_DEFAULT_TAG_WIDTH: usize = 22;
+const HOTSPOT_NARROW_TAG_WIDTH: usize = 12;
+const HOTSPOT_MIN_PATH_WIDTH: usize = 8;
+const HOTSPOT_TAG_SEPARATOR: &str = " \u{00B7} ";
+const OWNER_NAME_WIDTH: usize = 24;
 
 impl TuiView {
     fn title(self) -> &'static str {
@@ -1111,8 +1219,11 @@ fn coupling_graph_file_rows(snapshot: &TuiSnapshot, path: &str) -> Vec<String> {
             "Matched current file: {}",
             file_for_path(snapshot, path).is_some()
         ),
-        format!("Fan-in: {}", fan.map_or(0, |fan| fan.fan_in)),
-        format!("Fan-out: {}", fan.map_or(0, |fan| fan.fan_out)),
+        format!(
+            "Coupling: {} dependencies, {} dependents",
+            fan.map_or(0, |fan| fan.fan_out),
+            fan.map_or(0, |fan| fan.fan_in)
+        ),
     ];
 
     rows.push("Incoming edges:".to_owned());
@@ -1153,11 +1264,11 @@ fn coupling_graph_overview_rows(snapshot: &TuiSnapshot) -> Vec<String> {
         return rows;
     }
 
-    rows.push("Files by fan-in/fan-out:".to_owned());
+    rows.push("Files by coupling:".to_owned());
     rows.extend(snapshot.coupling.fan_by_file.iter().map(|fan| {
         format!(
-            "File: {} fan-in {} fan-out {}",
-            fan.path, fan.fan_in, fan.fan_out
+            "File: {} dependencies {} dependents {}",
+            fan.path, fan.fan_out, fan.fan_in
         )
     }));
 
@@ -1230,6 +1341,18 @@ struct RepoTreeNode {
     file_path: Option<String>,
 }
 
+impl Drop for RepoTreeNode {
+    fn drop(&mut self) {
+        let mut children = std::mem::take(&mut self.children)
+            .into_values()
+            .collect::<Vec<_>>();
+
+        while let Some(mut child) = children.pop() {
+            children.extend(std::mem::take(&mut child.children).into_values());
+        }
+    }
+}
+
 fn repo_tree_rows(snapshot: &TuiSnapshot) -> Vec<RepoTreeRow> {
     let mut root = RepoTreeNode::default();
     for file in &snapshot.scan.files {
@@ -1256,29 +1379,49 @@ fn insert_repo_tree_path(root: &mut RepoTreeNode, path: &str) {
     node.file_path = Some(path.to_owned());
 }
 
-fn append_repo_tree_rows(node: &RepoTreeNode, depth: usize, rows: &mut Vec<RepoTreeRow>) {
-    let (dirs, files): (Vec<_>, Vec<_>) = node
-        .children
-        .iter()
-        .partition(|(_, child)| child.file_path.is_none());
+enum RepoTreeFrame<'a> {
+    Children(&'a RepoTreeNode, usize),
+    Directory(&'a str, &'a RepoTreeNode, usize),
+    File(&'a RepoTreeNode, usize),
+}
 
-    for (name, child) in dirs {
-        let path = repo_tree_display_path(child);
-        rows.push(RepoTreeRow {
-            path,
-            text: format!("{}[dir] {name}/", "  ".repeat(depth)),
-            is_file: false,
-        });
-        append_repo_tree_rows(child, depth + 1, rows);
-    }
+fn append_repo_tree_rows(root: &RepoTreeNode, depth: usize, rows: &mut Vec<RepoTreeRow>) {
+    let mut stack = vec![RepoTreeFrame::Children(root, depth)];
 
-    for (_name, child) in files {
-        if let Some(path) = &child.file_path {
-            rows.push(RepoTreeRow {
-                path: path.clone(),
-                text: format!("{}[file] {path}", "  ".repeat(depth)),
-                is_file: true,
-            });
+    while let Some(frame) = stack.pop() {
+        match frame {
+            RepoTreeFrame::Children(node, depth) => {
+                let (dirs, files): (Vec<_>, Vec<_>) = node
+                    .children
+                    .iter()
+                    .partition(|(_, child)| child.file_path.is_none());
+
+                for (_name, child) in files.into_iter().rev() {
+                    stack.push(RepoTreeFrame::File(child, depth));
+                }
+
+                for (name, child) in dirs.into_iter().rev() {
+                    stack.push(RepoTreeFrame::Directory(name, child, depth));
+                }
+            }
+            RepoTreeFrame::Directory(name, child, depth) => {
+                let path = repo_tree_display_path(child);
+                rows.push(RepoTreeRow {
+                    path,
+                    text: format!("{}[dir] {name}/", "  ".repeat(depth)),
+                    is_file: false,
+                });
+                stack.push(RepoTreeFrame::Children(child, depth + 1));
+            }
+            RepoTreeFrame::File(child, depth) => {
+                if let Some(path) = &child.file_path {
+                    rows.push(RepoTreeRow {
+                        path: path.clone(),
+                        text: format!("{}[file] {path}", "  ".repeat(depth)),
+                        is_file: true,
+                    });
+                }
+            }
         }
     }
 }
@@ -1340,12 +1483,8 @@ fn git_detail_rows(snapshot: &TuiSnapshot, path: &str) -> Vec<String> {
         format!("File: {path}"),
         format!("Commits: {}", optional_u64(raw.commits_per_file)),
         format!("Total churn lines: {}", optional_u64(raw.total_churn_lines)),
-        format!(
-            "Recent churn lines ({} days): {}",
-            snapshot.report.summary.git.recent_window_days,
-            optional_u64(raw.recent_churn_lines)
-        ),
-        format!("Author count: {}", optional_u64(raw.author_count)),
+        format!("Contributors: {}", optional_u64(raw.author_count)),
+        format!("Owners: {}", optional_u64(raw.owner_count)),
         format!(
             "Dominant ownership: {}",
             optional_percent(raw.dominant_owner_share)
@@ -1396,10 +1535,10 @@ fn raw_metric_rows(hotspot: &ReportHotspot) -> Vec<String> {
         format!("commits {}", optional_u64(raw.commits_per_file)),
         format!("total churn lines {}", optional_u64(raw.total_churn_lines)),
         format!(
-            "recent churn lines {}",
-            optional_u64(raw.recent_churn_lines)
+            "authors {}  owners {}",
+            optional_u64(raw.author_count),
+            optional_u64(raw.owner_count)
         ),
-        format!("authors {}", optional_u64(raw.author_count)),
         format!(
             "dominant ownership {}",
             optional_percent(raw.dominant_owner_share)
@@ -1520,6 +1659,14 @@ fn fan_for_path<'a>(snapshot: &'a TuiSnapshot, path: &str) -> Option<&'a TuiFile
         .fan_by_file
         .iter()
         .find(|fan| fan.path == path)
+}
+
+fn ownership_for_path<'a>(snapshot: &'a TuiSnapshot, path: &str) -> Option<&'a TuiFileOwnership> {
+    snapshot
+        .ownership
+        .by_file
+        .iter()
+        .find(|ownership| ownership.path == path)
 }
 
 fn incoming_edges_for_path<'a>(
@@ -1672,9 +1819,9 @@ struct DisplayRow {
 
 #[derive(Debug, Clone, PartialEq)]
 struct DisplayHotspotRow {
-    rank: u64,
     path: String,
     score: f64,
+    tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1692,6 +1839,42 @@ enum TuiLayoutMode {
     Wide,
     Medium,
     Narrow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuiSizeBand {
+    Small,
+    Medium,
+    Large,
+    VeryLarge,
+}
+
+impl TuiSizeBand {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Small => "SMALL",
+            Self::Medium => "MEDIUM",
+            Self::Large => "LARGE",
+            Self::VeryLarge => "VERY LARGE",
+        }
+    }
+
+    fn bar_value(self) -> f64 {
+        match self {
+            Self::Small => 0.20,
+            Self::Medium => 0.40,
+            Self::Large => 0.60,
+            Self::VeryLarge => 0.80,
+        }
+    }
+
+    fn severity(self) -> TuiSeverity {
+        match self {
+            Self::Small => TuiSeverity::Low,
+            Self::Medium | Self::Large => TuiSeverity::Medium,
+            Self::VeryLarge => TuiSeverity::High,
+        }
+    }
 }
 
 fn layout_mode(area: Rect) -> TuiLayoutMode {
@@ -1743,9 +1926,9 @@ fn hotspot_display_row(snapshot: &TuiSnapshot, text: String) -> DisplayRow {
 
     DisplayRow {
         hotspot: hotspot.map(|hotspot| DisplayHotspotRow {
-            rank: hotspot.rank,
             path: hotspot.path.clone(),
             score: hotspot.score,
+            tags: hotspot_driver_tags(snapshot, hotspot),
         }),
         label: String::new(),
         text,
@@ -1894,9 +2077,9 @@ fn render_with_options(
     let [header, body, footer] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(4),
             Constraint::Min(10),
-            Constraint::Length(2),
+            Constraint::Length(1),
         ])
         .areas(area);
     let rows = display_rows(snapshot, state);
@@ -1929,7 +2112,13 @@ fn render_header(
     let path = state.current_path().unwrap_or("repo");
     let title_style = style(options, TuiSeverity::Low).add_modifier(Modifier::BOLD);
     let muted = style(options, TuiSeverity::Muted);
+    let nav = navigation_line(state, options);
     let header = Paragraph::new(vec![
+        nav,
+        Line::styled(
+            horizontal_rule(area.width, options),
+            style(options, TuiSeverity::Muted),
+        ),
         Line::from(vec![
             Span::styled("Hotpath", title_style),
             Span::raw("  "),
@@ -1953,13 +2142,12 @@ fn render_header(
                     "{} files  {} hotspots  {} tokens",
                     snapshot.scan.summary.total_files,
                     snapshot.report.summary.hotspot_count,
-                    snapshot.report.summary.context_estimated_tokens
+                    format_compact_count(snapshot.report.summary.context_estimated_tokens)
                 ),
                 muted,
             ),
         ]),
-    ])
-    .block(Block::default().borders(Borders::BOTTOM));
+    ]);
 
     frame.render_widget(header, area);
 }
@@ -1972,17 +2160,7 @@ fn render_wide_body(
     rows: &[DisplayRow],
     options: TuiOptions,
 ) {
-    let [nav, main, inspector] = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(22),
-            Constraint::Percentage(58),
-            Constraint::Percentage(42),
-        ])
-        .areas(area);
-    render_nav(frame, nav, state, options);
-    render_main_panel(frame, main, snapshot, state, rows, options);
-    render_inspector(frame, inspector, snapshot, state, rows, options);
+    render_joined_body(frame, area, snapshot, state, rows, [62, 38], options);
 }
 
 fn render_medium_body(
@@ -1993,17 +2171,7 @@ fn render_medium_body(
     rows: &[DisplayRow],
     options: TuiOptions,
 ) {
-    let [tabs, content] = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(8)])
-        .areas(area);
-    render_tabs(frame, tabs, state, options);
-    let [main, inspector] = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
-        .areas(content);
-    render_main_panel(frame, main, snapshot, state, rows, options);
-    render_inspector(frame, inspector, snapshot, state, rows, options);
+    render_joined_body(frame, area, snapshot, state, rows, [64, 36], options);
 }
 
 fn render_narrow_body(
@@ -2014,59 +2182,138 @@ fn render_narrow_body(
     rows: &[DisplayRow],
     options: TuiOptions,
 ) {
-    let [tabs, main] = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(8)])
-        .areas(area);
-    render_tabs(frame, tabs, state, options);
-    render_main_panel(frame, main, snapshot, state, rows, options);
+    render_main_panel(frame, area, snapshot, state, rows, options);
 }
 
-fn render_nav(frame: &mut Frame<'_>, area: Rect, state: &TuiAppState, options: TuiOptions) {
-    let lines = PRIMARY_VIEWS
-        .iter()
-        .enumerate()
-        .map(|(index, view)| {
-            let active = *view == state.current_view;
-            let marker = if active { ">" } else { " " };
-            let style = if active {
-                style(options, TuiSeverity::Medium).add_modifier(Modifier::BOLD)
-            } else {
-                style(options, TuiSeverity::Muted)
-            };
-            Line::from(vec![Span::styled(
-                format!("{marker} {} {}", index + 1, view.title()),
-                style,
-            )])
-        })
-        .collect::<Vec<_>>();
-    let block = panel_block("Navigate", state.pane_focus == TuiPaneFocus::Nav, options);
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+fn navigation_line(state: &TuiAppState, options: TuiOptions) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, view) in PRIMARY_VIEWS.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let active = *view == state.current_view;
+        let label = if active {
+            format!("[{} {}]", index + 1, view.title())
+        } else {
+            format!("{} {}", index + 1, view.title())
+        };
+        let mut view_style = if active {
+            style(options, TuiSeverity::Medium).add_modifier(Modifier::BOLD)
+        } else {
+            style(options, TuiSeverity::Muted)
+        };
+        if state.pane_focus == TuiPaneFocus::Nav {
+            view_style = view_style.add_modifier(Modifier::UNDERLINED);
+        }
+        spans.push(Span::styled(label, view_style));
+    }
+
+    Line::from(spans)
 }
 
-fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &TuiAppState, options: TuiOptions) {
-    let labels = PRIMARY_VIEWS
-        .iter()
-        .enumerate()
-        .map(|(index, view)| {
-            if *view == state.current_view {
-                format!("[{} {}]", index + 1, view.title())
-            } else {
-                format!(" {} {} ", index + 1, view.title())
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    frame.render_widget(
-        Paragraph::new(labels)
-            .style(style(options, TuiSeverity::Muted))
-            .block(panel_block(
-                "Views",
-                state.pane_focus == TuiPaneFocus::Nav,
-                options,
-            )),
-        area,
+fn horizontal_rule(width: u16, options: TuiOptions) -> String {
+    let glyph = if options.ascii { '-' } else { '\u{2500}' };
+    glyph.to_string().repeat(width as usize)
+}
+
+fn render_joined_body(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &TuiSnapshot,
+    state: &TuiAppState,
+    rows: &[DisplayRow],
+    split_percentages: [u16; 2],
+    options: TuiOptions,
+) {
+    let focused = matches!(
+        state.pane_focus,
+        TuiPaneFocus::Main | TuiPaneFocus::Inspector
     );
+    let block = plain_panel_block(focused, options);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [main, divider, inspector] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(split_percentages[0]),
+            Constraint::Length(1),
+            Constraint::Percentage(split_percentages[1]),
+        ])
+        .areas(inner);
+
+    render_main_panel_content(frame, main, snapshot, state, rows, options);
+    render_vertical_divider(frame, divider, options);
+    render_inspector_content(frame, inspector, snapshot, state, rows, options);
+}
+
+fn render_main_panel_content(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &TuiSnapshot,
+    state: &TuiAppState,
+    rows: &[DisplayRow],
+    options: TuiOptions,
+) {
+    let content = padded_rect(area, 1, 1, 0, 0);
+    let content_width = content.width.max(1);
+    let mut lines = vec![
+        Line::styled(
+            state.current_view.title(),
+            style(options, TuiSeverity::Medium).add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+    ];
+    let body_height = content.height.saturating_sub(lines.len() as u16).max(1) as usize;
+    lines.extend(main_panel_lines(
+        snapshot,
+        state,
+        rows,
+        content_width,
+        body_height,
+        options,
+    ));
+    frame.render_widget(Paragraph::new(lines), content);
+}
+
+fn render_inspector_content(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &TuiSnapshot,
+    state: &TuiAppState,
+    rows: &[DisplayRow],
+    options: TuiOptions,
+) {
+    let content = padded_rect(area, 1, 1, 0, 0);
+    let mut lines = vec![
+        Line::styled(
+            "Inspector",
+            style(options, TuiSeverity::Medium).add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+    ];
+    let body_width = content.width.max(1);
+    lines.extend(inspector_lines(snapshot, state, rows, body_width, options));
+    frame.render_widget(Paragraph::new(lines), content);
+}
+
+fn render_vertical_divider(frame: &mut Frame<'_>, area: Rect, options: TuiOptions) {
+    let glyph = if options.ascii { "|" } else { "\u{2502}" };
+    let lines = (0..area.height)
+        .map(|_| Line::styled(glyph, style(options, TuiSeverity::Muted)))
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn padded_rect(area: Rect, left: u16, right: u16, top: u16, bottom: u16) -> Rect {
+    let x_offset = left.min(area.width);
+    let y_offset = top.min(area.height);
+    Rect {
+        x: area.x.saturating_add(x_offset),
+        y: area.y.saturating_add(y_offset),
+        width: area.width.saturating_sub(left.saturating_add(right)),
+        height: area.height.saturating_sub(top.saturating_add(bottom)),
+    }
 }
 
 fn render_main_panel(
@@ -2077,7 +2324,39 @@ fn render_main_panel(
     rows: &[DisplayRow],
     options: TuiOptions,
 ) {
-    let inner_height = area.height.saturating_sub(2).max(1) as usize;
+    let top_padding = u16::from(state.current_view == TuiView::Hotspots);
+    let inner_height = area.height.saturating_sub(2 + top_padding).max(1) as usize;
+    let horizontal_padding = u16::from(state.current_view == TuiView::Hotspots);
+    let inner_width = area
+        .width
+        .saturating_sub(2 + horizontal_padding.saturating_mul(2))
+        .max(1);
+    let lines = main_panel_lines(snapshot, state, rows, inner_width, inner_height, options);
+    let mut block = panel_block(
+        state.current_view.title(),
+        state.pane_focus == TuiPaneFocus::Main,
+        options,
+    );
+    if horizontal_padding > 0 {
+        block = block.padding(Padding::new(
+            horizontal_padding,
+            horizontal_padding,
+            top_padding,
+            0,
+        ));
+    }
+
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn main_panel_lines(
+    snapshot: &TuiSnapshot,
+    state: &TuiAppState,
+    rows: &[DisplayRow],
+    width: u16,
+    height: usize,
+    options: TuiOptions,
+) -> Vec<Line<'static>> {
     let selected = state.selected_index();
     let mut lines = match state.current_view {
         TuiView::Hotspots => hotspot_kpi_lines(snapshot, options),
@@ -2085,47 +2364,19 @@ fn render_main_panel(
         TuiView::CouplingGraph => coupling_kpi_lines(snapshot, options),
         _ => Vec::new(),
     };
-    let remaining = inner_height.saturating_sub(lines.len()).max(1);
+    if state.current_view == TuiView::Hotspots {
+        lines.push(hotspot_header_line(width, options));
+    }
+    let remaining = height.saturating_sub(lines.len()).max(1);
     if rows.is_empty() {
         lines.push(Line::styled("No rows.", style(options, TuiSeverity::Muted)));
     } else {
         lines.extend(
-            visible_display_row_window(rows, selected, remaining).map(|(index, row)| {
-                render_display_row(row, index == selected, area.width, options)
-            }),
+            visible_display_row_window(rows, selected, remaining)
+                .map(|(index, row)| render_display_row(row, index == selected, width, options)),
         );
     }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(panel_block(
-                state.current_view.title(),
-                state.pane_focus == TuiPaneFocus::Main,
-                options,
-            )),
-        area,
-    );
-}
-
-fn render_inspector(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    snapshot: &TuiSnapshot,
-    state: &TuiAppState,
-    rows: &[DisplayRow],
-    options: TuiOptions,
-) {
-    let lines = inspector_lines(snapshot, state, rows, area.width, options);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .block(panel_block(
-                "Inspector",
-                state.pane_focus == TuiPaneFocus::Inspector,
-                options,
-            )),
-        area,
-    );
+    lines
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiAppState) {
@@ -2133,19 +2384,24 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiAppState) {
         format!("/{}", state.search_query().unwrap_or(""))
     } else {
         let default_status = || {
-            "j/k or arrows move  Enter drill  / search  1-4 views  ? help  Ctrl-P commands  e editor  q quit".to_owned()
+            [
+                "j/k or arrows move",
+                "Enter drill",
+                "/ search",
+                "1-4 views",
+                "? help",
+                "Ctrl-P commands",
+                "e editor",
+                "q quit",
+            ]
+            .join(HOTSPOT_TAG_SEPARATOR)
         };
         state
             .status()
             .map(str::to_owned)
             .unwrap_or_else(default_status)
     };
-    frame.render_widget(
-        Paragraph::new(text)
-            .alignment(Alignment::Left)
-            .block(Block::default().borders(Borders::TOP)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(text).alignment(Alignment::Left), area);
 }
 
 fn visible_display_row_window(
@@ -2171,7 +2427,7 @@ fn render_display_row(
         return render_hotspot_display_row(hotspot, selected, width, options);
     }
 
-    let marker = if selected { ">" } else { " " };
+    let marker = if selected { "\u{258C}" } else { " " };
     let label_width = 9usize;
     let meta_width = row.meta.len().min(32);
     let text_limit = (width as usize)
@@ -2184,7 +2440,7 @@ fn render_display_row(
     };
 
     let mut spans = vec![
-        Span::styled(marker.to_owned(), row_style),
+        Span::styled(marker.to_owned(), marker_style(selected, options)),
         Span::raw(" "),
         Span::styled(
             format!("{:<label_width$}", row.label),
@@ -2212,40 +2468,315 @@ fn render_hotspot_display_row(
     width: u16,
     options: TuiOptions,
 ) -> Line<'static> {
-    let marker = if selected { ">" } else { " " };
+    let marker = if selected { "\u{258C}" } else { " " };
     let row_style = if selected {
-        style(options, severity_for_score(hotspot.score)).add_modifier(Modifier::BOLD)
+        selected_row_style(options, severity_for_score(hotspot.score))
     } else {
         style(options, severity_for_score(hotspot.score))
     };
-    let selector_width = 2usize;
-    let rank_width = 5usize;
-    let risk_width = 26usize.min((width as usize).saturating_sub(12));
-    let path_width = (width as usize)
-        .saturating_sub(selector_width + rank_width + risk_width + 4)
-        .max(12);
+    let muted_style = if selected {
+        selected_row_style(options, TuiSeverity::Muted)
+    } else {
+        style(options, TuiSeverity::Muted)
+    };
+    let gap_style = if selected {
+        selected_gap_style(options)
+    } else {
+        Style::default()
+    };
+    let tags = hotspot_tag_text(&hotspot.tags);
+    let (path_width, tag_width) = hotspot_column_widths(width as usize);
     let risk = hotspot.score * 10.0;
-    let rank = format!("#{}", hotspot.rank);
-    let path = pad_truncated(&hotspot.path, path_width);
+    let path = pad_truncated_path(&hotspot.path, path_width);
 
     let mut spans = vec![
-        Span::styled(format!("{marker:<selector_width$}"), row_style),
         Span::styled(
-            format!("{rank:<rank_width$}"),
-            style(options, TuiSeverity::Muted),
+            format!("{marker:<HOTSPOT_SELECTOR_WIDTH$}"),
+            marker_style(selected, options),
         ),
         Span::styled(path, row_style),
-        Span::raw("  "),
+        Span::styled("  ", gap_style),
     ];
-    spans.extend(score_bar_spans(
-        hotspot.score,
-        METRIC_BAR_WIDTH,
+    if selected {
+        spans.extend(selected_score_bar_spans(
+            hotspot.score,
+            METRIC_BAR_WIDTH,
+            row_style,
+            options,
+        ));
+    } else {
+        spans.extend(score_bar_spans(
+            hotspot.score,
+            METRIC_BAR_WIDTH,
+            row_style,
+            options,
+        ));
+    }
+    spans.push(Span::styled(
+        format!(" {:>HOTSPOT_SCORE_WIDTH$.1}", risk),
         row_style,
-        options,
     ));
-    spans.push(Span::raw(format!(" {:>4.1}", risk)));
+    if tag_width > 0 && !tags.is_empty() {
+        spans.push(Span::styled("  ", gap_style));
+        spans.push(Span::styled(
+            pad_truncated_end(&tags, tag_width),
+            muted_style,
+        ));
+    }
 
     Line::from(spans)
+}
+
+fn hotspot_header_line(width: u16, options: TuiOptions) -> Line<'static> {
+    let (path_width, tag_width) = hotspot_column_widths(width as usize);
+    let risk_width = METRIC_BAR_WIDTH + 1 + HOTSPOT_SCORE_WIDTH;
+    let header_style = style(options, TuiSeverity::Muted).add_modifier(Modifier::BOLD);
+
+    let mut spans = vec![
+        Span::raw(" ".repeat(HOTSPOT_SELECTOR_WIDTH)),
+        Span::styled(pad_truncated_end("Path", path_width), header_style),
+        Span::raw("  "),
+        Span::styled(format!("{:<risk_width$}", "Risk"), header_style),
+    ];
+    if tag_width > 0 {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            pad_truncated_end("Top Factor", tag_width),
+            header_style,
+        ));
+    }
+
+    Line::from(spans)
+}
+
+fn hotspot_tag_text(tags: &[String]) -> String {
+    tags.join(HOTSPOT_TAG_SEPARATOR)
+}
+
+fn hotspot_column_widths(total_width: usize) -> (usize, usize) {
+    let base_width = HOTSPOT_SELECTOR_WIDTH + 2 + METRIC_BAR_WIDTH + 1 + HOTSPOT_SCORE_WIDTH;
+    let full_tag_width = 2 + HOTSPOT_DEFAULT_TAG_WIDTH;
+    let narrow_tag_width = 2 + HOTSPOT_NARROW_TAG_WIDTH;
+
+    if total_width >= base_width + HOTSPOT_MIN_PATH_WIDTH + full_tag_width {
+        (
+            total_width.saturating_sub(base_width + full_tag_width),
+            HOTSPOT_DEFAULT_TAG_WIDTH,
+        )
+    } else if total_width >= base_width + HOTSPOT_MIN_PATH_WIDTH + narrow_tag_width {
+        (
+            total_width.saturating_sub(base_width + narrow_tag_width),
+            HOTSPOT_NARROW_TAG_WIDTH,
+        )
+    } else {
+        (
+            total_width
+                .saturating_sub(base_width)
+                .max(HOTSPOT_MIN_PATH_WIDTH),
+            0,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DriverSignal {
+    label: &'static str,
+    strength: f64,
+    percentile: f64,
+    priority: u8,
+}
+
+fn driver_signal(label: &'static str, strength: f64, priority: u8) -> DriverSignal {
+    DriverSignal {
+        label,
+        strength,
+        percentile: 0.0,
+        priority,
+    }
+}
+
+fn hotspot_driver_tags(snapshot: &TuiSnapshot, hotspot: &ReportHotspot) -> Vec<String> {
+    qualified_driver_tags(snapshot, hotspot)
+        .into_iter()
+        .filter(|signal| signal_qualifies_for_row_tag(hotspot, signal))
+        .map(|signal| signal.label.to_owned())
+        .take(1)
+        .collect()
+}
+
+fn inspector_driver_tags(snapshot: &TuiSnapshot, hotspot: &ReportHotspot) -> Vec<String> {
+    qualified_driver_tags(snapshot, hotspot)
+        .into_iter()
+        .filter(signal_qualifies_for_inspector_tag)
+        .map(|signal| signal.label.to_owned())
+        .take(3)
+        .collect()
+}
+
+fn qualified_driver_tags(snapshot: &TuiSnapshot, hotspot: &ReportHotspot) -> Vec<DriverSignal> {
+    let mut signals = collect_driver_signals(snapshot, hotspot)
+        .into_iter()
+        .filter_map(|mut signal| {
+            signal.percentile =
+                driver_signal_percentile_rank(snapshot, signal.label, signal.strength);
+            signal_qualifies_for_tag(&signal).then_some(signal)
+        })
+        .collect::<Vec<_>>();
+
+    signals.sort_by(|left, right| {
+        right
+            .priority
+            .cmp(&left.priority)
+            .then_with(|| {
+                right
+                    .strength
+                    .partial_cmp(&left.strength)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                right
+                    .percentile
+                    .partial_cmp(&left.percentile)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.label.cmp(right.label))
+    });
+
+    let mut tags = Vec::new();
+    for signal in signals {
+        if !tags
+            .iter()
+            .any(|existing: &DriverSignal| existing.label == signal.label)
+        {
+            tags.push(signal);
+        }
+    }
+
+    tags
+}
+
+fn signal_qualifies_for_row_tag(hotspot: &ReportHotspot, signal: &DriverSignal) -> bool {
+    if hotspot.score >= 0.70 {
+        return signal.strength >= 0.70 && signal.percentile >= 0.90;
+    }
+
+    hotspot.score >= 0.55 && signal.strength >= 0.85 && signal.percentile >= 0.95
+}
+
+fn signal_qualifies_for_inspector_tag(signal: &DriverSignal) -> bool {
+    signal.strength >= 0.65 && signal.percentile >= 0.75
+}
+
+fn signal_qualifies_for_tag(signal: &DriverSignal) -> bool {
+    signal.strength >= 0.60 || signal.percentile >= 0.75
+}
+
+fn driver_signal_percentile_rank(snapshot: &TuiSnapshot, label: &str, strength: f64) -> f64 {
+    let values = snapshot
+        .report
+        .hotspots
+        .iter()
+        .filter(|hotspot| hotspot.score >= 0.55)
+        .flat_map(|hotspot| collect_driver_signals(snapshot, hotspot))
+        .filter(|signal| signal.label == label)
+        .map(|signal| signal.strength)
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+
+    percentile_rank(&values, strength)
+}
+
+fn percentile_rank(values: &[f64], value: f64) -> f64 {
+    if !value.is_finite() || values.is_empty() {
+        return 0.0;
+    }
+    if values.len() == 1 {
+        return if value > 0.0 { 1.0 } else { 0.0 };
+    }
+
+    let below_or_equal = values
+        .iter()
+        .filter(|candidate| candidate.is_finite() && **candidate <= value)
+        .count();
+
+    ((below_or_equal.saturating_sub(1)) as f64 / (values.len() - 1) as f64).clamp(0.0, 1.0)
+}
+
+fn collect_driver_signals(snapshot: &TuiSnapshot, hotspot: &ReportHotspot) -> Vec<DriverSignal> {
+    let mut signals = hotspot
+        .weighted_terms
+        .iter()
+        .filter_map(driver_signal_from_term)
+        .collect::<Vec<_>>();
+    if let Some(fan) = fan_for_path(snapshot, &hotspot.path) {
+        let fanout = normalized_u64(fan.fan_out, 25);
+        if fanout >= 0.45 {
+            signals.push(driver_signal("CORE", fanout, 80));
+        }
+        let fanin = normalized_u64(fan.fan_in, 25);
+        if fanin >= 0.45 {
+            signals.push(driver_signal("CORE", fanin, 95));
+        }
+    }
+    if let Some(complexity) = complexity_pressure_for_path(snapshot, &hotspot.path) {
+        if complexity >= 0.50 {
+            signals.push(driver_signal("COMPLEXITY", complexity, 70));
+        }
+    }
+    if let Some(file) = file_for_path(snapshot, &hotspot.path) {
+        if let Some(byte_size) = file.byte_size {
+            let context = normalized_context_tokens(byte_size.div_ceil(4), 100_000);
+            if context >= 0.65 {
+                signals.push(driver_signal("SIZE", context, 75));
+            }
+        }
+    }
+
+    signals.sort_by(|left, right| {
+        right
+            .strength
+            .partial_cmp(&left.strength)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.label.cmp(right.label))
+    });
+    let mut unique_signals = Vec::new();
+    for signal in signals {
+        if unique_signals
+            .iter()
+            .all(|existing: &DriverSignal| existing.label != signal.label)
+        {
+            unique_signals.push(signal);
+        }
+    }
+
+    unique_signals
+}
+
+fn driver_signal_from_term(term: &WeightedTerm) -> Option<DriverSignal> {
+    let input = term.normalized_input.unwrap_or(0.0);
+    let label = match term.metric {
+        NormalizedMetric::Churn if input >= 0.60 => "CHURN",
+        NormalizedMetric::Size if input >= 0.65 => "SIZE",
+        NormalizedMetric::RecentChurn if input >= 0.75 => "VOLATILITY",
+        NormalizedMetric::Ownership if input >= 0.70 => "FRAGILITY",
+        NormalizedMetric::Coupling if input >= 0.60 => "COUPLING",
+        _ => return None,
+    };
+
+    Some(driver_signal(label, input, driver_signal_priority(label)))
+}
+
+fn driver_signal_priority(label: &str) -> u8 {
+    match label {
+        "CORE" => 95,
+        "CHURN" => 90,
+        "COUPLING" => 85,
+        "FRAGILITY" => 80,
+        "SIZE" => 75,
+        "COMPLEXITY" => 70,
+        "VOLATILITY" => 65,
+        _ => 0,
+    }
 }
 
 fn hotspot_kpi_lines(snapshot: &TuiSnapshot, options: TuiOptions) -> Vec<Line<'static>> {
@@ -2261,23 +2792,6 @@ fn hotspot_kpi_lines(snapshot: &TuiSnapshot, options: TuiOptions) -> Vec<Line<'s
             top_score,
             format!("{} {:.1}", severity_label(top_score), top_score * 10.0),
             severity_for_score(top_score),
-            options,
-        ),
-        metric_bar_line(
-            "Coupling",
-            coupling_pressure(snapshot),
-            format!("{} edges", snapshot.coupling.edges.len()),
-            severity_for_score(coupling_pressure(snapshot)),
-            options,
-        ),
-        metric_bar_line(
-            "Context",
-            context_pressure(snapshot),
-            format!(
-                "{} tokens",
-                snapshot.report.summary.context_estimated_tokens
-            ),
-            severity_for_score(context_pressure(snapshot)),
             options,
         ),
         Line::raw(""),
@@ -2350,6 +2864,16 @@ fn metric_bar_line(
     Line::from(spans)
 }
 
+fn section_divider(width: u16, options: TuiOptions) -> Line<'static> {
+    let inner_width = width.saturating_sub(4).max(12) as usize;
+    let glyph = if options.ascii { "-" } else { "\u{2500}" };
+
+    Line::styled(
+        glyph.repeat(inner_width.min(48)),
+        style(options, TuiSeverity::Muted),
+    )
+}
+
 fn coupling_pressure(snapshot: &TuiSnapshot) -> f64 {
     let max_fan = snapshot
         .coupling
@@ -2372,10 +2896,83 @@ fn context_pressure(snapshot: &TuiSnapshot) -> f64 {
         .budget
         .as_ref()
         .map(|budget| normalized_u64(estimated, budget.budget_tokens.max(1)))
-        .unwrap_or_else(|| normalized_u64(estimated, 100_000))
+        .unwrap_or_else(|| normalized_context_tokens(estimated, 500_000))
+}
+
+fn context_pressure_for_path(snapshot: &TuiSnapshot, path: &str) -> Option<(f64, u64)> {
+    let bytes = file_for_path(snapshot, path)?.byte_size?;
+    let tokens = bytes.div_ceil(4);
+
+    Some((normalized_context_tokens(tokens, 100_000), tokens))
+}
+
+fn coupling_pressure_for_path(snapshot: &TuiSnapshot, path: &str) -> Option<f64> {
+    let fan = fan_for_path(snapshot, path)?;
+    let degree = fan.fan_in.saturating_add(fan.fan_out);
+    let cochange_count = hotspot_for_path(snapshot, path)
+        .and_then(|hotspot| hotspot.raw_metrics.co_changed_file_count)
+        .unwrap_or(0);
+    if degree == 0 && cochange_count == 0 {
+        return Some(0.0);
+    }
+
+    let fan_in_values = snapshot
+        .coupling
+        .fan_by_file
+        .iter()
+        .map(|fan| fan.fan_in as f64)
+        .collect::<Vec<_>>();
+    let fan_out_values = snapshot
+        .coupling
+        .fan_by_file
+        .iter()
+        .map(|fan| fan.fan_out as f64)
+        .collect::<Vec<_>>();
+    let degree_values = snapshot
+        .coupling
+        .fan_by_file
+        .iter()
+        .map(|fan| fan.fan_in.saturating_add(fan.fan_out) as f64)
+        .collect::<Vec<_>>();
+    let cochange_values = snapshot
+        .report
+        .hotspots
+        .iter()
+        .filter_map(|hotspot| {
+            hotspot
+                .raw_metrics
+                .co_changed_file_count
+                .map(|value| value as f64)
+        })
+        .collect::<Vec<_>>();
+
+    let fan_in_rank = percentile_rank(&fan_in_values, fan.fan_in as f64);
+    let fan_out_rank = percentile_rank(&fan_out_values, fan.fan_out as f64);
+    let degree_rank = percentile_rank(&degree_values, degree as f64);
+    let cochange_rank = percentile_rank(&cochange_values, cochange_count as f64);
+    let edge_share = normalized_u64(degree, snapshot.coupling.edges.len().max(1) as u64);
+
+    let mut pressure = (degree_rank * 0.45)
+        .max(fan_in_rank * 0.35 + fan_out_rank * 0.20)
+        .max(cochange_rank * 0.45)
+        + edge_share * 0.10
+        + normalized_u64(cochange_count, 25) * 0.10;
+    pressure = pressure.clamp(0.0, 1.0);
+
+    if degree <= 1 && cochange_count <= 1 {
+        pressure = pressure.min(0.25);
+    } else if degree <= 3 && cochange_count <= 2 {
+        pressure = pressure.min(0.55);
+    }
+
+    Some(pressure)
 }
 
 fn complexity_pressure_for_path(snapshot: &TuiSnapshot, path: &str) -> Option<f64> {
+    Some((complexity_score_for_path(snapshot, path)? / 35.0).clamp(0.0, 1.0))
+}
+
+fn complexity_score_for_path(snapshot: &TuiSnapshot, path: &str) -> Option<f64> {
     let max_complexity = snapshot
         .complexity
         .symbols
@@ -2383,13 +2980,8 @@ fn complexity_pressure_for_path(snapshot: &TuiSnapshot, path: &str) -> Option<f6
         .filter(|symbol| symbol.path == path)
         .filter_map(|symbol| symbol.cyclomatic_complexity)
         .max()?;
-    Some(normalized_u64(max_complexity, 20))
-}
 
-fn normalized_optional_u64(value: Option<u64>, saturation: u64) -> f64 {
-    value
-        .map(|value| normalized_u64(value, saturation))
-        .unwrap_or(0.0)
+    Some(max_complexity as f64)
 }
 
 fn normalized_u64(value: u64, saturation: u64) -> f64 {
@@ -2400,23 +2992,220 @@ fn normalized_u64(value: u64, saturation: u64) -> f64 {
     (value as f64 / saturation as f64).clamp(0.0, 1.0)
 }
 
+fn normalized_context_tokens(tokens: u64, large_threshold: u64) -> f64 {
+    normalized_u64(tokens, large_threshold)
+}
+
 fn severity_label(value: f64) -> &'static str {
-    if value >= 0.70 {
+    if value >= 0.85 {
+        "EXTREME"
+    } else if value >= 0.70 {
         "HIGH"
     } else if value >= 0.40 {
-        "MODERATE"
+        "MEDIUM"
     } else {
         "LOW"
     }
 }
 
-fn format_tokens(tokens: u64) -> String {
-    if tokens >= 1_000_000 {
-        format!("{:.1}m tokens", tokens as f64 / 1_000_000.0)
-    } else if tokens >= 1_000 {
-        format!("{:.1}k tokens", tokens as f64 / 1_000.0)
+fn complexity_severity_label(score: f64) -> &'static str {
+    if score >= 35.0 {
+        "EXTREME"
+    } else if score >= 20.0 {
+        "HIGH"
+    } else if score >= 10.0 {
+        "MEDIUM"
     } else {
-        format!("{tokens} tokens")
+        "LOW"
+    }
+}
+
+fn severity_for_complexity_score(score: f64) -> TuiSeverity {
+    if score >= 20.0 {
+        TuiSeverity::High
+    } else if score >= 10.0 {
+        TuiSeverity::Medium
+    } else {
+        TuiSeverity::Low
+    }
+}
+
+fn coupling_severity_label(value: f64) -> &'static str {
+    if value >= 0.90 {
+        "EXTREME"
+    } else if value >= 0.70 {
+        "HIGH"
+    } else if value >= 0.40 {
+        "MEDIUM"
+    } else {
+        "LOW"
+    }
+}
+
+fn line_size_band(lines: u64) -> TuiSizeBand {
+    match lines {
+        0..=999 => TuiSizeBand::Small,
+        1_000..=3_999 => TuiSizeBand::Medium,
+        4_000..=15_999 => TuiSizeBand::Large,
+        _ => TuiSizeBand::VeryLarge,
+    }
+}
+
+fn format_compact_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}m", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+#[cfg(test)]
+fn format_bytes(bytes: Option<u64>) -> String {
+    let Some(bytes) = bytes else {
+        return "unknown".to_owned();
+    };
+
+    if bytes >= 1_048_576 {
+        format!("{:.1} MiB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else if bytes == 1 {
+        "1 byte".to_owned()
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+fn ownership_risk(hotspot: &ReportHotspot) -> f64 {
+    hotspot
+        .normalized_metrics
+        .ownership
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0)
+}
+
+fn ownership_risk_label(hotspot: &ReportHotspot) -> &'static str {
+    owner_risk_label(ownership_risk(hotspot))
+}
+
+fn owner_risk_label(value: f64) -> &'static str {
+    if value >= 0.85 {
+        "EXTREME"
+    } else if value >= 0.60 {
+        "HIGH"
+    } else if value >= 0.30 {
+        "MEDIUM"
+    } else {
+        "LOW"
+    }
+}
+
+fn ownership_shape_label(hotspot: &ReportHotspot) -> &'static str {
+    let Some(concentration) = hotspot.raw_metrics.dominant_owner_share else {
+        return "UNOBSERVED";
+    };
+
+    ownership_shape_label_for_share(concentration)
+}
+
+fn ownership_shape_label_for_share(concentration: f64) -> &'static str {
+    if concentration > 0.90 {
+        "single owner"
+    } else if concentration >= 0.70 {
+        "concentrated"
+    } else if concentration >= 0.40 {
+        "shared"
+    } else {
+        "distributed"
+    }
+}
+
+fn risk_driver_lines(
+    snapshot: &TuiSnapshot,
+    hotspot: &ReportHotspot,
+    options: TuiOptions,
+) -> Vec<Line<'static>> {
+    let mut lines = qualified_driver_tags(snapshot, hotspot)
+        .into_iter()
+        .filter(|signal| signal.strength >= 0.60 || signal.percentile >= 0.75)
+        .filter_map(|signal| {
+            risk_driver_sentence_from_signal(signal.label)
+                .map(|message| (message.to_owned(), signal.strength, signal.priority))
+        })
+        .collect::<Vec<_>>();
+    if ownership_risk(hotspot) >= 0.60 {
+        lines.push((
+            "Concentrated ownership / low maintainer redundancy".to_owned(),
+            ownership_risk(hotspot),
+            80,
+        ));
+    }
+    if fan_for_path(snapshot, &hotspot.path).is_some_and(|fan| fan.fan_out >= 10) {
+        lines.push(("Central architectural dependency point".to_owned(), 1.0, 75));
+    }
+    if fan_for_path(snapshot, &hotspot.path).is_some_and(|fan| fan.fan_in >= 10) {
+        lines.push(("Central architectural dependency point".to_owned(), 1.0, 95));
+    }
+    if complexity_pressure_for_path(snapshot, &hotspot.path).is_some_and(|value| value >= 0.50) {
+        lines.push(("High structural or logical complexity".to_owned(), 1.0, 70));
+    }
+    if file_for_path(snapshot, &hotspot.path)
+        .and_then(|file| file.byte_size)
+        .is_some_and(|bytes| normalized_context_tokens(bytes.div_ceil(4), 100_000) >= 0.50)
+    {
+        lines.push((
+            "Expensive to review or reason about due to scale".to_owned(),
+            1.0,
+            75,
+        ));
+    }
+    lines.sort_by(|left, right| {
+        right
+            .2
+            .cmp(&left.2)
+            .then_with(|| {
+                right
+                    .1
+                    .partial_cmp(&left.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    lines.dedup_by(|left, right| left.0 == right.0);
+
+    if lines.is_empty() {
+        return Vec::new();
+    }
+
+    let mut rendered = vec![
+        Line::raw(""),
+        Line::styled(
+            "Why This File Matters",
+            style(options, TuiSeverity::Medium).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    rendered.extend(
+        lines
+            .into_iter()
+            .take(4)
+            .map(|(message, _, _)| Line::raw(format!("  - {message}"))),
+    );
+
+    rendered
+}
+
+fn risk_driver_sentence_from_signal(label: &str) -> Option<&'static str> {
+    match label {
+        "CORE" => Some("Central architectural dependency point"),
+        "CHURN" => Some("Changes significantly more often than typical files"),
+        "COUPLING" => Some("Frequently changes alongside related modules"),
+        "FRAGILITY" => Some("Concentrated ownership / low maintainer redundancy"),
+        "SIZE" => Some("Expensive to review or reason about due to scale"),
+        "COMPLEXITY" => Some("High structural or logical complexity"),
+        "VOLATILITY" => Some("Unstable recent modification activity"),
+        _ => None,
     }
 }
 
@@ -2457,119 +3246,171 @@ fn file_inspector_lines(
     width: u16,
     options: TuiOptions,
 ) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        Line::styled(
-            truncate_middle(path, width.saturating_sub(4) as usize),
-            style(options, TuiSeverity::Medium).add_modifier(Modifier::BOLD),
-        ),
-        Line::raw(""),
-    ];
+    let mut lines = vec![Line::styled(
+        truncate_middle(path, width.saturating_sub(4) as usize),
+        style(options, TuiSeverity::Medium).add_modifier(Modifier::BOLD),
+    )];
     if let Some(hotspot) = hotspot_for_path(snapshot, path) {
+        lines.push(Line::raw(""));
         lines.push(metric_bar_line(
-            "Risk",
+            "RISK",
             hotspot.score,
-            format!("{:.1}", hotspot.score * 10.0),
+            severity_label(hotspot.score).to_owned(),
             severity_for_score(hotspot.score),
             options,
         ));
         lines.push(metric_bar_line(
-            "Churn",
-            normalized_optional_u64(hotspot.raw_metrics.total_churn_lines, 2000),
-            optional_u64(hotspot.raw_metrics.total_churn_lines),
-            severity_for_score(normalized_optional_u64(
-                hotspot.raw_metrics.total_churn_lines,
-                2000,
-            )),
+            "FRAGILITY",
+            ownership_risk(hotspot),
+            ownership_risk_label(hotspot).to_owned(),
+            severity_for_score(ownership_risk(hotspot)),
             options,
         ));
-        lines.push(metric_bar_line(
-            "Ownership",
-            hotspot.normalized_metrics.ownership.unwrap_or(0.0),
-            optional_percent(hotspot.raw_metrics.dominant_owner_share),
-            severity_for_score(hotspot.normalized_metrics.ownership.unwrap_or(0.0)),
-            options,
-        ));
-        lines.push(Line::raw(format!(
-            "Rank #{}  Formula {}",
-            hotspot.rank, hotspot.formula_version.id
-        )));
-        lines.push(Line::raw(format!(
-            "Churn {}  Recent {}",
-            optional_u64(hotspot.raw_metrics.total_churn_lines),
-            optional_u64(hotspot.raw_metrics.recent_churn_lines)
-        )));
-        lines.push(Line::raw(format!(
-            "Authors {}  Owner {}",
-            optional_u64(hotspot.raw_metrics.author_count),
-            optional_percent(hotspot.raw_metrics.dominant_owner_share)
-        )));
+
+        if let Some(coupling) = coupling_pressure_for_path(snapshot, path) {
+            lines.push(metric_bar_line(
+                "COUPLING",
+                coupling,
+                coupling_severity_label(coupling).to_owned(),
+                severity_for_score(coupling),
+                options,
+            ));
+        }
+        if let Some(complexity) = complexity_score_for_path(snapshot, path) {
+            lines.push(metric_bar_line(
+                "COMPLEXITY",
+                (complexity / 35.0).clamp(0.0, 1.0),
+                complexity_severity_label(complexity).to_owned(),
+                severity_for_complexity_score(complexity),
+                options,
+            ));
+        }
+        if let Some(line_count) = file_for_path(snapshot, path).and_then(|file| file.line_count) {
+            let band = line_size_band(line_count);
+            let size_text = context_pressure_for_path(snapshot, path).map_or_else(
+                || {
+                    format!(
+                        "{} {} lines",
+                        band.label(),
+                        format_compact_count(line_count)
+                    )
+                },
+                |(_context, tokens)| {
+                    format!(
+                        "{} {} lines · {} tokens",
+                        band.label(),
+                        format_compact_count(line_count),
+                        format_compact_count(tokens)
+                    )
+                },
+            );
+            lines.push(metric_bar_line(
+                "SIZE",
+                band.bar_value(),
+                size_text,
+                band.severity(),
+                options,
+            ));
+        }
+
+        let tags = hotspot_tag_text(&inspector_driver_tags(snapshot, hotspot));
+        if !tags.is_empty() {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(tags, style(options, TuiSeverity::Muted)));
+        }
+
+        lines.push(Line::raw(""));
+        lines.push(section_divider(width, options));
+        lines.extend(risk_driver_lines(snapshot, hotspot, options));
     } else {
+        lines.push(Line::raw(""));
         lines.push(Line::styled(
             "No hotspot score for this file",
             style(options, TuiSeverity::Muted),
         ));
     }
-    if let Some(file) = file_for_path(snapshot, path) {
-        lines.push(Line::raw(""));
-        lines.push(Line::raw(format!(
-            "{}  {} lines  {} bytes",
-            file.language.unwrap_or("unknown"),
-            optional_u64(file.line_count),
-            optional_u64(file.byte_size)
-        )));
-        let flags = [
-            ("generated", file.is_generated),
-            ("vendor", file.is_vendor),
-            ("symlink", file.is_symlink),
-        ]
+
+    lines.push(Line::raw(""));
+    lines.push(section_divider(width, options));
+    lines.push(Line::raw(""));
+    let ownership_title = hotspot_for_path(snapshot, path).map_or_else(
+        || "Ownership".to_owned(),
+        |hotspot| format!("Ownership ({})", ownership_shape_label(hotspot)),
+    );
+    lines.push(Line::styled(
+        ownership_title,
+        style(options, TuiSeverity::Medium).add_modifier(Modifier::BOLD),
+    ));
+    lines.extend(ownership_distribution_lines(snapshot, path, options));
+
+    lines
+}
+
+fn ownership_distribution_lines(
+    snapshot: &TuiSnapshot,
+    path: &str,
+    options: TuiOptions,
+) -> Vec<Line<'static>> {
+    let Some(ownership) = ownership_for_path(snapshot, path) else {
+        return vec![Line::styled(
+            "  unavailable",
+            style(options, TuiSeverity::Muted),
+        )];
+    };
+    if ownership.owners.is_empty() {
+        return vec![Line::styled(
+            "  unavailable",
+            style(options, TuiSeverity::Muted),
+        )];
+    }
+
+    let mut visible = Vec::new();
+    let mut others_share = 0.0;
+    let mut others_touches = 0;
+    for owner in &ownership.owners {
+        if visible.len() < 3 && owner.author != "others" {
+            visible.push(owner);
+        } else {
+            others_share += owner.share;
+            others_touches += owner.touch_count;
+        }
+    }
+
+    let mut lines = visible
         .into_iter()
-        .filter_map(|(label, enabled)| enabled.then_some(label))
+        .map(|owner| owner_share_line(&display_author_name(&owner.author), owner.share, options))
         .collect::<Vec<_>>();
-        if !flags.is_empty() {
-            lines.push(Line::styled(
-                format!("Flags: {}", flags.join(", ")),
-                style(options, TuiSeverity::High),
-            ));
-        }
-    }
-    if let Some(fan) = fan_for_path(snapshot, path) {
-        let fan_pressure = normalized_u64(fan.fan_in.max(fan.fan_out), 25);
-        lines.push(metric_bar_line(
-            "Coupling",
-            fan_pressure,
-            format!("in {} out {}", fan.fan_in, fan.fan_out),
-            severity_for_score(fan_pressure),
-            options,
-        ));
-    }
-    if let Some(complexity) = complexity_pressure_for_path(snapshot, path) {
-        lines.push(metric_bar_line(
-            "Complexity",
-            complexity,
-            severity_label(complexity).to_owned(),
-            severity_for_score(complexity),
-            options,
-        ));
-    }
-    if let Some(file) = file_for_path(snapshot, path) {
-        if let Some(byte_size) = file.byte_size {
-            let tokens = byte_size.div_ceil(4);
-            let context = normalized_u64(tokens, 20_000);
-            lines.push(metric_bar_line(
-                "Context",
-                context,
-                format_tokens(tokens),
-                severity_for_score(context),
-                options,
-            ));
-        }
-    }
-    let symbol_count = symbols_for_path(snapshot, path).len();
-    if symbol_count > 0 {
-        lines.push(Line::raw(format!("{symbol_count} symbols")));
+    if others_touches > 0 && rounded_percent(others_share) >= 1.0 {
+        lines.push(owner_share_line("others", others_share, options));
     }
 
     lines
+}
+
+fn rounded_percent(share: f64) -> f64 {
+    (share * 100.0).round()
+}
+
+fn owner_share_line(author: &str, share: f64, options: TuiOptions) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!(
+                "  {:<OWNER_NAME_WIDTH$}",
+                truncate_end(author, OWNER_NAME_WIDTH)
+            ),
+            style(options, TuiSeverity::Muted),
+        ),
+        Span::raw(format!(" {:>3.0}%", share * 100.0)),
+    ])
+}
+
+fn display_author_name(author: &str) -> String {
+    author
+        .split_once(" <")
+        .map(|(name, _email)| name.trim())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(author)
+        .to_owned()
 }
 
 fn repo_inspector_lines(snapshot: &TuiSnapshot, options: TuiOptions) -> Vec<Line<'static>> {
@@ -2695,6 +3536,22 @@ fn panel_block<'a>(title: &'a str, focused: bool, options: TuiOptions) -> Block<
         .border_style(border_style)
 }
 
+fn plain_panel_block(focused: bool, options: TuiOptions) -> Block<'static> {
+    let border_style = if focused {
+        style(options, TuiSeverity::Medium)
+    } else {
+        style(options, TuiSeverity::Muted)
+    };
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(if options.ascii {
+            BorderType::Plain
+        } else {
+            BorderType::Rounded
+        })
+        .border_style(border_style)
+}
+
 fn style(options: TuiOptions, severity: TuiSeverity) -> Style {
     if options.no_color {
         return Style::default();
@@ -2709,6 +3566,31 @@ fn style(options: TuiOptions, severity: TuiSeverity) -> Style {
     };
 
     Style::default().fg(color)
+}
+
+fn selected_row_style(options: TuiOptions, severity: TuiSeverity) -> Style {
+    let base = style(options, severity).add_modifier(Modifier::BOLD);
+    if options.no_color {
+        return base.add_modifier(Modifier::REVERSED);
+    }
+
+    base.bg(Color::Rgb(32, 32, 32))
+}
+
+fn selected_gap_style(options: TuiOptions) -> Style {
+    if options.no_color {
+        return Style::default().add_modifier(Modifier::REVERSED);
+    }
+
+    Style::default().bg(Color::Rgb(32, 32, 32))
+}
+
+fn marker_style(selected: bool, options: TuiOptions) -> Style {
+    if !selected {
+        return Style::default();
+    }
+
+    selected_row_style(options, TuiSeverity::Medium)
 }
 
 fn score_bar_parts(score: f64, width: usize, options: TuiOptions) -> (String, String) {
@@ -2728,10 +3610,41 @@ fn score_bar_spans(
     active_style: Style,
     options: TuiOptions,
 ) -> Vec<Span<'static>> {
+    score_bar_spans_with_inactive(
+        score,
+        width,
+        active_style,
+        inactive_bar_style(options),
+        options,
+    )
+}
+
+fn selected_score_bar_spans(
+    score: f64,
+    width: usize,
+    active_style: Style,
+    options: TuiOptions,
+) -> Vec<Span<'static>> {
+    score_bar_spans_with_inactive(
+        score,
+        width,
+        active_style,
+        selected_inactive_bar_style(options),
+        options,
+    )
+}
+
+fn score_bar_spans_with_inactive(
+    score: f64,
+    width: usize,
+    active_style: Style,
+    inactive_style: Style,
+    options: TuiOptions,
+) -> Vec<Span<'static>> {
     let (filled, empty) = score_bar_parts(score, width, options);
     vec![
         Span::styled(filled, active_style),
-        Span::styled(empty, inactive_bar_style(options)),
+        Span::styled(empty, inactive_style),
     ]
 }
 
@@ -2744,6 +3657,19 @@ fn inactive_bar_style(options: TuiOptions) -> Style {
     }
 
     Style::default().fg(Color::Rgb(82, 82, 82)).bg(Color::Black)
+}
+
+fn selected_inactive_bar_style(options: TuiOptions) -> Style {
+    if options.no_color {
+        return Style::default().add_modifier(Modifier::REVERSED);
+    }
+    if options.ascii {
+        return selected_row_style(options, TuiSeverity::Muted);
+    }
+
+    Style::default()
+        .fg(Color::Rgb(118, 118, 118))
+        .bg(Color::Rgb(32, 32, 32))
 }
 
 fn short_commit(value: &str) -> String {
@@ -2776,8 +3702,50 @@ fn truncate_middle(value: &str, max: usize) -> String {
     format!("{left}…{right}")
 }
 
-fn pad_truncated(value: &str, width: usize) -> String {
-    let truncated = truncate_middle(value, width);
+fn truncate_end(value: &str, max: usize) -> String {
+    let length = value.chars().count();
+    if length <= max {
+        return value.to_owned();
+    }
+    if max <= 1 {
+        return "…".to_owned();
+    }
+
+    let prefix = value.chars().take(max - 1).collect::<String>();
+
+    format!("{prefix}…")
+}
+
+fn pad_truncated_end(value: &str, width: usize) -> String {
+    let truncated = truncate_end(value, width);
+    let padding = width.saturating_sub(truncated.chars().count());
+
+    format!("{truncated}{}", " ".repeat(padding))
+}
+
+fn truncate_path_start(value: &str, max: usize) -> String {
+    let length = value.chars().count();
+    if length <= max {
+        return value.to_owned();
+    }
+    if max <= 1 {
+        return "…".to_owned();
+    }
+
+    let suffix = value
+        .chars()
+        .rev()
+        .take(max - 1)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+
+    format!("…{suffix}")
+}
+
+fn pad_truncated_path(value: &str, width: usize) -> String {
+    let truncated = truncate_path_start(value, width);
     let padding = width.saturating_sub(truncated.chars().count());
 
     format!("{truncated}{}", " ".repeat(padding))
@@ -3022,7 +3990,7 @@ mod tests {
     }
 
     #[test]
-    fn render_dashboard_contains_header_nav_and_inspector() {
+    fn render_dashboard_contains_top_navigation_and_inspector() {
         let snapshot = test_snapshot();
         let state = TuiAppState::default();
         let backend = TestBackend::new(130, 36);
@@ -3040,13 +4008,68 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Hotpath"));
-        assert!(rendered.contains("Navigate"));
+        assert!(rendered.contains("[1 Hotspots]  2 Repo Tree"));
+        assert!(!rendered.contains("Navigate"));
         assert!(rendered.contains("Inspector"));
         assert!(rendered.contains("src/lib.rs"));
     }
 
     #[test]
-    fn hotspot_rows_render_fixed_selector_rank_path_and_score_bar() {
+    fn header_uses_human_readable_token_count() {
+        let mut snapshot = test_snapshot();
+        snapshot.report.summary.context_estimated_tokens = 32_400;
+        let state = TuiAppState::default();
+        let backend = TestBackend::new(130, 4);
+        let mut terminal = Terminal::new(backend).expect("test terminal should initialize");
+
+        terminal
+            .draw(|frame| {
+                render_header(
+                    frame,
+                    Rect::new(0, 0, 130, 4),
+                    &snapshot,
+                    &state,
+                    TuiOptions::default(),
+                )
+            })
+            .expect("render should succeed");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.starts_with("[1 Hotspots]"));
+        assert!(rendered.contains("32.4k tokens"));
+        assert!(!rendered.contains("32400 tokens"));
+    }
+
+    #[test]
+    fn footer_hints_use_middle_dot_separators() {
+        let state = TuiAppState::default();
+        let backend = TestBackend::new(140, 3);
+        let mut terminal = Terminal::new(backend).expect("test terminal should initialize");
+
+        terminal
+            .draw(|frame| render_footer(frame, Rect::new(0, 0, 140, 3), &state))
+            .expect("render should succeed");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains(&format!("move{HOTSPOT_TAG_SEPARATOR}Enter")));
+        assert!(rendered.contains(&format!("help{HOTSPOT_TAG_SEPARATOR}Ctrl-P")));
+        assert!(!rendered.contains("move  Enter"));
+    }
+
+    #[test]
+    fn hotspot_rows_render_fixed_path_and_score_bar() {
         let snapshot = test_snapshot();
         let state = TuiAppState::default();
         let row = display_rows(&snapshot, &state)
@@ -3061,36 +4084,638 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert!(rendered.starts_with("> #1"));
+        assert!(rendered.starts_with("\u{258C} src/lib.rs"));
+        assert!(!rendered.contains("#1"));
         assert!(rendered.contains("src/lib.rs"));
         assert!(!rendered.contains("hotspot"));
         assert!(rendered.contains("6.4"));
+        assert!(!rendered.contains("CHURN"));
+    }
+
+    #[test]
+    fn selected_hotspot_row_uses_continuous_background() {
+        let row = DisplayHotspotRow {
+            path: "src/lib.rs".to_owned(),
+            score: 0.8,
+            tags: vec!["CHURN".to_owned()],
+        };
+
+        let line = render_hotspot_display_row(&row, true, 80, TuiOptions::default());
+
+        assert!(line
+            .spans
+            .iter()
+            .filter(|span| !span.content.is_empty())
+            .all(|span| span.style.bg == Some(Color::Rgb(32, 32, 32))));
+        assert_eq!(line.spans[0].content.as_ref(), "\u{258C} ");
+        assert_eq!(line.spans[0].style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn hotspot_driver_tags_are_deterministic_and_suppress_weak_terms() {
+        let snapshot = test_snapshot();
+        let tags = hotspot_driver_tags(&snapshot, &snapshot.report.hotspots[0]);
+
+        assert!(tags.is_empty());
     }
 
     #[test]
     fn hotspot_score_bars_start_in_the_same_column() {
         let short = DisplayHotspotRow {
-            rank: 1,
             path: "a.rs".to_owned(),
             score: 0.6,
+            tags: Vec::new(),
         };
         let long = DisplayHotspotRow {
-            rank: 2,
             path: "src/deeply/nested/repository/file.rs".to_owned(),
             score: 0.7,
+            tags: Vec::new(),
+        };
+        let docs = DisplayHotspotRow {
+            path: "docs/json-schema.md".to_owned(),
+            score: 0.25,
+            tags: Vec::new(),
         };
         let short_line = render_hotspot_display_row(&short, true, 80, TuiOptions::default());
         let long_line = render_hotspot_display_row(&long, false, 80, TuiOptions::default());
+        let docs_line = render_hotspot_display_row(&docs, false, 80, TuiOptions::default());
         let short_rendered = line_text(&short_line);
         let long_rendered = line_text(&long_line);
+        let docs_rendered = line_text(&docs_line);
+        let active_bar = score_bar_parts(1.0, 1, TuiOptions::default()).0;
+        let active_bar = active_bar.chars().next().expect("bar glyph");
 
         assert_eq!(
-            short_rendered.find('■'),
-            long_rendered.find('■'),
+            char_position(&short_rendered, active_bar),
+            char_position(&long_rendered, active_bar),
             "score bars should share a stable column"
         );
-        assert!(short_rendered.starts_with("> #1"));
-        assert!(long_rendered.starts_with("  #2"));
+        assert_eq!(
+            char_position(&short_rendered, active_bar),
+            char_position(&docs_rendered, active_bar),
+            "docs paths should not shift the score bar"
+        );
+        assert!(short_rendered.starts_with("\u{258C} a.rs"));
+        assert!(long_rendered.contains("file.rs"));
+        assert!(docs_rendered.starts_with("  docs/json-schema.md"));
+        assert!(!short_rendered.contains("#1"));
+        assert!(!docs_rendered.contains("GROWTH"));
+    }
+
+    #[test]
+    fn hotspot_rows_clip_tags_and_paths_without_moving_bars() {
+        let high = DisplayHotspotRow {
+            path: "src/very/long/storage/integration/module/file.rs".to_owned(),
+            score: 0.82,
+            tags: vec!["CHURN".to_owned(), "CORE".to_owned(), "SIZE".to_owned()],
+        };
+        let low = DisplayHotspotRow {
+            path: "src/main.rs".to_owned(),
+            score: 0.39,
+            tags: Vec::new(),
+        };
+        let high_rendered = line_text(&render_hotspot_display_row(
+            &high,
+            true,
+            54,
+            TuiOptions::default(),
+        ));
+        let low_rendered = line_text(&render_hotspot_display_row(
+            &low,
+            false,
+            54,
+            TuiOptions::default(),
+        ));
+        let active_bar = score_bar_parts(1.0, 1, TuiOptions::default()).0;
+        let active_bar = active_bar.chars().next().expect("bar glyph");
+
+        assert_eq!(
+            char_position(&high_rendered, active_bar),
+            char_position(&low_rendered, active_bar)
+        );
+        assert!(high_rendered.contains("…"));
+        assert!(!low_rendered.contains("CHURN"));
+        assert!(high_rendered.chars().count() <= 54);
+    }
+
+    #[test]
+    fn hotspot_tags_render_with_centered_separators_and_clip_in_place() {
+        let row = DisplayHotspotRow {
+            path: "src/lib.rs".to_owned(),
+            score: 0.8,
+            tags: vec![
+                "CHURN".to_owned(),
+                "SIZE".to_owned(),
+                "VOLATILITY".to_owned(),
+                "COUPLING".to_owned(),
+            ],
+        };
+
+        let wide = line_text(&render_hotspot_display_row(
+            &row,
+            true,
+            96,
+            TuiOptions::default(),
+        ));
+        let narrow = line_text(&render_hotspot_display_row(
+            &row,
+            true,
+            58,
+            TuiOptions::default(),
+        ));
+
+        assert_eq!(
+            hotspot_tag_text(&[
+                "CHURN".to_owned(),
+                "SIZE".to_owned(),
+                "VOLATILITY".to_owned()
+            ]),
+            format!("CHURN{HOTSPOT_TAG_SEPARATOR}SIZE{HOTSPOT_TAG_SEPARATOR}VOLATILITY")
+        );
+        assert!(wide.contains(&format!("CHURN{HOTSPOT_TAG_SEPARATOR}SIZE")));
+        assert!(!wide.contains("CHURN SIZE"));
+        assert!(!wide.contains("COUPLING ·"));
+        assert!(narrow.chars().count() <= 58);
+        assert!(!narrow.contains("COUPLING"));
+    }
+
+    #[test]
+    fn dense_hotspot_list_renders_without_empty_spacer_rows() {
+        let mut snapshot = test_snapshot();
+        let mut second = snapshot.report.hotspots[0].clone();
+        second.rank = 2;
+        second.path = "src/very/long/storage/integration/module/file.rs".to_owned();
+        second.score = 0.72;
+        second.raw_metrics.path = second.path.clone();
+        let mut third = snapshot.report.hotspots[0].clone();
+        third.rank = 3;
+        third.path = "docs/json-schema.md".to_owned();
+        third.score = 0.25;
+        third.raw_metrics.path = third.path.clone();
+        snapshot.report.hotspots = vec![snapshot.report.hotspots[0].clone(), second, third];
+        snapshot.report.summary.hotspot_count = 3;
+        snapshot.scan.files.push(file_record(
+            "src/very/long/storage/integration/module/file.rs",
+        ));
+        snapshot.scan.files.push(file_record("docs/json-schema.md"));
+
+        let state = TuiAppState::default();
+        let rows = display_rows(&snapshot, &state);
+        let backend = TestBackend::new(82, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal should initialize");
+
+        terminal
+            .draw(|frame| {
+                render_main_panel(
+                    frame,
+                    Rect::new(0, 0, 82, 12),
+                    &snapshot,
+                    &state,
+                    &rows,
+                    TuiOptions::default(),
+                )
+            })
+            .expect("render should succeed");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let header = buffer_line_text(&terminal, 4, 82);
+        let first = buffer_line_text(&terminal, 5, 82);
+        let second = buffer_line_text(&terminal, 6, 82);
+        let third = buffer_line_text(&terminal, 7, 82);
+
+        assert!(header.contains("Path"));
+        assert!(header.contains("Risk"));
+        assert!(header.contains("Top Factor"));
+        assert!(!rendered.contains("Coupling"));
+        assert!(first.contains("src/lib.rs"));
+        assert!(second.contains("file.rs"));
+        assert!(third.contains("docs/json-schema.md"));
+        assert!(!first.contains("#1"));
+        assert!(!second.contains("#2"));
+        assert!(!third.contains("#3"));
+        assert!(!first.trim().is_empty());
+        assert!(!second.trim().is_empty());
+        assert!(!third.trim().is_empty());
+    }
+
+    #[test]
+    fn generated_and_lockfile_hotspots_are_suppressed_by_default_policy() {
+        let scan = ScanReport::from_parts(
+            Vec::new(),
+            vec![file_record("src/lib.rs"), file_record("Cargo.lock")],
+        );
+        let mut report = report_with_hotspots(&scan);
+        let mut lockfile = report.hotspots[0].clone();
+        lockfile.rank = 2;
+        lockfile.path = "Cargo.lock".to_owned();
+        lockfile.raw_metrics.path = "Cargo.lock".to_owned();
+        report.hotspots.push(lockfile);
+        report.summary.hotspot_count = 2;
+
+        suppress_generated_hotspots(&scan.files, &mut report);
+
+        assert_eq!(
+            report
+                .hotspots
+                .iter()
+                .map(|hotspot| hotspot.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/lib.rs"]
+        );
+        assert_eq!(report.summary.hotspot_count, 1);
+    }
+
+    #[test]
+    fn ownership_bar_represents_operational_risk_not_health() {
+        let mut snapshot = test_snapshot();
+        snapshot.report.hotspots[0].raw_metrics.dominant_owner_share = Some(1.0);
+        snapshot.report.hotspots[0].normalized_metrics.ownership = Some(0.0);
+
+        let text = lines_text(&file_inspector_lines(
+            &snapshot,
+            "src/lib.rs",
+            80,
+            TuiOptions::default(),
+        ));
+
+        assert!(text.contains("FRAGILITY"));
+        assert!(text.contains("Ownership (single owner)"));
+        assert!(!text.contains("Ownership    SINGLE OWNER"));
+        assert!(!text.contains("Owner Risk"));
+        assert!(text.contains("LOW"));
+        let ownership_line = text
+            .lines()
+            .find(|line| line.starts_with("Ownership"))
+            .expect("ownership section title should render");
+        assert!(!ownership_line.contains("■"));
+    }
+
+    #[test]
+    fn inspector_includes_concise_risk_driver_section() {
+        let snapshot = test_snapshot();
+        let text = lines_text(&file_inspector_lines(
+            &snapshot,
+            "src/lib.rs",
+            80,
+            TuiOptions::default(),
+        ));
+
+        assert!(text.contains("Why This File Matters"));
+        assert!(text.contains("  - Changes significantly more often than typical files"));
+        assert!(!text.contains("Key Signals"));
+        assert!(!text.contains("Structure"));
+        assert!(!text.contains("  Formula"));
+        assert!(!text.contains("  Rank"));
+    }
+
+    #[test]
+    fn low_owner_risk_does_not_emit_strong_ownership_driver() {
+        let mut snapshot = test_snapshot();
+        snapshot.report.hotspots[0].raw_metrics.dominant_owner_share = Some(1.0);
+        snapshot.report.hotspots[0].normalized_metrics.ownership = Some(0.10);
+
+        let text = lines_text(&risk_driver_lines(
+            &snapshot,
+            &snapshot.report.hotspots[0],
+            TuiOptions::default(),
+        ));
+
+        assert!(!text.contains("Concentrated ownership / low maintainer redundancy"));
+    }
+
+    #[test]
+    fn high_owner_risk_emits_contextual_ownership_driver() {
+        let mut snapshot = test_snapshot();
+        snapshot.report.hotspots[0].raw_metrics.dominant_owner_share = Some(1.0);
+        snapshot.report.hotspots[0].normalized_metrics.ownership = Some(0.85);
+
+        let text = lines_text(&risk_driver_lines(
+            &snapshot,
+            &snapshot.report.hotspots[0],
+            TuiOptions::default(),
+        ));
+
+        assert!(text.contains("Concentrated ownership / low maintainer redundancy"));
+    }
+
+    #[test]
+    fn inspector_uses_operational_metric_labels() {
+        let snapshot = test_snapshot();
+        let text = lines_text(&file_inspector_lines(
+            &snapshot,
+            "src/lib.rs",
+            80,
+            TuiOptions::default(),
+        ));
+
+        assert!(text.contains("Ownership"));
+        assert!(text.contains("Ownership (shared)"));
+        assert!(text.contains("SIZE"));
+        assert!(!text.lines().any(|line| line.starts_with("Context")));
+        assert!(!text.contains("Key Signals"));
+        assert!(!text.contains("Structure"));
+        assert!(!text.contains("Lifetime Churn"));
+        assert!(!text.contains("90 days Churn"));
+        assert!(!text.contains("Bytes"));
+        assert!(!text.contains("90d Churn"));
+        assert!(!text.contains("Recent"));
+        assert!(!text.contains("Fan-in"));
+        assert!(!text.contains("Fan-out"));
+    }
+
+    #[test]
+    fn inspector_renders_ownership_distribution_in_descending_order() {
+        let mut snapshot = test_snapshot();
+        snapshot.ownership = TuiOwnershipSnapshot {
+            by_file: vec![TuiFileOwnership {
+                path: "src/lib.rs".to_owned(),
+                owners: vec![
+                    owner_share("alice <alice@example.invalid>", 91, 0.91),
+                    owner_share("bob <bob@example.invalid>", 7, 0.07),
+                    owner_share("carol <carol@example.invalid>", 2, 0.02),
+                ],
+            }],
+        };
+
+        let text = lines_text(&file_inspector_lines(
+            &snapshot,
+            "src/lib.rs",
+            80,
+            TuiOptions::default(),
+        ));
+
+        let alice = text.find("alice").expect("alice should render");
+        let bob = text.find("bob").expect("bob should render");
+        let carol = text.find("carol").expect("carol should render");
+        assert!(alice < bob && bob < carol);
+        assert!(text.contains("alice                     91%"));
+        assert!(text.contains("bob                        7%"));
+        assert!(text.contains("carol                      2%"));
+    }
+
+    #[test]
+    fn inspector_collapses_long_author_lists_into_others() {
+        let mut snapshot = test_snapshot();
+        snapshot.ownership = TuiOwnershipSnapshot {
+            by_file: vec![TuiFileOwnership {
+                path: "src/lib.rs".to_owned(),
+                owners: vec![
+                    owner_share("alice <alice@example.invalid>", 40, 0.40),
+                    owner_share("bob <bob@example.invalid>", 25, 0.25),
+                    owner_share("carol <carol@example.invalid>", 20, 0.20),
+                    owner_share("dana <dana@example.invalid>", 10, 0.10),
+                    owner_share("erin <erin@example.invalid>", 1, 0.01),
+                    owner_share("frank <frank@example.invalid>", 1, 0.01),
+                    owner_share("grace <grace@example.invalid>", 1, 0.01),
+                ],
+            }],
+        };
+
+        let text = lines_text(&file_inspector_lines(
+            &snapshot,
+            "src/lib.rs",
+            80,
+            TuiOptions::default(),
+        ));
+
+        assert!(text.contains("others                    13%"));
+        assert!(!text.contains("erin"));
+        assert!(!text.contains("frank"));
+        assert!(!text.contains("grace"));
+    }
+
+    #[test]
+    fn hotspot_tags_are_selective_by_risk_band() {
+        let mut snapshot = test_snapshot();
+        snapshot.report.hotspots = vec![
+            hotspot_fixture(1, "src/high.rs", 0.80, 0.90, 0.89, 0.88),
+            hotspot_fixture(2, "src/medium.rs", 0.55, 0.86, 0.80, 0.20),
+            hotspot_fixture(3, "src/low.rs", 0.30, 0.95, 0.95, 0.95),
+        ];
+
+        assert_eq!(
+            hotspot_driver_tags(&snapshot, &snapshot.report.hotspots[0]),
+            vec!["CHURN"]
+        );
+        assert!(hotspot_driver_tags(&snapshot, &snapshot.report.hotspots[1]).is_empty());
+        assert!(hotspot_driver_tags(&snapshot, &snapshot.report.hotspots[2]).is_empty());
+    }
+
+    #[test]
+    fn exceptional_hotspot_rows_show_only_one_tag() {
+        let mut snapshot = test_snapshot();
+        snapshot.report.hotspots = vec![hotspot_fixture(
+            1,
+            "src/critical.rs",
+            0.90,
+            0.95,
+            0.92,
+            0.91,
+        )];
+
+        assert_eq!(
+            hotspot_driver_tags(&snapshot, &snapshot.report.hotspots[0]),
+            vec!["CHURN"]
+        );
+    }
+
+    #[test]
+    fn inspector_headline_renders_coupling_and_complexity_severity() {
+        let mut snapshot = coupling_snapshot();
+        snapshot.report.hotspots[0].score = 0.77;
+        snapshot.report.hotspots[0].path = "src/lib.rs".to_owned();
+        snapshot.report.hotspots[0].raw_metrics.path = "src/lib.rs".to_owned();
+        snapshot.complexity.symbols = vec![ComplexitySymbolRecord {
+            path: "src/lib.rs".to_owned(),
+            name: "hard".to_owned(),
+            kind: "function".to_owned(),
+            start_line: 1,
+            end_line: 10,
+            length_lines: 10,
+            function_length_lines: Some(10),
+            nesting_depth: 0,
+            cyclomatic_complexity: Some(18),
+            max_control_flow_nesting: Some(2),
+            is_large_symbol: false,
+        }];
+
+        let text = lines_text(&file_inspector_lines(
+            &snapshot,
+            "src/lib.rs",
+            80,
+            TuiOptions::default(),
+        ));
+
+        assert!(text.contains("COUPLING"));
+        assert!(text.contains("COMPLEXITY"));
+        assert!(text.contains("MEDIUM"));
+        assert!(!text.contains("18.0 MEDIUM"));
+    }
+
+    #[test]
+    fn coupling_pressure_uses_percentile_pressure_not_raw_count_linear_mapping() {
+        let mut snapshot = test_snapshot();
+        snapshot.coupling.fan_by_file = vec![
+            TuiFileFan {
+                path: "src/lib.rs".to_owned(),
+                fan_in: 31,
+                fan_out: 12,
+            },
+            TuiFileFan {
+                path: "src/main.rs".to_owned(),
+                fan_in: 1,
+                fan_out: 0,
+            },
+            TuiFileFan {
+                path: "src/leaf.rs".to_owned(),
+                fan_in: 0,
+                fan_out: 1,
+            },
+        ];
+        snapshot.report.hotspots[0]
+            .raw_metrics
+            .co_changed_file_count = Some(20);
+
+        let hub = coupling_pressure_for_path(&snapshot, "src/lib.rs")
+            .expect("hub should have coupling pressure");
+        let leaf = coupling_pressure_for_path(&snapshot, "src/leaf.rs")
+            .expect("leaf should have coupling pressure");
+
+        assert!(hub >= 0.70, "expected hub pressure to be high, got {hub}");
+        assert!(
+            leaf <= 0.25,
+            "expected leaf pressure to stay low, got {leaf}"
+        );
+    }
+
+    #[test]
+    fn narrow_width_inspector_keeps_headline_bars_aligned() {
+        let mut snapshot = test_snapshot();
+        if let Some(file) = snapshot
+            .scan
+            .files
+            .iter_mut()
+            .find(|file| file.path == "src/lib.rs")
+        {
+            file.byte_size = Some(200_000);
+        }
+        let text = lines_text(&file_inspector_lines(
+            &snapshot,
+            "src/lib.rs",
+            42,
+            TuiOptions::default(),
+        ));
+        let filled = score_bar_parts(1.0, 1, TuiOptions::default()).0;
+        let glyph = filled.chars().next().expect("bar glyph");
+        let columns = text
+            .lines()
+            .filter(|line| {
+                line.starts_with("RISK")
+                    || line.starts_with("FRAGILITY")
+                    || line.starts_with("SIZE")
+            })
+            .filter_map(|line| char_position(line, glyph))
+            .collect::<Vec<_>>();
+
+        assert!(columns.len() >= 3);
+        assert!(columns.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[test]
+    fn inspector_tags_use_unicode_middle_dot_separator() {
+        let mut snapshot = test_snapshot();
+        snapshot.report.hotspots = vec![hotspot_fixture(1, "src/lib.rs", 0.90, 0.95, 0.92, 0.91)];
+
+        let text = lines_text(&file_inspector_lines(
+            &snapshot,
+            "src/lib.rs",
+            80,
+            TuiOptions::default(),
+        ));
+
+        assert!(text.contains(&format!(
+            "CHURN{HOTSPOT_TAG_SEPARATOR}SIZE{HOTSPOT_TAG_SEPARATOR}VOLATILITY"
+        )));
+    }
+
+    #[test]
+    fn inspector_tags_show_top_three_by_severity() {
+        let mut snapshot = test_snapshot();
+        let mut hotspot = hotspot_fixture(1, "src/lib.rs", 0.90, 0.95, 0.95, 0.95);
+        hotspot.weighted_terms.push(weighted_term(
+            "coupling_score",
+            NormalizedMetric::Coupling,
+            0.95,
+            0.20,
+        ));
+        snapshot.report.hotspots = vec![hotspot];
+
+        assert_eq!(
+            inspector_driver_tags(&snapshot, &snapshot.report.hotspots[0]),
+            vec!["CHURN", "COUPLING", "SIZE"]
+        );
+    }
+
+    #[test]
+    fn context_pressure_normalization_preserves_relative_scale() {
+        assert!(normalized_context_tokens(32_000, 100_000) < 0.50);
+        assert!(normalized_context_tokens(282_000, 500_000) < 0.70);
+    }
+
+    #[test]
+    fn structure_size_uses_human_readable_units() {
+        assert_eq!(format_bytes(Some(1)), "1 byte");
+        assert_eq!(format_bytes(Some(166_687)), "162.8 KiB");
+        assert_eq!(format_bytes(Some(2_097_152)), "2.0 MiB");
+        assert_eq!(format_bytes(None), "unknown");
+    }
+
+    #[test]
+    fn inspector_context_and_size_header_labels_use_operational_bands() {
+        assert_eq!(line_size_band(999).label(), "SMALL");
+        assert_eq!(line_size_band(3_700).label(), "MEDIUM");
+        assert_eq!(line_size_band(4_000).label(), "LARGE");
+        assert_eq!(line_size_band(16_000).label(), "VERY LARGE");
+        assert_eq!(format_compact_count(32_200), "32.2k");
+    }
+
+    #[test]
+    fn context_and_size_header_bars_use_their_size_band_severity() {
+        let size = line_size_band(3_700);
+        assert_eq!(size.label(), "MEDIUM");
+        assert_eq!(size.bar_value(), 0.40);
+        assert_eq!(size.severity(), TuiSeverity::Medium);
+    }
+
+    #[test]
+    fn inspector_size_row_includes_context_tokens_when_available() {
+        let mut snapshot = test_snapshot();
+        if let Some(file) = snapshot
+            .scan
+            .files
+            .iter_mut()
+            .find(|file| file.path == "src/lib.rs")
+        {
+            file.line_count = Some(3_800);
+            file.byte_size = Some(129_600);
+        }
+
+        let text = lines_text(&file_inspector_lines(
+            &snapshot,
+            "src/lib.rs",
+            80,
+            TuiOptions::default(),
+        ));
+
+        assert!(text.contains("SIZE"));
+        assert!(text.contains("MEDIUM 3.8k lines · 32.4k tokens"));
+        assert!(!text.lines().any(|line| line.starts_with("Context")));
     }
 
     #[test]
@@ -3239,8 +4864,8 @@ mod tests {
                 "File: src/lib.rs",
                 "Commits: 7",
                 "Total churn lines: 120",
-                "Recent churn lines (90 days): 30",
-                "Author count: 3",
+                "Contributors: 3",
+                "Owners: 3",
                 "Dominant ownership: 57.0%",
                 "Co-changed file count: 4",
             ]
@@ -3252,8 +4877,8 @@ mod tests {
         let snapshot = test_snapshot();
         let rows = explain_score_rows(&snapshot, "src/lib.rs");
 
-        assert!(rows.contains(&"Formula: hotpath.score.v1".to_owned()));
-        assert!(rows.contains(&"Formula version: 1.0".to_owned()));
+        assert!(rows.contains(&"Formula: hotpath.score.v3".to_owned()));
+        assert!(rows.contains(&"Formula version: 3.0".to_owned()));
         assert!(rows
             .contains(&"Term: churn_score weight 0.35 input 0.600 contribution 0.210".to_owned()));
         assert!(rows.contains(&"Limitation: test.limit - fixture limitation".to_owned()));
@@ -3268,8 +4893,7 @@ mod tests {
             vec![
                 "File: src/lib.rs",
                 "Matched current file: true",
-                "Fan-in: 0",
-                "Fan-out: 1",
+                "Coupling: 1 dependencies, 0 dependents",
                 "Incoming edges:",
                 "Incoming: none",
                 "Outgoing edges:",
@@ -3281,8 +4905,7 @@ mod tests {
             vec![
                 "File: src/child.rs",
                 "Matched current file: true",
-                "Fan-in: 1",
-                "Fan-out: 0",
+                "Coupling: 0 dependencies, 1 dependents",
                 "Incoming edges:",
                 "Incoming: src/lib.rs -> src/child.rs (mod)",
                 "Outgoing edges:",
@@ -3299,9 +4922,9 @@ mod tests {
             coupling_graph_rows(&snapshot, None),
             vec![
                 "Coupling graph: 1 resolved dependency edges",
-                "Files by fan-in/fan-out:",
-                "File: src/child.rs fan-in 1 fan-out 0",
-                "File: src/lib.rs fan-in 0 fan-out 1",
+                "Files by coupling:",
+                "File: src/child.rs dependencies 0 dependents 1",
+                "File: src/lib.rs dependencies 1 dependents 0",
             ]
         );
     }
@@ -3507,6 +5130,31 @@ mod tests {
     }
 
     #[test]
+    fn repo_tree_rows_handle_deep_paths_iteratively() {
+        let depth = 2_000;
+        let path = (0..depth)
+            .map(|index| format!("d{index}"))
+            .chain(std::iter::once("leaf.rs".to_owned()))
+            .collect::<Vec<_>>()
+            .join("/");
+        let scan = ScanReport::from_parts(Vec::new(), vec![file_record(&path)]);
+        let parse = parse::scaffold_report_from_scan(&scan);
+        let complexity = complexity::report_from_parse(&parse);
+        let snapshot = TuiSnapshot::from_parts(empty_report(&scan), scan, parse, complexity);
+
+        let rows = repo_tree_rows(&snapshot);
+
+        assert_eq!(rows.len(), depth + 1);
+        assert_eq!(
+            rows.last().map(|row| row.path.as_str()),
+            Some(path.as_str())
+        );
+        assert!(rows.last().is_some_and(|row| row
+            .text
+            .starts_with(&format!("{}[file]", "  ".repeat(depth)))));
+    }
+
+    #[test]
     fn reducer_opens_repo_tree_and_drills_file_rows_to_file_detail() {
         let snapshot = test_snapshot();
         let mut state = TuiAppState::default();
@@ -3690,6 +5338,18 @@ mod tests {
             .collect()
     }
 
+    fn lines_text(lines: &[Line<'_>]) -> String {
+        lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
+    }
+
+    fn buffer_line_text(terminal: &Terminal<TestBackend>, y: usize, width: usize) -> String {
+        let content = terminal.backend().buffer().content();
+        content[y * width..(y + 1) * width]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
     fn select_visible_row(state: &mut TuiAppState, snapshot: &TuiSnapshot, row_text: &str) {
         let rows = filtered_visible_rows(snapshot, state);
         state.selection_for_current_view_mut().selected = rows
@@ -3767,8 +5427,13 @@ mod tests {
                 total_churn_lines: Some(120),
                 recent_churn_lines: Some(30),
                 author_count: Some(3),
+                owner_count: Some(3),
                 dominant_owner_share: Some(0.57),
                 co_changed_file_count: Some(4),
+                file_age_days: Some(365),
+                repository_age_days: Some(730),
+                repository_author_count: Some(10),
+                repository_file_count: Some(200),
             },
             normalized_metrics: NormalizedScoreMetrics {
                 size: Some(0.1),
@@ -3801,6 +5466,80 @@ mod tests {
             }],
         }];
         report
+    }
+
+    fn hotspot_fixture(
+        rank: u64,
+        path: &str,
+        score: f64,
+        churn: f64,
+        size: f64,
+        recent_churn: f64,
+    ) -> ReportHotspot {
+        ReportHotspot {
+            rank,
+            path: path.to_owned(),
+            score,
+            formula_version: FormulaVersion::current(),
+            raw_metrics: RawScoreMetrics {
+                path: path.to_owned(),
+                byte_size: Some((size * 400_000.0) as u64),
+                line_count: Some(100),
+                commits_per_file: Some(10),
+                total_churn_lines: Some((churn * 2_000.0) as u64),
+                recent_churn_lines: Some((recent_churn * 100.0) as u64),
+                author_count: Some(2),
+                owner_count: Some(2),
+                dominant_owner_share: Some(0.5),
+                co_changed_file_count: Some(1),
+                file_age_days: Some(365),
+                repository_age_days: Some(730),
+                repository_author_count: Some(10),
+                repository_file_count: Some(200),
+            },
+            normalized_metrics: NormalizedScoreMetrics {
+                size: Some(size),
+                churn: Some(churn),
+                recent_churn: Some(recent_churn),
+                ownership: Some(0.2),
+                coupling: Some(0.1),
+            },
+            weighted_terms: vec![
+                weighted_term("churn_score", NormalizedMetric::Churn, churn, 0.35),
+                weighted_term("size_score", NormalizedMetric::Size, size, 0.20),
+                weighted_term(
+                    "recent_growth",
+                    NormalizedMetric::RecentChurn,
+                    recent_churn,
+                    0.15,
+                ),
+            ],
+            limitations: Vec::new(),
+        }
+    }
+
+    fn weighted_term(
+        name: &str,
+        metric: NormalizedMetric,
+        normalized_input: f64,
+        weight: f64,
+    ) -> WeightedTerm {
+        WeightedTerm {
+            name: name.to_owned(),
+            metric,
+            formula_version: FormulaVersion::current(),
+            weight,
+            normalized_input: Some(normalized_input),
+            weighted_contribution: normalized_input * weight,
+        }
+    }
+
+    fn owner_share(author: &str, touch_count: u64, share: f64) -> TuiOwnerShare {
+        TuiOwnerShare {
+            author: author.to_owned(),
+            touch_count,
+            share,
+        }
     }
 
     fn empty_report(scan: &ScanReport) -> Report {
@@ -3903,5 +5642,9 @@ mod tests {
             cyclomatic_complexity: Some(8),
             max_control_flow_nesting: Some(3),
         }
+    }
+
+    fn char_position(value: &str, needle: char) -> Option<usize> {
+        value.chars().position(|candidate| candidate == needle)
     }
 }

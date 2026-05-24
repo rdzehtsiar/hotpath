@@ -6,8 +6,8 @@ repositories, indexes, and explain output can be tested against a public
 contract.
 
 Git metrics are advisory signals. They can point to files that may be volatile,
-recently active, or ownership-fragmented, but they do not prove that a file is
-bad, risky, or owned by the wrong person.
+recently active, or operationally concentrated, but they do not prove that a
+file is bad, risky, or owned by the wrong person.
 
 ## Practical Limitations
 
@@ -26,17 +26,18 @@ Important limitations:
   parent. Side-branch commits reachable from `HEAD` are still walked separately.
   This can make the merge commit itself appear to touch files introduced or
   changed on the side branch.
-- Git metrics do not currently filter or weight generated and vendor files by
+- Git metrics do not currently exclude generated and vendor files by
   scanner classification. If those paths exist in Git history, their churn,
-  authorship, and co-change rows can be present in Git metric output and index
-  rows.
+  authorship, operational ownership, and co-change rows can be present in Git
+  metric output and index rows.
 - Shallow repositories are rejected before output or persistence. Hotpath does
   not estimate missing history.
 - Author identity is the exact commit author string. `.mailmap`, case folding,
   bot detection, domain normalization, and account merging are not applied.
 - Binary file changes, pure renames, and changes where Git does not provide line
-  statistics contribute `0` added and deleted lines. Commit counts and ownership
-  can still change even when line churn is `0`.
+  statistics contribute `0` added and deleted lines. Commit counts and raw
+  author counts can still change, but zero-line changes do not create
+  operational ownership weight.
 - Commit timestamps come from local Git metadata. Recent churn and file age use
   the `HEAD` committer timestamp as the reference time, so rewritten, imported,
   rebased, or otherwise skewed timestamps can distort age and recency metrics.
@@ -87,8 +88,8 @@ repository-relative path as an added, modified, deleted, type-changed, renamed,
 or copied path.
 
 Multiple hunks or repeated diff records for the same path in one commit count as
-one file touch for commit-counting, authorship, ownership, and co-change
-purposes.
+one file touch for commit-counting, raw authorship, sustained ownership
+activity, and co-change purposes.
 
 Line churn uses the added and deleted line counts reported by the selected diff.
 For binary changes or file changes where line counts are unavailable, line churn
@@ -180,30 +181,41 @@ author_count(path) =
   count(distinct exact_author_identity for commits that touch path)
 ```
 
-## Dominant Ownership
+## Operational Ownership
 
-The dominant owner for a path is the author identity with the highest number of
-file-touching commits for that path.
+Operational ownership is weighted maintainership, not raw contributor history.
+It uses changed lines, recency, bulk-change dampening, and sustained activity to
+favor contributors who meaningfully maintain the file today.
+
+The compact owner count for a path is the number of meaningful operational
+owners retained in the displayed ownership summary, capped at three. It is not
+the same as `author_count`.
+
+The dominant owner for a path is the author identity with the highest weighted
+operational ownership score for that path.
 
 Tie-break rule:
 
 ```text
-sort by touch_count descending, then exact_author_identity ascending
+sort by ownership_score descending, then exact_author_identity ascending
 ```
 
 The ascending author string tie-breaker makes results stable when two or more
-authors have the same touch count.
+authors have the same weighted score.
 
 Dominant ownership share is:
 
 ```text
 dominant_owner_share(path) =
-  dominant_owner_touch_count(path) / commits_per_file(path)
+  dominant_owner_score(path) / sum(ownership_score(path) for retained owners and others)
 ```
 
-If `commits_per_file` is `0`, dominant owner and dominant owner share are
-undefined and should be omitted or reported as unavailable rather than forced to
-an arbitrary value.
+If no author has a positive operational ownership score, dominant owner and
+dominant owner share are undefined and should be omitted or reported as
+unavailable rather than forced to an arbitrary value.
+
+See [Operational ownership](ownership.md) for the complete deterministic
+weighting and filtering model.
 
 ## Co-Change
 
@@ -264,5 +276,5 @@ metrics.
 
 Future implementation work should add deterministic fixture repositories and
 focused tests that cover commit counting, recent churn windows, exact author
-identity, dominant owner tie-breaking, co-change ordering, root commits, merge
-commits, and conservative rename behavior.
+identity, operational owner weighting and tie-breaking, co-change ordering, root
+commits, merge commits, and conservative rename behavior.

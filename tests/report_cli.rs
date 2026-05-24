@@ -137,7 +137,7 @@ fn report_defaults_to_deterministic_markdown_without_path_leaks() {
     assert!(default_stdout.contains("- Files scanned: 3"));
     assert!(default_stdout.contains("- Hotspots ranked: 3"));
     assert!(default_stdout.contains("## Top Hotspots"));
-    assert!(default_stdout.contains("| 1 | `src/risky.rs` |"));
+    assert!(default_stdout.contains("| 1 | `src/related.rs` |"));
     assert!(default_stdout.contains("Risk /10"));
     assert!(default_stdout.contains("## Calculation Notes"));
     assert!(default_stdout.contains("does not require network access or telemetry"));
@@ -321,9 +321,9 @@ fn report_sarif_is_deterministic_and_has_expected_shape() {
     );
     assert_eq!(
         sarif_result_levels(&value),
-        vec!["error", "warning", "note"]
+        vec!["warning", "warning", "note"]
     );
-    assert!(first_stdout.contains("hotpath.score.v1"));
+    assert!(first_stdout.contains("hotpath.score.v3"));
     assert!(first_stdout.contains("advisory decision-support"));
     assert!(!first_stdout.contains("pub fn"));
     assert!(!first_stdout.contains("\\src\\"));
@@ -345,7 +345,7 @@ fn report_sarif_results_include_expected_properties() {
     assert_eq!(result["ruleId"], "hotpath.hotspot.risk");
     assert_eq!(result["ruleIndex"], 0);
     assert_eq!(result["properties"]["rank"], 1);
-    assert_eq!(result["properties"]["formulaVersion"], "hotpath.score.v1");
+    assert_eq!(result["properties"]["formulaVersion"], "hotpath.score.v3");
     assert_eq!(risk, score * 10.0);
     assert!(result["message"]["text"]
         .as_str()
@@ -358,7 +358,7 @@ fn report_sarif_results_include_expected_properties() {
     assert!(result["message"]["text"]
         .as_str()
         .expect("message text")
-        .contains("hotpath.score.v1"));
+        .contains("hotpath.score.v3"));
     assert!(result["properties"]["advisory"]
         .as_str()
         .expect("advisory property")
@@ -397,7 +397,8 @@ fn report_sarif_rejects_non_git_directory_without_output_or_path_leak() {
     assert!(stderr.starts_with("hotpath: path is not a readable Git worktree"));
     assert!(stderr.contains("run report from inside a repository"));
     assert!(!contains_path(&stderr, fixture.path()));
-    assert!(!fixture.path().join(".hotpath").exists());
+    assert!(fixture.path().join(".hotpath").join("logs").exists());
+    assert!(!fixture.path().join(".hotpath").join("index.db").exists());
 }
 
 #[test]
@@ -437,7 +438,7 @@ fn ci_risk_gate_passes_when_max_risk_is_below_threshold_without_path_leaks() {
     assert!(stdout.contains("result: pass\n"));
     assert!(stdout.contains("threshold: 10.000/10\n"));
     assert!(stdout.contains("max risk: "));
-    assert!(stdout.contains("highest-risk file: src/risky.rs\n"));
+    assert!(stdout.contains("highest-risk file: src/related.rs\n"));
     assert!(!contains_path(&stdout, fixture.path()));
 }
 
@@ -452,7 +453,7 @@ fn ci_risk_gate_fails_when_max_risk_meets_threshold() {
     assert!(output.stderr.is_empty());
     assert!(stdout.contains("result: fail\n"));
     assert!(stdout.contains("threshold: 0.001/10\n"));
-    assert!(stdout.contains("highest-risk file: src/risky.rs\n"));
+    assert!(stdout.contains("highest-risk file: src/related.rs\n"));
     assert!(!contains_path(&stdout, fixture.path()));
 }
 
@@ -505,7 +506,8 @@ fn ci_operational_errors_exit_two_without_output_or_path_leaks() {
     assert!(stderr.starts_with("hotpath: path is not a readable Git worktree"));
     assert!(stderr.contains("run report from inside a repository"));
     assert!(!contains_path(&stderr, fixture.path()));
-    assert!(!fixture.path().join(".hotpath").exists());
+    assert!(fixture.path().join(".hotpath").join("logs").exists());
+    assert!(!fixture.path().join(".hotpath").join("index.db").exists());
 }
 
 #[test]
@@ -515,23 +517,26 @@ fn report_json_preserves_hotspot_ranking_order_and_score_payloads() {
 
     assert_eq!(
         hotspot_paths(&value),
-        vec!["src/risky.rs", "src/related.rs", "src/stable.rs"]
+        vec!["src/related.rs", "src/risky.rs", "src/stable.rs"]
     );
     assert_eq!(value["hotspots"][0]["rank"], 1);
-    assert_eq!(value["hotspots"][0]["path"], "src/risky.rs");
+    assert_eq!(value["hotspots"][0]["path"], "src/related.rs");
     assert_eq!(
         value["hotspots"][0]["formula_version"]["id"],
-        "hotpath.score.v1"
+        "hotpath.score.v3"
     );
-    assert_eq!(value["hotspots"][0]["raw_metrics"]["path"], "src/risky.rs");
-    assert_eq!(value["hotspots"][0]["raw_metrics"]["line_count"], 100);
+    assert_eq!(
+        value["hotspots"][0]["raw_metrics"]["path"],
+        "src/related.rs"
+    );
+    assert_eq!(value["hotspots"][0]["raw_metrics"]["line_count"], 2);
     assert!(value["hotspots"][0]["weighted_terms"]
         .as_array()
         .expect("weighted terms")
         .iter()
         .any(|term| term["name"] == "churn_score"));
     assert_eq!(value["findings"][0]["code"], "hotpath.hotspot.risk");
-    assert_eq!(value["findings"][0]["path"], "src/risky.rs");
+    assert_eq!(value["findings"][0]["path"], "src/related.rs");
     assert_eq!(value["findings"][0]["rank"], 1);
 }
 
@@ -572,8 +577,8 @@ fn report_json_persists_scan_git_analysis_and_hotspots() {
             .map(|hotspot| (hotspot.rank, hotspot.path.as_str()))
             .collect::<Vec<_>>(),
         vec![
-            (1, "src/risky.rs"),
-            (2, "src/related.rs"),
+            (1, "src/related.rs"),
+            (2, "src/risky.rs"),
             (3, "src/stable.rs"),
         ]
     );
@@ -628,7 +633,8 @@ fn report_json_rejects_non_git_directory_without_output_or_path_leak() {
     assert!(stderr.starts_with("hotpath: path is not a readable Git worktree"));
     assert!(stderr.contains("run report from inside a repository"));
     assert!(!contains_path(&stderr, fixture.path()));
-    assert!(!fixture.path().join(".hotpath").exists());
+    assert!(fixture.path().join(".hotpath").join("logs").exists());
+    assert!(!fixture.path().join(".hotpath").join("index.db").exists());
 }
 
 #[test]
@@ -641,7 +647,8 @@ fn report_json_rejects_missing_head_without_output_or_path_leak() {
     assert!(stderr.starts_with("hotpath: Git repository does not have a commit at HEAD"));
     assert!(stderr.contains("create an initial commit"));
     assert!(!contains_path(&stderr, fixture.path()));
-    assert!(!fixture.path().join(".hotpath").exists());
+    assert!(fixture.path().join(".hotpath").join("logs").exists());
+    assert!(!fixture.path().join(".hotpath").join("index.db").exists());
 }
 
 #[test]
@@ -666,7 +673,8 @@ fn report_json_rejects_shallow_repository_without_output_or_path_leak() {
     assert!(stderr.starts_with("hotpath: Git repository has shallow history"));
     assert!(stderr.contains("fetch complete local history"));
     assert!(!contains_path(&stderr, fixture.path()));
-    assert!(!fixture.path().join(".hotpath").exists());
+    assert!(fixture.path().join(".hotpath").join("logs").exists());
+    assert!(!fixture.path().join(".hotpath").join("index.db").exists());
 }
 
 fn ranked_fixture(name: &str) -> GitFixture {

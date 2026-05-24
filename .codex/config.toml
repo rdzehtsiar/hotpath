@@ -1,0 +1,14 @@
+# Run without any approval prompts
+approval_policy = "never"
+
+# Disable sandbox restrictions (full filesystem + network access)
+sandbox_mode = "danger-full-access"
+
+# Optional: allow network access explicitly
+network_access = true
+
+# Optional: allow running shell commands automatically
+allow_shell = true
+
+# Optional logging
+log_level = "info"

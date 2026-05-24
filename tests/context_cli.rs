@@ -136,20 +136,38 @@ fn assert_no_path_leaks_in_json(value: &Value, fixture_path: &Path) {
 }
 
 fn collect_json_strings<'a>(value: &'a Value, strings: &mut Vec<&'a str>) {
-    match value {
-        Value::String(text) => strings.push(text),
-        Value::Array(values) => {
-            for value in values {
-                collect_json_strings(value, strings);
+    let mut stack = vec![value];
+
+    while let Some(value) = stack.pop() {
+        match value {
+            Value::String(text) => strings.push(text),
+            Value::Array(values) => {
+                for value in values.iter().rev() {
+                    stack.push(value);
+                }
             }
-        }
-        Value::Object(values) => {
-            for value in values.values() {
-                collect_json_strings(value, strings);
+            Value::Object(values) => {
+                let values = values.values().collect::<Vec<_>>();
+                for value in values.into_iter().rev() {
+                    stack.push(value);
+                }
             }
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
         }
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
+}
+
+#[test]
+fn json_string_collection_handles_deep_json_iteratively() {
+    let mut value = Value::String("needle".to_owned());
+    for _ in 0..2_000 {
+        value = Value::Array(vec![value]);
+    }
+    let mut strings = Vec::new();
+
+    collect_json_strings(&value, &mut strings);
+
+    assert_eq!(strings, vec!["needle"]);
 }
 
 fn push_path_leak_needles(needles: &mut Vec<String>, path: &Path) {
