@@ -1,19 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::BTreeMap;
+use std::env;
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use rusqlite::{
     params, params_from_iter, types::Type, Connection, OpenFlags, OptionalExtension, Row,
     Statement, ToSql, Transaction,
 };
 use serde::Serialize;
+use serde_json::json;
 
 use crate::git::{GitCoChange, GitFileChange, GitFileMetrics};
+use crate::operation_log;
 use crate::scoring::{NormalizedScoreMetrics, RankedHotspotScore, ScoreLimitation, WeightedTerm};
 use crate::{
     dependency, ContentKind, FileRecord, FileWarning, ParseReport, ParseSymbolRecord, ScanReport,
@@ -1275,6 +1279,7 @@ impl IndexStore {
 
         let index_path = self.path.clone();
         let mut payloads = Vec::with_capacity(commits.len());
+        let serialize_started = Instant::now();
         for (commit_id, changes) in commits {
             let changes_json = serde_json::to_string(changes).map_err(|source| {
                 IndexError::InvalidGitAnalysisData {
@@ -1284,7 +1289,9 @@ impl IndexStore {
             })?;
             payloads.push((commit_id, changes_json));
         }
+        let serialize_ms = elapsed_ms(serialize_started.elapsed());
 
+        let write_started = Instant::now();
         let transaction =
             self.connection
                 .transaction()
@@ -1325,10 +1332,35 @@ impl IndexStore {
         transaction
             .commit()
             .map_err(|source| IndexError::PersistGitAnalysis {
-                path: index_path,
+                path: index_path.clone(),
                 source,
-            })
+            })?;
+        if git_perf_enabled() {
+            operation_log::event(
+                "hotpath.git_cache_write",
+                json!({
+                    "commits": commits.len(),
+                    "serialize_ms": serialize_ms,
+                    "sqlite_write_ms": elapsed_ms(write_started.elapsed()),
+                }),
+            );
+        }
+
+        Ok(())
     }
+}
+
+fn git_perf_enabled() -> bool {
+    env::var("HOTPATH_PERF").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn elapsed_ms(duration: Duration) -> u128 {
+    duration.as_millis()
 }
 
 #[derive(Debug)]

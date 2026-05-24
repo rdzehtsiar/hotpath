@@ -8,12 +8,16 @@ use std::fmt;
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Receiver, TrySendError};
 use git2::{Delta, Diff, DiffLineType, DiffOptions, ErrorClass, ErrorCode, Oid, Repository, Sort};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
+use crate::operation_log;
 use crate::ownership::{operational_ownership_from_changes, OperationalOwnershipSnapshot};
 
 pub const RECENT_CHURN_WINDOW_DAYS: i64 = 90;
@@ -27,6 +31,7 @@ const GIT_COMMIT_CACHE_WRITE_BATCH_SIZE: usize = 512;
 const GIT_DIFF_QUEUE_FACTOR: usize = 4;
 const GIT_RESULT_QUEUE_FACTOR: usize = 8;
 const MAX_DEFAULT_GIT_WORKERS: usize = 16;
+const GIT_PERF_ENV: &str = "HOTPATH_PERF";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// A raw repository-relative file change observed in one reachable commit.
@@ -127,6 +132,170 @@ pub struct GitPipelineOptions {
     pub job_commit_chunk_size: usize,
     pub diff_queue_capacity: usize,
     pub result_queue_capacity: usize,
+}
+
+#[derive(Debug)]
+struct GitPerf {
+    enabled: bool,
+    started_at: Instant,
+    total_commits: usize,
+    git_jobs: usize,
+    job_commit_chunk_size: usize,
+    diff_queue_capacity: usize,
+    result_queue_capacity: usize,
+    revwalk_ms: u128,
+    cache_batches: u64,
+    cache_lookup_ms: u128,
+    cache_hits: u64,
+    cache_misses: u64,
+    jobs_sent: u64,
+    queue_full_count: u64,
+    enqueue_wait_ms: u128,
+    result_receive_wait_ms: u128,
+    result_batches: u64,
+    reducer_handle_ms: u128,
+    reducer_commits: u64,
+    reducer_changes: u64,
+    reducer_deltas: u64,
+    reducer_changed_lines: u64,
+    cache_flushes: u64,
+    final_sort_ms: u128,
+    aggregation_ms: u128,
+    workers: Arc<Mutex<Vec<GitWorkerPerf>>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct GitWorkerPerf {
+    worker_id: usize,
+    jobs: u64,
+    commits: u64,
+    changes: u64,
+    deltas: u64,
+    changed_lines: u64,
+    active_ms: u128,
+    send_wait_ms: u128,
+    errors: u64,
+}
+
+impl GitPerf {
+    fn new(enabled: bool, options: GitPipelineOptions) -> Self {
+        Self {
+            enabled,
+            started_at: Instant::now(),
+            total_commits: 0,
+            git_jobs: options.git_jobs,
+            job_commit_chunk_size: options.job_commit_chunk_size,
+            diff_queue_capacity: options.diff_queue_capacity,
+            result_queue_capacity: options.result_queue_capacity,
+            revwalk_ms: 0,
+            cache_batches: 0,
+            cache_lookup_ms: 0,
+            cache_hits: 0,
+            cache_misses: 0,
+            jobs_sent: 0,
+            queue_full_count: 0,
+            enqueue_wait_ms: 0,
+            result_receive_wait_ms: 0,
+            result_batches: 0,
+            reducer_handle_ms: 0,
+            reducer_commits: 0,
+            reducer_changes: 0,
+            reducer_deltas: 0,
+            reducer_changed_lines: 0,
+            cache_flushes: 0,
+            final_sort_ms: 0,
+            aggregation_ms: 0,
+            workers: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn disabled() -> Self {
+        Self::new(false, GitPipelineOptions::default())
+    }
+
+    fn emit_summary(&self) {
+        if !self.enabled {
+            return;
+        }
+
+        let workers = self
+            .workers
+            .lock()
+            .map(|workers| workers.clone())
+            .unwrap_or_default();
+        operation_log::event(
+            "hotpath.git_perf_summary",
+            json!({
+                "elapsed_ms": elapsed_ms(self.started_at.elapsed()),
+                "total_commits": self.total_commits,
+                "git_jobs": self.git_jobs,
+                "job_commit_chunk_size": self.job_commit_chunk_size,
+                "diff_queue_capacity": self.diff_queue_capacity,
+                "result_queue_capacity": self.result_queue_capacity,
+                "revwalk_ms": self.revwalk_ms,
+                "cache_batches": self.cache_batches,
+                "cache_lookup_ms": self.cache_lookup_ms,
+                "cache_hits": self.cache_hits,
+                "cache_misses": self.cache_misses,
+                "jobs_sent": self.jobs_sent,
+                "queue_full_count": self.queue_full_count,
+                "enqueue_wait_ms": self.enqueue_wait_ms,
+                "result_receive_wait_ms": self.result_receive_wait_ms,
+                "result_batches": self.result_batches,
+                "reducer_handle_ms": self.reducer_handle_ms,
+                "reducer_commits": self.reducer_commits,
+                "reducer_changes": self.reducer_changes,
+                "reducer_deltas": self.reducer_deltas,
+                "reducer_changed_lines": self.reducer_changed_lines,
+                "cache_flushes": self.cache_flushes,
+                "final_sort_ms": self.final_sort_ms,
+                "aggregation_ms": self.aggregation_ms,
+                "workers": workers.iter().map(|worker| {
+                    json!({
+                        "worker_id": worker.worker_id,
+                        "jobs": worker.jobs,
+                        "commits": worker.commits,
+                        "changes": worker.changes,
+                        "deltas": worker.deltas,
+                        "changed_lines": worker.changed_lines,
+                        "active_ms": worker.active_ms,
+                        "send_wait_ms": worker.send_wait_ms,
+                        "errors": worker.errors,
+                    })
+                }).collect::<Vec<_>>(),
+            }),
+        );
+    }
+
+    fn record_send_stats(&mut self, stats: SendDiffJobStats) {
+        self.jobs_sent += 1;
+        self.queue_full_count += stats.queue_full_count;
+        self.enqueue_wait_ms += stats.enqueue_wait_ms;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SendDiffJobStats {
+    queue_full_count: u64,
+    enqueue_wait_ms: u128,
+}
+
+struct GitCacheCallbacks<L, S> {
+    load: L,
+    store: S,
+}
+
+fn git_perf_enabled() -> bool {
+    env::var(GIT_PERF_ENV).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn elapsed_ms(duration: Duration) -> u128 {
+    duration.as_millis()
 }
 
 impl Default for GitPipelineOptions {
@@ -486,19 +655,27 @@ where
             path: worktree_path.to_path_buf(),
         })?
         .to_path_buf();
+    let options = GitPipelineOptions::default();
+    let mut perf = GitPerf::new(git_perf_enabled(), options);
     let changes = file_changes_from_repository_with_progress_and_cache(
         &repository,
         &worktree_root,
         head_commit_id,
         progress,
-        load_cached_commits,
-        store_commits,
-        GitPipelineOptions::default(),
+        GitCacheCallbacks {
+            load: load_cached_commits,
+            store: store_commits,
+        },
+        options,
+        &mut perf,
     )?;
+    let aggregation_started = Instant::now();
     let ownership = operational_ownership_from_changes(&changes, head_commit_time);
     let file_metrics =
         file_metrics_from_changes_with_ownership(&changes, head_commit_time, &ownership);
     let co_changes = co_changes_from_changes(&changes);
+    perf.aggregation_ms = elapsed_ms(aggregation_started.elapsed());
+    perf.emit_summary();
 
     Ok(GitAnalysis {
         worktree_root,
@@ -533,35 +710,53 @@ where
             path: PathBuf::from("."),
         })?
         .to_path_buf();
+    let mut perf = GitPerf::disabled();
     file_changes_from_repository_with_progress_and_cache(
         repository,
         &worktree_root,
         head_commit_id,
         progress,
-        |_| BTreeMap::new(),
-        |_| {},
+        GitCacheCallbacks {
+            load: no_cached_commits,
+            store: ignore_cached_commits,
+        },
         GitPipelineOptions::default(),
+        &mut perf,
     )
 }
+
+fn no_cached_commits(_: &[String]) -> BTreeMap<String, Vec<GitFileChange>> {
+    BTreeMap::new()
+}
+
+fn ignore_cached_commits(_: &[(String, Vec<GitFileChange>)]) {}
 
 fn file_changes_from_repository_with_progress_and_cache<F, L, S>(
     repository: &Repository,
     worktree_root: &Path,
     head_commit_id: Oid,
     mut progress: F,
-    mut load_cached_commits: L,
-    mut store_commits: S,
+    mut cache: GitCacheCallbacks<L, S>,
     options: GitPipelineOptions,
+    perf: &mut GitPerf,
 ) -> Result<Vec<GitFileChange>, GitHistoryError>
 where
     F: FnMut(GitHistoryProgress),
     L: FnMut(&[String]) -> BTreeMap<String, Vec<GitFileChange>>,
     S: FnMut(&[(String, Vec<GitFileChange>)]),
 {
+    let revwalk_started = Instant::now();
     let commits = reachable_commits(repository, head_commit_id)?;
+    perf.revwalk_ms = elapsed_ms(revwalk_started.elapsed());
     let mut changes = Vec::new();
     let total_commits = commits.len();
+    perf.total_commits = total_commits;
+    perf.git_jobs = options.git_jobs;
+    perf.job_commit_chunk_size = options.job_commit_chunk_size;
+    perf.diff_queue_capacity = options.diff_queue_capacity;
+    perf.result_queue_capacity = options.result_queue_capacity;
     if total_commits == 0 {
+        perf.emit_summary();
         return Ok(changes);
     }
     let git_jobs = options.git_jobs.clamp(1, total_commits.max(1));
@@ -570,12 +765,21 @@ where
     let (result_sender, result_receiver) =
         bounded::<DiffWorkerResult>(options.result_queue_capacity.max(git_jobs));
     let mut workers = Vec::with_capacity(git_jobs);
-    for _ in 0..git_jobs {
+    for worker_id in 0..git_jobs {
         let worktree_root = worktree_root.to_path_buf();
         let job_receiver = job_receiver.clone();
         let result_sender = result_sender.clone();
+        let worker_perf = perf.workers.clone();
+        let enabled = perf.enabled;
         workers.push(thread::spawn(move || {
-            diff_worker(&worktree_root, job_receiver, result_sender);
+            diff_worker(
+                worker_id,
+                &worktree_root,
+                job_receiver,
+                result_sender,
+                worker_perf,
+                enabled,
+            );
         }));
     }
     drop(result_sender);
@@ -589,10 +793,14 @@ where
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>();
-        let mut cached_changes = load_cached_commits(&commit_ids);
+        let cache_lookup_started = Instant::now();
+        let mut cached_changes = (cache.load)(&commit_ids);
+        perf.cache_batches += 1;
+        perf.cache_lookup_ms += elapsed_ms(cache_lookup_started.elapsed());
         for commit_id in commit_batch {
             let commit_id_string = commit_id.to_string();
             if let Some(cached) = cached_changes.remove(&commit_id_string) {
+                perf.cache_hits += 1;
                 changes.extend(cached);
                 completed_commits += 1;
                 progress(GitHistoryProgress {
@@ -600,6 +808,7 @@ where
                     total_commits,
                 });
             } else {
+                perf.cache_misses += 1;
                 diff_batch.push(*commit_id);
                 if diff_batch.len() < job_commit_chunk_size {
                     continue;
@@ -609,17 +818,19 @@ where
                     &job_sender,
                     &result_receiver,
                     &mut |result| {
-                        handle_diff_result(
-                            result,
-                            &mut changes,
-                            &mut fresh_cache_writes,
-                            &mut store_commits,
-                            &mut completed_commits,
+                        DiffReducer {
+                            changes: &mut changes,
+                            fresh_cache_writes: &mut fresh_cache_writes,
+                            store_commits: &mut cache.store,
+                            completed_commits: &mut completed_commits,
                             total_commits,
-                            &mut progress,
-                        )
+                            progress: &mut progress,
+                            perf,
+                        }
+                        .handle(result)
                     },
-                )?;
+                )
+                .map(|stats| perf.record_send_stats(stats))?;
             }
         }
         if !diff_batch.is_empty() {
@@ -628,36 +839,41 @@ where
                 &job_sender,
                 &result_receiver,
                 &mut |result| {
-                    handle_diff_result(
-                        result,
-                        &mut changes,
-                        &mut fresh_cache_writes,
-                        &mut store_commits,
-                        &mut completed_commits,
+                    DiffReducer {
+                        changes: &mut changes,
+                        fresh_cache_writes: &mut fresh_cache_writes,
+                        store_commits: &mut cache.store,
+                        completed_commits: &mut completed_commits,
                         total_commits,
-                        &mut progress,
-                    )
+                        progress: &mut progress,
+                        perf,
+                    }
+                    .handle(result)
                 },
-            )?;
+            )
+            .map(|stats| perf.record_send_stats(stats))?;
         }
     }
     drop(job_sender);
 
     while completed_commits < total_commits {
+        let receive_started = Instant::now();
         let result = result_receiver
             .recv()
             .map_err(|_| GitHistoryError::WorkerFailed {
                 context: "receiving Git diff worker result",
             })?;
-        handle_diff_result(
-            result,
-            &mut changes,
-            &mut fresh_cache_writes,
-            &mut store_commits,
-            &mut completed_commits,
+        perf.result_receive_wait_ms += elapsed_ms(receive_started.elapsed());
+        DiffReducer {
+            changes: &mut changes,
+            fresh_cache_writes: &mut fresh_cache_writes,
+            store_commits: &mut cache.store,
+            completed_commits: &mut completed_commits,
             total_commits,
-            &mut progress,
-        )?;
+            progress: &mut progress,
+            perf,
+        }
+        .handle(result)?;
     }
 
     if completed_commits != total_commits {
@@ -665,7 +881,10 @@ where
             context: "collecting Git diff worker results",
         });
     }
-    store_commits(&fresh_cache_writes);
+    if !fresh_cache_writes.is_empty() {
+        (cache.store)(&fresh_cache_writes);
+        perf.cache_flushes += 1;
+    }
     fresh_cache_writes.clear();
     for worker in workers {
         if worker.join().is_err() {
@@ -675,6 +894,7 @@ where
         }
     }
 
+    let sort_started = Instant::now();
     changes.sort_by(|left, right| {
         (
             left.commit_time,
@@ -693,27 +913,50 @@ where
                 right.deleted_lines,
             ))
     });
+    perf.final_sort_ms = elapsed_ms(sort_started.elapsed());
 
     Ok(changes)
 }
 
 type DiffJob = Vec<Oid>;
-type DiffWorkerResult = Result<Vec<(String, Vec<GitFileChange>)>, GitHistoryError>;
+type DiffWorkerResult = Result<DiffBatch, GitHistoryError>;
+
+#[derive(Debug)]
+struct DiffBatch {
+    commits: Vec<(String, Vec<GitFileChange>)>,
+    change_count: u64,
+    delta_count: u64,
+    changed_lines: u64,
+}
+
+#[derive(Debug)]
+struct DiffCommitOutput {
+    commit_id: String,
+    changes: Vec<GitFileChange>,
+    delta_count: u64,
+    changed_lines: u64,
+}
 
 fn send_diff_job<F>(
     job: DiffJob,
     sender: &crossbeam_channel::Sender<DiffJob>,
     result_receiver: &Receiver<DiffWorkerResult>,
     handle_result: &mut F,
-) -> Result<(), GitHistoryError>
+) -> Result<SendDiffJobStats, GitHistoryError>
 where
     F: FnMut(DiffWorkerResult) -> Result<(), GitHistoryError>,
 {
+    let started = Instant::now();
+    let mut stats = SendDiffJobStats::default();
     let mut pending = job;
     loop {
         match sender.try_send(pending) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                stats.enqueue_wait_ms = elapsed_ms(started.elapsed());
+                return Ok(stats);
+            }
             Err(TrySendError::Full(job)) => {
+                stats.queue_full_count += 1;
                 pending = job;
                 let result = result_receiver
                     .recv()
@@ -731,61 +974,126 @@ where
     }
 }
 
-fn handle_diff_result<F, S>(
-    result: DiffWorkerResult,
-    changes: &mut Vec<GitFileChange>,
-    fresh_cache_writes: &mut Vec<(String, Vec<GitFileChange>)>,
-    store_commits: &mut S,
-    completed_commits: &mut usize,
+struct DiffReducer<'a, F, S> {
+    changes: &'a mut Vec<GitFileChange>,
+    fresh_cache_writes: &'a mut Vec<(String, Vec<GitFileChange>)>,
+    store_commits: &'a mut S,
+    completed_commits: &'a mut usize,
     total_commits: usize,
-    progress: &mut F,
-) -> Result<(), GitHistoryError>
+    progress: &'a mut F,
+    perf: &'a mut GitPerf,
+}
+
+impl<F, S> DiffReducer<'_, F, S>
 where
     F: FnMut(GitHistoryProgress),
     S: FnMut(&[(String, Vec<GitFileChange>)]),
 {
-    for (commit_id, commit_changes) in result? {
-        changes.extend(commit_changes.clone());
-        fresh_cache_writes.push((commit_id, commit_changes));
-        if fresh_cache_writes.len() >= GIT_COMMIT_CACHE_WRITE_BATCH_SIZE {
-            store_commits(fresh_cache_writes);
-            fresh_cache_writes.clear();
+    fn handle(self, result: DiffWorkerResult) -> Result<(), GitHistoryError> {
+        let started = Instant::now();
+        let batch = result?;
+        self.perf.result_batches += 1;
+        self.perf.reducer_commits += batch.commits.len() as u64;
+        self.perf.reducer_changes += batch.change_count;
+        self.perf.reducer_deltas += batch.delta_count;
+        self.perf.reducer_changed_lines += batch.changed_lines;
+        for (commit_id, commit_changes) in batch.commits {
+            self.changes.extend(commit_changes.clone());
+            self.fresh_cache_writes.push((commit_id, commit_changes));
+            if self.fresh_cache_writes.len() >= GIT_COMMIT_CACHE_WRITE_BATCH_SIZE {
+                (self.store_commits)(self.fresh_cache_writes);
+                self.perf.cache_flushes += 1;
+                self.fresh_cache_writes.clear();
+            }
+            *self.completed_commits += 1;
+            (self.progress)(GitHistoryProgress {
+                completed_commits: *self.completed_commits,
+                total_commits: self.total_commits,
+            });
         }
-        *completed_commits += 1;
-        progress(GitHistoryProgress {
-            completed_commits: *completed_commits,
-            total_commits,
-        });
+        self.perf.reducer_handle_ms += elapsed_ms(started.elapsed());
+        Ok(())
     }
-    Ok(())
 }
 
 fn diff_worker(
+    worker_id: usize,
     worktree_root: &Path,
     receiver: Receiver<DiffJob>,
     sender: crossbeam_channel::Sender<DiffWorkerResult>,
+    worker_perf: Arc<Mutex<Vec<GitWorkerPerf>>>,
+    perf_enabled: bool,
 ) {
+    let mut local_perf = GitWorkerPerf {
+        worker_id,
+        ..GitWorkerPerf::default()
+    };
     let repository = match open_repository(worktree_root) {
         Ok(repository) => repository,
         Err(error) => {
+            local_perf.errors += 1;
+            record_worker_perf(perf_enabled, worker_perf, local_perf);
             let _ = sender.send(Err(error));
             return;
         }
     };
 
     for job in receiver {
-        let mut batch = Vec::with_capacity(job.len());
+        let active_started = Instant::now();
+        let mut commits = Vec::with_capacity(job.len());
+        let mut change_count = 0u64;
+        let mut delta_count = 0u64;
+        let mut changed_lines = 0u64;
         for commit_id in job {
             match diff_commit_file_changes(&repository, commit_id) {
-                Ok(changes) => batch.push(changes),
+                Ok(output) => {
+                    change_count += output.changes.len() as u64;
+                    delta_count += output.delta_count;
+                    changed_lines += output.changed_lines;
+                    commits.push((output.commit_id, output.changes));
+                }
                 Err(error) => {
+                    local_perf.errors += 1;
+                    record_worker_perf(perf_enabled, worker_perf, local_perf);
                     let _ = sender.send(Err(error));
                     return;
                 }
             }
         }
-        if sender.send(Ok(batch)).is_err() {
+        local_perf.active_ms += elapsed_ms(active_started.elapsed());
+        local_perf.jobs += 1;
+        local_perf.commits += commits.len() as u64;
+        local_perf.changes += change_count;
+        local_perf.deltas += delta_count;
+        local_perf.changed_lines += changed_lines;
+
+        let send_started = Instant::now();
+        if sender
+            .send(Ok(DiffBatch {
+                commits,
+                change_count,
+                delta_count,
+                changed_lines,
+            }))
+            .is_err()
+        {
+            local_perf.send_wait_ms += elapsed_ms(send_started.elapsed());
+            record_worker_perf(perf_enabled, worker_perf, local_perf);
             return;
+        }
+        local_perf.send_wait_ms += elapsed_ms(send_started.elapsed());
+    }
+    record_worker_perf(perf_enabled, worker_perf, local_perf);
+}
+
+fn record_worker_perf(
+    enabled: bool,
+    worker_perf: Arc<Mutex<Vec<GitWorkerPerf>>>,
+    local_perf: GitWorkerPerf,
+) {
+    if enabled {
+        if let Ok(mut workers) = worker_perf.lock() {
+            workers.push(local_perf);
         }
     }
 }
@@ -793,7 +1101,7 @@ fn diff_worker(
 fn diff_commit_file_changes(
     repository: &Repository,
     commit_id: Oid,
-) -> Result<(String, Vec<GitFileChange>), GitHistoryError> {
+) -> Result<DiffCommitOutput, GitHistoryError> {
     let commit = repository
         .find_commit(commit_id)
         .map_err(|source| GitHistoryError::Git {
@@ -822,6 +1130,7 @@ fn diff_commit_file_changes(
         )
     };
     let mut diff_options = DiffOptions::new();
+    diff_options.context_lines(0).interhunk_lines(0);
     let diff = repository
         .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut diff_options))
         .map_err(|source| GitHistoryError::Git {
@@ -836,7 +1145,18 @@ fn diff_commit_file_changes(
         commit_time,
     )?;
 
-    Ok((commit_id_string, changes))
+    let delta_count = changes.len() as u64;
+    let changed_lines = changes
+        .iter()
+        .map(|change| change.added_lines.saturating_add(change.deleted_lines))
+        .sum();
+
+    Ok(DiffCommitOutput {
+        commit_id: commit_id_string,
+        changes,
+        delta_count,
+        changed_lines,
+    })
 }
 
 /// Explain local Git history metrics and co-changes for one requested file.

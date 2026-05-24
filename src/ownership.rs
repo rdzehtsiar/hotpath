@@ -101,11 +101,13 @@ fn ownership_for_path(
     path: String,
     by_author: HashMap<String, ContributorAccumulator>,
 ) -> OperationalFileOwnership {
-    let total_effective_lines = by_author
-        .values()
-        .map(|contributor| contributor.effective_lines)
+    let mut contributors = by_author.into_iter().collect::<Vec<_>>();
+    contributors.sort_by(|left, right| left.0.cmp(&right.0));
+    let total_effective_lines = contributors
+        .iter()
+        .map(|(_, contributor)| contributor.effective_lines)
         .sum::<f64>();
-    let mut owners = by_author
+    let mut owners = contributors
         .into_iter()
         .filter_map(|(author, contributor)| {
             let meaningful_commits = contributor.meaningful_commits.len() as u64;
@@ -121,6 +123,7 @@ fn ownership_for_path(
             })
         })
         .collect::<Vec<_>>();
+    owners.sort_by(|left, right| left.author.cmp(&right.author));
     let total_score = owners.iter().map(|owner| owner.score).sum::<f64>();
 
     if total_score > 0.0 {
