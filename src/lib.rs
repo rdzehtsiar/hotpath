@@ -524,6 +524,37 @@ pub enum ContextCommandError {
 }
 
 #[derive(Debug)]
+pub enum AnalyzeCommandError {
+    CurrentDir(std::io::Error),
+    Git(git::GitHistoryError),
+    Scan(ScanError),
+    PersistScan(storage::index::IndexError),
+    PersistGitAnalysis(storage::index::IndexError),
+    PersistHotspots(storage::index::IndexError),
+    PersistSymbols(storage::index::IndexError),
+    PersistUiFacts(storage::index::IndexError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalyzeProgress {
+    pub phase: &'static str,
+    pub detail: String,
+    pub completed: Option<u64>,
+    pub total: Option<u64>,
+    pub unit: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalyzeSummary {
+    pub worktree_root: PathBuf,
+    pub head_commit_id: String,
+    pub total_files: u64,
+    pub parsed_files: u64,
+    pub symbol_count: u64,
+    pub hotspot_count: u64,
+}
+
+#[derive(Debug)]
 pub enum ExplainCommandError {
     CurrentDir(std::io::Error),
     Git(git::GitHistoryError),
@@ -704,6 +735,48 @@ impl fmt::Display for ContextCommandError {
     }
 }
 
+impl fmt::Display for AnalyzeCommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CurrentDir(source) => {
+                write!(f, "failed to determine the current directory: {source}")
+            }
+            Self::Git(source) => write_hotspots_git_error(f, source),
+            Self::Scan(source) => write!(f, "{source}"),
+            Self::PersistScan(source) => {
+                write_hotspots_persistence_error(f, "persist scan results", source)
+            }
+            Self::PersistGitAnalysis(source) => {
+                write_hotspots_persistence_error(f, "persist Git analysis", source)
+            }
+            Self::PersistHotspots(source) => {
+                write_hotspots_persistence_error(f, "persist hotspot scores", source)
+            }
+            Self::PersistSymbols(source) => {
+                write_persistence_error(f, "persist parser symbols", source, "analyze")
+            }
+            Self::PersistUiFacts(source) => {
+                write_persistence_error(f, "persist TUI presentation facts", source, "analyze")
+            }
+        }
+    }
+}
+
+impl StdError for AnalyzeCommandError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::CurrentDir(source) => Some(source),
+            Self::Git(source) => Some(source),
+            Self::Scan(source) => Some(source),
+            Self::PersistScan(source)
+            | Self::PersistGitAnalysis(source)
+            | Self::PersistHotspots(source)
+            | Self::PersistSymbols(source)
+            | Self::PersistUiFacts(source) => Some(source),
+        }
+    }
+}
+
 impl StdError for ContextCommandError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
@@ -757,6 +830,18 @@ impl From<ScanError> for ContextCommandError {
     }
 }
 
+impl From<git::GitHistoryError> for AnalyzeCommandError {
+    fn from(source: git::GitHistoryError) -> Self {
+        Self::Git(source)
+    }
+}
+
+impl From<ScanError> for AnalyzeCommandError {
+    fn from(source: ScanError) -> Self {
+        Self::Scan(source)
+    }
+}
+
 impl From<serde_json::Error> for ContextCommandError {
     fn from(source: serde_json::Error) -> Self {
         Self::Json(source)
@@ -770,6 +855,25 @@ pub fn scan_current_dir() -> Result<ScanReport, ScanError> {
 }
 
 pub fn scan_repository(root: impl AsRef<Path>) -> Result<ScanReport, ScanError> {
+    scan_repository_with_progress(root, |_| {})
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanProgress {
+    pub phase: &'static str,
+    pub completed: u64,
+    pub total: Option<u64>,
+    pub unit: &'static str,
+    pub detail: String,
+}
+
+pub fn scan_repository_with_progress<F>(
+    root: impl AsRef<Path>,
+    mut progress: F,
+) -> Result<ScanReport, ScanError>
+where
+    F: FnMut(ScanProgress),
+{
     let requested_root = root.as_ref();
     let root = fs::canonicalize(requested_root).map_err(|source| ScanError::Root {
         path: requested_root.to_path_buf(),
@@ -793,8 +897,16 @@ pub fn scan_repository(root: impl AsRef<Path>) -> Result<ScanReport, ScanError> 
 
     let mut warnings = Vec::new();
     let mut file_paths = Vec::new();
+    let mut walked_entries = 0u64;
     let internal_filter_root = root.clone();
 
+    progress(ScanProgress {
+        phase: "walk",
+        completed: 0,
+        total: None,
+        unit: "entries",
+        detail: "walking repository entries".to_owned(),
+    });
     for entry in WalkBuilder::new(&root)
         .follow_links(false)
         .hidden(false)
@@ -813,6 +925,16 @@ pub fn scan_repository(root: impl AsRef<Path>) -> Result<ScanReport, ScanError> 
                 continue;
             }
         };
+        walked_entries += 1;
+        if walked_entries == 1 || walked_entries.is_multiple_of(1024) {
+            progress(ScanProgress {
+                phase: "walk",
+                completed: walked_entries,
+                total: None,
+                unit: "entries",
+                detail: format!("walking files; {} candidates", file_paths.len()),
+            });
+        }
 
         if let Some(error) = entry.error() {
             warnings.push(scan_warning_from_entry_error(&root, &entry, error));
@@ -832,11 +954,30 @@ pub fn scan_repository(root: impl AsRef<Path>) -> Result<ScanReport, ScanError> 
 
         file_paths.push(entry.path().to_path_buf());
     }
+    progress(ScanProgress {
+        phase: "walk",
+        completed: walked_entries,
+        total: None,
+        unit: "entries",
+        detail: format!("walking complete; {} files", file_paths.len()),
+    });
 
-    let classified_files = file_paths
-        .par_iter()
-        .map(|path| classify_file(&root, path))
-        .collect::<Vec<_>>();
+    let total_files = file_paths.len() as u64;
+    let mut classified_files = Vec::with_capacity(file_paths.len());
+    for chunk in file_paths.chunks(512) {
+        let chunk_files = chunk
+            .par_iter()
+            .map(|path| classify_file(&root, path))
+            .collect::<Vec<_>>();
+        classified_files.extend(chunk_files);
+        progress(ScanProgress {
+            phase: "classify",
+            completed: classified_files.len() as u64,
+            total: Some(total_files),
+            unit: "files",
+            detail: "classifying files".to_owned(),
+        });
+    }
     let mut files = Vec::with_capacity(classified_files.len());
     for classified_file in classified_files {
         files.push(classified_file?);
@@ -900,6 +1041,205 @@ pub fn context(options: ContextOptions, json: bool) -> Result<String, ContextCom
     }
 }
 
+pub fn analyze() -> Result<String, AnalyzeCommandError> {
+    let summary = analyze_current_dir_with_progress(|_| {})?;
+
+    Ok(render_analyze_summary(&summary))
+}
+
+pub fn analyze_current_dir_with_progress<F>(
+    mut progress: F,
+) -> Result<AnalyzeSummary, AnalyzeCommandError>
+where
+    F: FnMut(AnalyzeProgress),
+{
+    let current_dir = env::current_dir().map_err(AnalyzeCommandError::CurrentDir)?;
+    progress(AnalyzeProgress {
+        phase: "Opening repository",
+        detail: "discovering Git worktree".to_owned(),
+        completed: None,
+        total: None,
+        unit: "",
+    });
+    let worktree_root = git::worktree_root_at(&current_dir)?;
+    operation_log::event(
+        "analyze_started",
+        json!({
+            "root": worktree_root.display().to_string(),
+        }),
+    );
+
+    progress(AnalyzeProgress {
+        phase: "Git history",
+        detail: "counting reachable commits".to_owned(),
+        completed: None,
+        total: None,
+        unit: "commits",
+    });
+    let read_cache = RefCell::new(storage::index::IndexStore::open(&worktree_root).ok());
+    let (cache_write_sender, cache_write_receiver) =
+        crossbeam_channel::bounded::<Vec<(String, Vec<git::GitFileChange>)>>(8);
+    let cache_write_root = worktree_root.clone();
+    let cache_writer = thread::spawn(move || {
+        let Ok(mut write_cache) = storage::index::IndexStore::open(&cache_write_root) else {
+            return;
+        };
+        for commits in cache_write_receiver {
+            let _ = write_cache
+                .persist_git_commit_changes_batch(git::GIT_HISTORY_CACHE_VERSION, &commits);
+        }
+    });
+    let analyzer_version = git::GIT_HISTORY_CACHE_VERSION;
+    let analysis = git::analyze_from_head_at_with_progress_and_cache_batches(
+        &worktree_root,
+        |git_progress| {
+            progress(AnalyzeProgress {
+                phase: "Git history",
+                detail: "diffing reachable commits".to_owned(),
+                completed: Some(git_progress.completed_commits as u64),
+                total: Some(git_progress.total_commits as u64),
+                unit: "commits",
+            });
+        },
+        |commit_ids| {
+            read_cache
+                .borrow()
+                .as_ref()
+                .and_then(|store| {
+                    store
+                        .cached_git_commit_changes_batch(commit_ids, analyzer_version)
+                        .ok()
+                })
+                .unwrap_or_default()
+        },
+        |commits| {
+            if !commits.is_empty() {
+                let _ = cache_write_sender.send(commits.to_vec());
+            }
+        },
+    );
+    drop(cache_write_sender);
+    let _ = cache_writer.join();
+    let analysis = analysis?;
+
+    progress(AnalyzeProgress {
+        phase: "Scanning repository",
+        detail: "walking files and classifying content".to_owned(),
+        completed: None,
+        total: None,
+        unit: "files",
+    });
+    let scan = scan_repository_with_progress(&analysis.worktree_root, |scan_progress| {
+        progress(AnalyzeProgress {
+            phase: "Scanning repository",
+            detail: scan_progress.detail,
+            completed: Some(scan_progress.completed),
+            total: scan_progress.total,
+            unit: scan_progress.unit,
+        });
+    })?;
+
+    progress(AnalyzeProgress {
+        phase: "Parsing symbols",
+        detail: "preparing parser candidates".to_owned(),
+        completed: None,
+        total: None,
+        unit: "files",
+    });
+    let parse =
+        parse::report_from_scan_with_progress(&analysis.worktree_root, &scan, |parse_progress| {
+            progress(AnalyzeProgress {
+                phase: "Parsing symbols",
+                detail: parse_progress.path,
+                completed: Some(parse_progress.completed_files as u64),
+                total: Some(parse_progress.total_files as u64),
+                unit: "files",
+            });
+        });
+
+    progress(AnalyzeProgress {
+        phase: "Scoring hotspots",
+        detail: "ranking files by advisory risk".to_owned(),
+        completed: None,
+        total: None,
+        unit: "files",
+    });
+    let ranked = ranked_hotspot_scores_from_scan_and_git(&scan.files, &analysis);
+    let complexity = complexity::report_from_parse(&parse);
+    let dependency_edges = dependency::resolve_dependencies(&parse);
+    let dependency_fan = dependency::fan_metrics(&parse.files, &dependency_edges);
+
+    progress(AnalyzeProgress {
+        phase: "Writing index",
+        detail: "persisting scan, parser, Git, and hotspot facts".to_owned(),
+        completed: None,
+        total: None,
+        unit: "rows",
+    });
+    let mut index = storage::index::IndexStore::open(&analysis.worktree_root)
+        .map_err(AnalyzeCommandError::PersistScan)?;
+    let scan_run = index
+        .persist_scan_with_progress(&scan, |persist_progress| {
+            progress(analyze_persist_progress_update(persist_progress));
+        })
+        .map_err(AnalyzeCommandError::PersistScan)?;
+    index
+        .persist_symbols_with_progress(&parse, |persist_progress| {
+            progress(analyze_persist_progress_update(persist_progress));
+        })
+        .map_err(AnalyzeCommandError::PersistSymbols)?;
+    index
+        .persist_git_analysis_with_progress(
+            &analysis.head_commit_id,
+            analysis.head_commit_time,
+            analysis.recent_window_days as u64,
+            &analysis.file_metrics,
+            &analysis.co_changes,
+            |persist_progress| {
+                progress(analyze_persist_progress_update(persist_progress));
+            },
+        )
+        .map_err(AnalyzeCommandError::PersistGitAnalysis)?;
+    index
+        .persist_hotspots_with_progress(scan_run.id, &ranked, |persist_progress| {
+            progress(analyze_persist_progress_update(persist_progress));
+        })
+        .map_err(AnalyzeCommandError::PersistHotspots)?;
+    index
+        .persist_ui_facts_with_progress(
+            scan_run.id,
+            &complexity,
+            &dependency_fan.by_path,
+            &analysis.ownership,
+            |persist_progress| {
+                progress(analyze_persist_progress_update(persist_progress));
+            },
+        )
+        .map_err(AnalyzeCommandError::PersistUiFacts)?;
+
+    let summary = AnalyzeSummary {
+        worktree_root: analysis.worktree_root,
+        head_commit_id: analysis.head_commit_id,
+        total_files: scan.files.len() as u64,
+        parsed_files: parse.files.len() as u64,
+        symbol_count: parse.symbols.len() as u64,
+        hotspot_count: ranked.len() as u64,
+    };
+    operation_log::event(
+        "analyze_completed",
+        json!({
+            "root": summary.worktree_root.display().to_string(),
+            "head": summary.head_commit_id,
+            "total_files": summary.total_files,
+            "parsed_files": summary.parsed_files,
+            "symbol_count": summary.symbol_count,
+            "hotspot_count": summary.hotspot_count,
+        }),
+    );
+
+    Ok(summary)
+}
+
 pub fn parse_scan_report(scan: &ScanReport) -> ParseReport {
     parse::scaffold_report_from_scan(scan)
 }
@@ -915,11 +1255,11 @@ pub(crate) fn analyze_git_cached_at(root: &Path) -> Result<git::GitAnalysis, git
             return;
         };
         for commits in cache_write_receiver {
-            let _ =
-                write_cache.persist_git_commit_changes_batch(env!("CARGO_PKG_VERSION"), &commits);
+            let _ = write_cache
+                .persist_git_commit_changes_batch(git::GIT_HISTORY_CACHE_VERSION, &commits);
         }
     });
-    let analyzer_version = env!("CARGO_PKG_VERSION");
+    let analyzer_version = git::GIT_HISTORY_CACHE_VERSION;
 
     let analysis = git::analyze_from_head_at_with_progress_and_cache_batches(
         &worktree_root,
@@ -1356,6 +1696,27 @@ fn render_context(report: &ContextReport) -> String {
     );
 
     output
+}
+
+fn render_analyze_summary(summary: &AnalyzeSummary) -> String {
+    format!(
+        "Hotpath analysis complete\nHEAD: {}\nFiles: {}\nParsed files: {}\nSymbols: {}\nHotspots: {}\nIndex: .hotpath/index.db",
+        summary.head_commit_id,
+        summary.total_files,
+        summary.parsed_files,
+        summary.symbol_count,
+        summary.hotspot_count
+    )
+}
+
+fn analyze_persist_progress_update(progress: storage::index::PersistProgress) -> AnalyzeProgress {
+    AnalyzeProgress {
+        phase: "Writing index",
+        detail: progress.detail,
+        completed: Some(progress.completed),
+        total: Some(progress.total),
+        unit: progress.unit,
+    }
 }
 
 fn render_diff_risk(report: &DiffRiskReport, json: bool) -> Result<String, DiffCommandError> {
@@ -1930,6 +2291,7 @@ fn write_persistence_error(
         storage::index::IndexError::PersistScan { .. }
         | storage::index::IndexError::PersistGitAnalysis { .. }
         | storage::index::IndexError::PersistSymbols { .. }
+        | storage::index::IndexError::PersistUiFacts { .. }
         | storage::index::IndexError::PersistHotspots { .. } => write!(
             f,
             "could not update .hotpath/index.db; ensure the index is writable"

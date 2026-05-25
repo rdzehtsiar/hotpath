@@ -3,7 +3,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
 
@@ -17,6 +17,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Build or refresh the local analysis index.
+    Analyze,
+
     /// Scan a repository and print an early placeholder report.
     Scan(ScanArgs),
 
@@ -56,13 +59,14 @@ enum Commands {
     /// Check the local Hotpath index health.
     Doctor,
 
-    /// Open the early keyboard-first terminal user interface.
+    /// Open the read-only terminal viewer for an existing local index.
     Tui(TuiArgs),
 }
 
 impl Commands {
     fn name(&self) -> &'static str {
         match self {
+            Self::Analyze => "analyze",
             Self::Scan(_) => "scan",
             Self::Parse(_) => "parse",
             Self::Complexity(_) => "complexity",
@@ -202,18 +206,6 @@ struct ContextArgs {
 
 #[derive(Debug, Args)]
 struct TuiArgs {
-    /// Token budget to compare against the TUI context estimate. Accepts integers with optional k or m suffix.
-    #[arg(long, value_parser = parse_budget_tokens_arg)]
-    budget: Option<u64>,
-
-    /// Exclude generated files from the TUI context estimate.
-    #[arg(long)]
-    exclude_generated: bool,
-
-    /// Exclude vendor files from the TUI context estimate.
-    #[arg(long)]
-    exclude_vendor: bool,
-
     /// Include generated, vendored, lockfile, and minified files in TUI hotspot rows.
     #[arg(long)]
     include_generated_hotspots: bool,
@@ -269,7 +261,11 @@ fn main() -> ExitCode {
     let output_mode = cli.command.output_mode();
     let started = Instant::now();
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    let log_root = operation_log_root(&cwd);
+    let log_root = if command_name == "tui" {
+        cwd.clone()
+    } else {
+        operation_log_root(&cwd)
+    };
     hotpath::operation_log::init(&log_root);
     hotpath::operation_log::event(
         "command_started",
@@ -282,6 +278,7 @@ fn main() -> ExitCode {
     );
 
     let command = match cli.command {
+        Commands::Analyze => return run_analyze(command_name, output_mode, started),
         Commands::Ci(args) => return run_ci(args, command_name, output_mode, started),
         Commands::Tui(args) => return run_tui(args, command_name, output_mode, started),
         command => command,
@@ -331,6 +328,7 @@ fn main() -> ExitCode {
             hotpath::report::report_html(&output_dir).map_err(Into::into)
         }
         Commands::Report(_) => hotpath::report::report_markdown().map_err(Into::into),
+        Commands::Analyze => unreachable!("analyze command is handled before generic dispatch"),
         Commands::Ci(_) => unreachable!("CI command is handled before generic command dispatch"),
         Commands::Tui(_) => unreachable!("TUI command is handled before generic command dispatch"),
         Commands::Doctor => hotpath::doctor().map_err(Into::into),
@@ -364,11 +362,7 @@ fn run_tui(
     started: Instant,
 ) -> ExitCode {
     match hotpath::run_tui_with_options(hotpath::TuiOptions {
-        context: hotpath::ContextOptions {
-            exclude_generated: args.exclude_generated,
-            exclude_vendor: args.exclude_vendor,
-            budget_tokens: args.budget,
-        },
+        context: hotpath::ContextOptions::default(),
         include_generated_hotspots: args.include_generated_hotspots,
         ascii: args.ascii,
         no_color: args.no_color,
@@ -381,6 +375,69 @@ fn run_tui(
             eprintln!("hotpath: {error}");
             log_command_failed(command_name, output_mode, started, &error.to_string());
             ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_analyze(
+    command_name: &'static str,
+    output_mode: &'static str,
+    started: Instant,
+) -> ExitCode {
+    let mut reporter = AnalyzeProgressReporter::default();
+    match hotpath::analyze_current_dir_with_progress(|progress| reporter.report(progress)) {
+        Ok(summary) => {
+            eprintln!();
+            println!(
+                "Hotpath analysis complete\nHEAD: {}\nFiles: {}\nParsed files: {}\nSymbols: {}\nHotspots: {}\nIndex: .hotpath/index.db",
+                summary.head_commit_id,
+                summary.total_files,
+                summary.parsed_files,
+                summary.symbol_count,
+                summary.hotspot_count
+            );
+            log_command_completed(command_name, output_mode, started);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("\nhotpath: {error}");
+            log_command_failed(command_name, output_mode, started, &error.to_string());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[derive(Default)]
+struct AnalyzeProgressReporter {
+    last: Option<Instant>,
+    last_phase: Option<&'static str>,
+}
+
+impl AnalyzeProgressReporter {
+    fn report(&mut self, progress: hotpath::AnalyzeProgress) {
+        let now = Instant::now();
+        let phase_changed = self.last_phase != Some(progress.phase);
+        let should_report = phase_changed
+            || self
+                .last
+                .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(2))
+            || progress
+                .completed
+                .zip(progress.total)
+                .is_some_and(|(completed, total)| total > 0 && completed >= total);
+        if !should_report {
+            return;
+        }
+
+        self.last = Some(now);
+        self.last_phase = Some(progress.phase);
+        if let (Some(completed), Some(total)) = (progress.completed, progress.total) {
+            eprintln!(
+                "{}: {} {}/{} {}",
+                progress.phase, progress.detail, completed, total, progress.unit
+            );
+        } else {
+            eprintln!("{}: {}", progress.phase, progress.detail);
         }
     }
 }

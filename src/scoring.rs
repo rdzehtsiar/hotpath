@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::git::{GitAnalysis, GitCoChange, GitFileMetrics};
 use crate::FileRecord;
@@ -53,7 +53,7 @@ struct RiskFormulaTerm {
 }
 
 /// Version identity for a hotspot score formula.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FormulaVersion {
     /// Stable machine-readable formula identifier.
     pub id: String,
@@ -82,7 +82,7 @@ pub struct RepositoryScoreContext {
 }
 
 /// Raw repository facts available to a score formula for one path.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RawScoreMetrics {
     /// Repository-relative path using `/` separators.
     pub path: String,
@@ -119,7 +119,7 @@ pub struct RawScoreMetrics {
 /// Values are intentionally optional because early Hotpath analyses may not
 /// have every signal available. This type records normalized inputs only; it
 /// does not define how normalization is performed.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NormalizedScoreMetrics {
     pub size: Option<f64>,
     pub churn: Option<f64>,
@@ -139,7 +139,7 @@ pub struct ScoreNormalization {
 }
 
 /// One weighted normalized term in a score formula.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WeightedTerm {
     /// Stable term name, for example `churn`.
     pub name: String,
@@ -156,7 +156,7 @@ pub struct WeightedTerm {
 }
 
 /// Named normalized metrics that can participate in a score formula.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NormalizedMetric {
     Size,
@@ -167,7 +167,7 @@ pub enum NormalizedMetric {
 }
 
 /// Known limitation or approximation attached to a score output.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScoreLimitation {
     /// Stable machine-readable limitation code.
     pub code: String,

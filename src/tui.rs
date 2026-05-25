@@ -6,7 +6,8 @@ use std::env;
 use std::error::Error as StdError;
 use std::fmt;
 use std::io::{self, Stdout};
-use std::sync::mpsc::{self, Receiver};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,13 +22,19 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 use ratatui::{Frame, Terminal};
+use serde::Deserialize;
+use serde_json::json;
 
 use crate::complexity::{self, ComplexityReport, ComplexitySummary, ComplexitySymbolRecord};
 use crate::dependency::{self, FileDependencyFan, ResolvedDependencyEdge};
 use crate::git;
+use crate::operation_log;
 use crate::ownership::OperationalOwnershipSnapshot;
 use crate::report::{self, Report, ReportFinding, ReportHotspot};
-use crate::scoring::{NormalizedMetric, WeightedTerm};
+use crate::scoring::{
+    FormulaVersion, NormalizedMetric, NormalizedScoreMetrics, RawScoreMetrics, ScoreLimitation,
+    WeightedTerm,
+};
 use crate::storage;
 use crate::{
     estimate_context, parse, ranked_hotspot_scores_from_scan_and_git, ContextBudgetStatus,
@@ -36,8 +43,14 @@ use crate::{
 };
 
 type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
+#[cfg(test)]
 const TUI_PROGRESS_THROTTLE: Duration = Duration::from_millis(750);
+#[cfg(test)]
 const TUI_PROGRESS_PERCENT_STEP: u64 = 2;
+const TUI_HOTSPOT_PAGE_SIZE: u64 = 200;
+const TUI_INSPECTOR_LOADING_DELAY: Duration = Duration::from_millis(150);
+const TUI_INSPECTOR_TIMEOUT: Duration = Duration::from_millis(1_500);
+const TUI_PAGE_TIMEOUT: Duration = Duration::from_millis(2_000);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TuiOptions {
@@ -53,27 +66,139 @@ pub fn run_tui() -> io::Result<()> {
 
 pub fn run_tui_with_options(options: TuiOptions) -> io::Result<()> {
     let snapshot = TuiSnapshot::loading_with_options(options);
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let mut progress = TuiProgressEmitter::new(sender.clone());
-        let result = TuiSnapshot::load_current_dir_with_progress(options, |update| {
-            progress.emit(update);
-        })
-        .map_err(|error| error.to_string());
-        let _ = match result {
-            Ok(snapshot) => sender.send(TuiWorkerMessage::Completed(Box::new(snapshot))),
-            Err(error) => sender.send(TuiWorkerMessage::Failed(error)),
-        };
-    });
+    let initial_index = open_initial_index_mode(options);
     let mut terminal = TerminalSession::enter()?;
-    run_app(terminal.terminal_mut(), snapshot, Some(receiver), options)
+    run_app(terminal.terminal_mut(), snapshot, initial_index, options)
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 enum TuiWorkerMessage {
     Progress(TuiProgressUpdate),
-    Completed(Box<TuiSnapshot>),
-    Failed(String),
+}
+
+#[derive(Debug)]
+struct TuiDataClient {
+    sender: mpsc::Sender<TuiDataRequest>,
+    receiver: mpsc::Receiver<TuiDataResponse>,
+    next_request_id: u64,
+}
+
+#[derive(Debug)]
+enum TuiDataRequest {
+    LoadPage {
+        request_id: u64,
+        offset: u64,
+        limit: u64,
+        include_generated_hotspots: bool,
+        query: Option<String>,
+    },
+    LoadInspector {
+        request_id: u64,
+        path: String,
+        include_generated_hotspots: bool,
+    },
+}
+
+#[derive(Debug)]
+enum TuiDataResponse {
+    Page {
+        request_id: u64,
+        result: Result<TuiHotspotPage, String>,
+    },
+    Inspector {
+        request_id: u64,
+        path: String,
+        result: Box<Result<Option<TuiIndexInspector>, String>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuiPendingKind {
+    Page,
+    Inspector,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TuiPendingRequest {
+    request_id: u64,
+    started_at: Instant,
+    kind: TuiPendingKind,
+    detail: String,
+}
+
+impl TuiDataClient {
+    fn start(worktree_root: PathBuf) -> Self {
+        let (request_sender, request_receiver) = mpsc::channel();
+        let (response_sender, response_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            run_tui_data_worker(worktree_root, request_receiver, response_sender)
+        });
+
+        Self {
+            sender: request_sender,
+            receiver: response_receiver,
+            next_request_id: 1,
+        }
+    }
+
+    fn next_request_id(&mut self) -> u64 {
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        request_id
+    }
+}
+
+fn run_tui_data_worker(
+    worktree_root: PathBuf,
+    receiver: mpsc::Receiver<TuiDataRequest>,
+    sender: mpsc::Sender<TuiDataResponse>,
+) {
+    let store = storage::index::IndexStore::open_read_only_fast(&worktree_root);
+    for request in receiver {
+        match request {
+            TuiDataRequest::LoadPage {
+                request_id,
+                offset,
+                limit,
+                include_generated_hotspots,
+                query,
+            } => {
+                let result = store
+                    .as_ref()
+                    .map_err(ToString::to_string)
+                    .and_then(|store| {
+                        load_index_hotspot_page_from_store(
+                            store,
+                            offset,
+                            limit,
+                            include_generated_hotspots,
+                            query.as_deref(),
+                        )
+                        .map_err(|error| error.to_string())
+                    });
+                let _ = sender.send(TuiDataResponse::Page { request_id, result });
+            }
+            TuiDataRequest::LoadInspector {
+                request_id,
+                path,
+                include_generated_hotspots,
+            } => {
+                let result = store
+                    .as_ref()
+                    .map_err(ToString::to_string)
+                    .and_then(|store| {
+                        load_index_inspector_from_store(store, &path, include_generated_hotspots)
+                            .map_err(|error| error.to_string())
+                    });
+                let _ = sender.send(TuiDataResponse::Inspector {
+                    request_id,
+                    path,
+                    result: Box::new(result),
+                });
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +209,7 @@ struct TuiProgressUpdate {
     total: Option<u64>,
     unit: &'static str,
     rate: Option<TuiProgressRate>,
+    started_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +227,7 @@ impl TuiProgressUpdate {
             total: None,
             unit: "",
             rate: None,
+            started_at: None,
         }
     }
 
@@ -118,10 +245,12 @@ impl TuiProgressUpdate {
             total: Some(total),
             unit,
             rate: None,
+            started_at: None,
         }
     }
 }
 
+#[cfg(test)]
 struct TuiProgressEmitter {
     sender: mpsc::Sender<TuiWorkerMessage>,
     last_emit: Option<Instant>,
@@ -131,6 +260,7 @@ struct TuiProgressEmitter {
     phase_started_completed: Option<u64>,
 }
 
+#[cfg(test)]
 impl TuiProgressEmitter {
     fn new(sender: mpsc::Sender<TuiWorkerMessage>) -> Self {
         Self {
@@ -156,7 +286,7 @@ impl TuiProgressEmitter {
         if let Some(completed) = update.completed {
             if self.phase_started_at.is_none() || self.phase_started_completed.is_none() {
                 self.phase_started_at = Some(now);
-                self.phase_started_completed = Some(0);
+                self.phase_started_completed = Some(completed);
             }
             if let (Some(started_at), Some(started_completed)) =
                 (self.phase_started_at, self.phase_started_completed)
@@ -166,7 +296,10 @@ impl TuiProgressEmitter {
                     started_at,
                 });
             }
+        } else if self.phase_started_at.is_none() {
+            self.phase_started_at = Some(now);
         }
+        update.started_at = self.phase_started_at;
 
         self.last_emit = Some(now);
         self.last_phase = Some(update.phase);
@@ -201,6 +334,35 @@ fn progress_percent(update: &TuiProgressUpdate) -> Option<u64> {
         .saturating_mul(100)
         .checked_div(total)
         .map(|percent| percent.min(100))
+}
+
+fn scan_progress_update(progress: crate::ScanProgress) -> TuiProgressUpdate {
+    match progress.total {
+        Some(total) => TuiProgressUpdate::measured(
+            "Scanning repository",
+            progress.detail,
+            progress.completed,
+            total,
+            progress.unit,
+        ),
+        None => TuiProgressUpdate::indeterminate(
+            "Scanning repository",
+            format!(
+                "{}{}{} {}",
+                progress.detail, HOTSPOT_TAG_SEPARATOR, progress.completed, progress.unit
+            ),
+        ),
+    }
+}
+
+fn persist_progress_update(progress: storage::index::PersistProgress) -> TuiProgressUpdate {
+    TuiProgressUpdate::measured(
+        "Writing index",
+        progress.detail,
+        progress.completed,
+        progress.total,
+        progress.unit,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -304,7 +466,7 @@ impl TuiSnapshot {
                 code: "hotpath.tui.loading",
                 level: report::ReportFindingLevel::Info,
                 path: None,
-                message: "Repository analysis is running in the background".to_owned(),
+                message: "Opening the local Hotpath index".to_owned(),
                 rank: None,
                 score: None,
             }],
@@ -334,6 +496,10 @@ impl TuiSnapshot {
             "discovering Git worktree",
         ));
         let worktree_root = git::worktree_root_at(&current_dir)?;
+        progress(TuiProgressUpdate::indeterminate(
+            "Opening repository",
+            "opening local analysis index",
+        ));
         let read_git_cache = RefCell::new(
             storage::index::IndexStore::open(&worktree_root)
                 .map_err(TuiSnapshotError::PersistScan)?,
@@ -341,20 +507,24 @@ impl TuiSnapshot {
         let (cache_write_sender, cache_write_receiver) =
             crossbeam_channel::bounded::<Vec<(String, Vec<git::GitFileChange>)>>(8);
         let cache_write_root = worktree_root.clone();
+        progress(TuiProgressUpdate::indeterminate(
+            "Opening repository",
+            "starting Git cache writer",
+        ));
         let cache_writer = thread::spawn(move || {
             let Ok(mut write_cache) = storage::index::IndexStore::open(&cache_write_root) else {
                 return;
             };
             for commits in cache_write_receiver {
                 let _ = write_cache
-                    .persist_git_commit_changes_batch(env!("CARGO_PKG_VERSION"), &commits);
+                    .persist_git_commit_changes_batch(git::GIT_HISTORY_CACHE_VERSION, &commits);
             }
         });
         progress(TuiProgressUpdate::indeterminate(
             "Git history",
             "counting reachable commits",
         ));
-        let analyzer_version = env!("CARGO_PKG_VERSION");
+        let analyzer_version = git::GIT_HISTORY_CACHE_VERSION;
         let analysis = git::analyze_from_head_at_with_progress_and_cache_batches(
             &worktree_root,
             |git_progress| {
@@ -393,7 +563,10 @@ impl TuiSnapshot {
             "Scanning repository",
             "walking files and classifying content",
         ));
-        let scan = crate::scan_repository(&analysis.worktree_root)?;
+        let scan =
+            crate::scan_repository_with_progress(&analysis.worktree_root, |scan_progress| {
+                progress(scan_progress_update(scan_progress));
+            })?;
         progress(TuiProgressUpdate::measured(
             "Scanning repository",
             "walking files and classifying content",
@@ -438,23 +611,31 @@ impl TuiSnapshot {
         let mut index = storage::index::IndexStore::open(&analysis.worktree_root)
             .map_err(TuiSnapshotError::PersistScan)?;
         let scan_run = index
-            .persist_scan(&scan)
+            .persist_scan_with_progress(&scan, |persist_progress| {
+                progress(persist_progress_update(persist_progress));
+            })
             .map_err(TuiSnapshotError::PersistScan)?;
         index
-            .persist_symbols(&parse)
+            .persist_symbols_with_progress(&parse, |persist_progress| {
+                progress(persist_progress_update(persist_progress));
+            })
             .map_err(TuiSnapshotError::PersistSymbols)?;
         index
-            .persist_git_analysis(
-                &analysis.worktree_root,
+            .persist_git_analysis_with_progress(
                 &analysis.head_commit_id,
                 analysis.head_commit_time,
                 analysis.recent_window_days as u64,
                 &analysis.file_metrics,
                 &analysis.co_changes,
+                |persist_progress| {
+                    progress(persist_progress_update(persist_progress));
+                },
             )
             .map_err(TuiSnapshotError::PersistGitAnalysis)?;
         index
-            .persist_hotspots(scan_run.id, &ranked)
+            .persist_hotspots_with_progress(scan_run.id, &ranked, |persist_progress| {
+                progress(persist_progress_update(persist_progress));
+            })
             .map_err(TuiSnapshotError::PersistHotspots)?;
         let mut report =
             report::report_from_scan_analysis(&scan, &analysis, context, hotspots, findings);
@@ -713,60 +894,79 @@ impl From<ScanError> for TuiSnapshotError {
 
 fn run_app(
     terminal: &mut TuiTerminal,
-    mut snapshot: TuiSnapshot,
-    receiver: Option<Receiver<TuiWorkerMessage>>,
+    snapshot: TuiSnapshot,
+    initial_index: Result<TuiIndexMode, String>,
     options: TuiOptions,
 ) -> io::Result<()> {
-    let mut state = TuiAppState {
-        status: Some("Analyzing repository in background".to_owned()),
-        analysis_running: receiver.is_some(),
-        ..TuiAppState::default()
+    let mut data_client = initial_index
+        .as_ref()
+        .ok()
+        .map(|index_mode| TuiDataClient::start(index_mode.worktree_root.clone()));
+    let mut state = match initial_index {
+        Ok(index_mode) => TuiAppState {
+            status: Some("Opening local analysis index".to_owned()),
+            current_path: index_mode
+                .hotspots
+                .rows
+                .first()
+                .map(|hotspot| hotspot.path.clone()),
+            index_mode: Some(index_mode),
+            analysis_running: false,
+            background_status: Some(TuiProgressUpdate::indeterminate(
+                "Ready",
+                "showing local analysis index",
+            )),
+            ..TuiAppState::default()
+        },
+        Err(error) => TuiAppState {
+            status: Some(error),
+            analysis_running: false,
+            background_status: Some(TuiProgressUpdate::indeterminate(
+                "No index",
+                "run `hotpath analyze` before opening the TUI",
+            )),
+            ..TuiAppState::default()
+        },
     };
-
+    if let Some(client) = &mut data_client {
+        request_index_page(&mut state, client, None, 0);
+    }
     loop {
-        if let Some(receiver) = &receiver {
-            loop {
-                match receiver.try_recv() {
-                    Ok(TuiWorkerMessage::Progress(update)) => {
-                        state.background_status = Some(update);
-                    }
-                    Ok(TuiWorkerMessage::Completed(loaded)) => {
-                        snapshot = *loaded;
-                        state.status = Some("Repository analysis ready".to_owned());
-                        state.analysis_running = false;
-                        state.background_status = Some(TuiProgressUpdate::indeterminate(
-                            "Ready",
-                            "repository analysis complete",
-                        ));
-                        clamp_current_selection(&mut state, &snapshot);
-                    }
-                    Ok(TuiWorkerMessage::Failed(error)) => {
-                        state.status = Some(format!("Analysis failed: {error}"));
-                        state.analysis_running = false;
-                    }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        if state.analysis_running {
-                            state.status = Some("Analysis stopped before completing".to_owned());
-                            state.analysis_running = false;
-                            state.background_status = None;
-                        }
-                        break;
-                    }
-                }
-            }
+        if let Some(client) = &mut data_client {
+            drain_tui_data_responses(&mut state, client, options);
+            update_tui_pending_status(&mut state);
         }
-
         terminal.draw(|frame| render_with_options(frame, &snapshot, &state, options))?;
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
-                reduce_key_with_editor(&mut state, &snapshot, key, |name| env::var_os(name));
+                reduce_key_with_editor_and_data(
+                    &mut state,
+                    &snapshot,
+                    key,
+                    |name| env::var_os(name),
+                    data_client.as_mut(),
+                );
                 if state.should_exit {
                     return Ok(());
                 }
             }
         }
     }
+}
+
+fn open_initial_index_mode(options: TuiOptions) -> Result<TuiIndexMode, String> {
+    let current_dir = env::current_dir()
+        .map_err(|source| format!("Could not read current directory: {source}"))?;
+    let index_root = find_existing_index_root(&current_dir)
+        .ok_or_else(|| "No Hotpath index found. Run `hotpath analyze` first.".to_owned())?;
+    Ok(open_index_mode(index_root, options))
+}
+
+fn find_existing_index_root(current_dir: &Path) -> Option<PathBuf> {
+    current_dir
+        .ancestors()
+        .find(|candidate| storage::index::default_index_path(candidate).is_file())
+        .map(Path::to_path_buf)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -937,7 +1137,7 @@ impl SearchState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TuiAppState {
     current_view: TuiView,
     current_path: Option<String>,
@@ -954,6 +1154,7 @@ pub struct TuiAppState {
     status: Option<String>,
     background_status: Option<TuiProgressUpdate>,
     analysis_running: bool,
+    index_mode: Option<TuiIndexMode>,
     last_action: Option<TuiAction>,
     should_exit: bool,
 }
@@ -986,10 +1187,57 @@ impl Default for TuiAppState {
             status: None,
             background_status: None,
             analysis_running: false,
+            index_mode: None,
             last_action: None,
             should_exit: false,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TuiIndexMode {
+    worktree_root: PathBuf,
+    include_generated_hotspots: bool,
+    hotspots: TuiHotspotPage,
+    presentation: TuiSnapshot,
+    inspector: Option<TuiIndexInspector>,
+    pending_page: Option<TuiPendingRequest>,
+    pending_inspector: Option<TuiPendingRequest>,
+    last_query_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TuiHotspotPage {
+    rows: Vec<storage::index::PersistedHotspot>,
+    total: u64,
+    offset: u64,
+    limit: u64,
+    query: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TuiIndexInspector {
+    hotspot: storage::index::PersistedHotspot,
+    file: Option<storage::index::PersistedFileRecord>,
+    owners: Vec<storage::index::PersistedOwnerShare>,
+    max_cyclomatic_complexity: Option<u64>,
+    fan_in: u64,
+    fan_out: u64,
+    raw_metrics: Option<RawScoreMetrics>,
+    normalized_metrics: Option<NormalizedScoreMetrics>,
+    weighted_terms: Vec<WeightedTerm>,
+    limitations: Vec<ScoreLimitation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TuiHotspotExplanationPayload {
+    normalized_metrics: NormalizedScoreMetrics,
+    weighted_terms: Vec<WeightedTerm>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TuiHotspotLimitationsPayload {
+    limitations: Vec<ScoreLimitation>,
 }
 
 impl TuiAppState {
@@ -1067,11 +1315,24 @@ where
         .unwrap_or(EditorResolution::Missing)
 }
 
+#[cfg(test)]
 fn reduce_key_with_editor<F>(
     state: &mut TuiAppState,
     snapshot: &TuiSnapshot,
     key: KeyEvent,
+    get_env: F,
+) where
+    F: FnMut(&str) -> Option<std::ffi::OsString>,
+{
+    reduce_key_with_editor_and_data(state, snapshot, key, get_env, None);
+}
+
+fn reduce_key_with_editor_and_data<F>(
+    state: &mut TuiAppState,
+    snapshot: &TuiSnapshot,
+    key: KeyEvent,
     mut get_env: F,
+    data_client: Option<&mut TuiDataClient>,
 ) where
     F: FnMut(&str) -> Option<std::ffi::OsString>,
 {
@@ -1096,15 +1357,27 @@ fn reduce_key_with_editor<F>(
             }
             KeyCode::Char('2') => {
                 state.command_palette = false;
+                if state.index_mode.is_some() {
+                    unavailable_index_view(state);
+                    return;
+                }
                 open_repo_tree(state);
             }
             KeyCode::Char('3') => {
                 state.command_palette = false;
+                if state.index_mode.is_some() {
+                    unavailable_index_view(state);
+                    return;
+                }
                 let rows = filtered_visible_rows(snapshot, state);
                 open_coupling_graph(state, snapshot, &rows);
             }
             KeyCode::Char('4') => {
                 state.command_palette = false;
+                if state.index_mode.is_some() {
+                    unavailable_index_view(state);
+                    return;
+                }
                 open_context_budgeting(state);
             }
             KeyCode::Char('/') => {
@@ -1121,6 +1394,15 @@ fn reduce_key_with_editor<F>(
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
         state.command_palette = true;
         state.status = Some("Command palette".to_owned());
+        return;
+    }
+
+    if state.index_mode.is_some() {
+        if let Some(client) = data_client {
+            reduce_index_key_async(state, key, client);
+        } else {
+            reduce_index_key(state, key);
+        }
         return;
     }
 
@@ -1190,6 +1472,443 @@ fn reduce_key_with_editor<F>(
         }
         _ => {}
     }
+}
+
+fn reduce_index_key(state: &mut TuiAppState, key: KeyEvent) {
+    if state.search_editing {
+        match key.code {
+            KeyCode::Esc => {
+                state.search = None;
+                state.search_editing = false;
+                reload_index_hotspots(state, None, 0);
+            }
+            KeyCode::Enter => {
+                state.search_editing = false;
+                let query = state.search_query().map(str::to_owned);
+                reload_index_hotspots(state, query.as_deref(), 0);
+            }
+            KeyCode::Backspace => {
+                if let Some(search) = &mut state.search {
+                    search.query.pop();
+                }
+            }
+            KeyCode::Char(character) => {
+                if let Some(search) = &mut state.search {
+                    search.query.push(character);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    match key.code {
+        KeyCode::Char('q') => state.should_exit = true,
+        KeyCode::Char('?') => state.show_help = true,
+        KeyCode::Char('/') => {
+            state.search = Some(SearchState::default());
+            state.search_editing = true;
+            state.status = Some("Search active".to_owned());
+        }
+        KeyCode::Esc => {
+            if state.search.take().is_some() {
+                state.search_editing = false;
+                reload_index_hotspots(state, None, 0);
+            } else {
+                state.should_exit = true;
+            }
+        }
+        KeyCode::Tab => {
+            state.pane_focus = state.pane_focus.next();
+            state.status = Some(format!("Focus: {}", state.pane_focus.title()));
+        }
+        KeyCode::BackTab => {
+            state.pane_focus = state.pane_focus.previous();
+            state.status = Some(format!("Focus: {}", state.pane_focus.title()));
+        }
+        KeyCode::Down | KeyCode::Char('j') => move_index_selection(state, 1),
+        KeyCode::Up | KeyCode::Char('k') => move_index_selection(state, -1),
+        KeyCode::Char('1') => open_hotspots(state),
+        KeyCode::Char('2')
+        | KeyCode::Char('3')
+        | KeyCode::Char('4')
+        | KeyCode::Char('t')
+        | KeyCode::Char('g')
+        | KeyCode::Char('c')
+        | KeyCode::Char('x')
+        | KeyCode::Right
+        | KeyCode::Char('l')
+        | KeyCode::Enter => unavailable_index_view(state),
+        _ => {}
+    }
+}
+
+fn reduce_index_key_async(state: &mut TuiAppState, key: KeyEvent, client: &mut TuiDataClient) {
+    if state.search_editing {
+        match key.code {
+            KeyCode::Esc => {
+                state.search = None;
+                state.search_editing = false;
+                request_index_page(state, client, None, 0);
+            }
+            KeyCode::Enter => {
+                state.search_editing = false;
+                let query = state.search_query().map(str::to_owned);
+                request_index_page(state, client, query.as_deref(), 0);
+            }
+            KeyCode::Backspace => {
+                if let Some(search) = &mut state.search {
+                    search.query.pop();
+                }
+            }
+            KeyCode::Char(character) => {
+                if let Some(search) = &mut state.search {
+                    search.query.push(character);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    match key.code {
+        KeyCode::Char('q') => state.should_exit = true,
+        KeyCode::Char('?') => state.show_help = true,
+        KeyCode::Char('/') => {
+            state.search = Some(SearchState::default());
+            state.search_editing = true;
+            state.status = Some("Search active".to_owned());
+        }
+        KeyCode::Esc => {
+            if state.search.take().is_some() {
+                state.search_editing = false;
+                request_index_page(state, client, None, 0);
+            } else {
+                state.should_exit = true;
+            }
+        }
+        KeyCode::Tab => {
+            state.pane_focus = state.pane_focus.next();
+            state.status = Some(format!("Focus: {}", state.pane_focus.title()));
+        }
+        KeyCode::BackTab => {
+            state.pane_focus = state.pane_focus.previous();
+            state.status = Some(format!("Focus: {}", state.pane_focus.title()));
+        }
+        KeyCode::Down | KeyCode::Char('j') => move_index_selection_async(state, 1, client),
+        KeyCode::Up | KeyCode::Char('k') => move_index_selection_async(state, -1, client),
+        KeyCode::Char('1') => open_hotspots(state),
+        KeyCode::Char('2')
+        | KeyCode::Char('3')
+        | KeyCode::Char('4')
+        | KeyCode::Char('t')
+        | KeyCode::Char('g')
+        | KeyCode::Char('c')
+        | KeyCode::Char('x')
+        | KeyCode::Right
+        | KeyCode::Char('l')
+        | KeyCode::Enter => unavailable_index_view(state),
+        _ => {}
+    }
+}
+
+fn move_index_selection_async(state: &mut TuiAppState, delta: isize, client: &mut TuiDataClient) {
+    let Some(index_mode) = state.index_mode.as_ref() else {
+        return;
+    };
+    let row_count = index_mode.hotspots.rows.len();
+    if row_count == 0 {
+        state.selection_for_current_view_mut().selected = 0;
+        return;
+    }
+
+    let selected = state.selected_index();
+    if delta > 0 && selected + 1 >= row_count {
+        let next_offset = index_mode.hotspots.offset + index_mode.hotspots.rows.len() as u64;
+        if next_offset < index_mode.hotspots.total {
+            let query = index_mode.hotspots.query.clone();
+            request_index_page(state, client, query.as_deref(), next_offset);
+            state.selection_for_current_view_mut().selected = 0;
+            return;
+        }
+    } else if delta < 0 && selected == 0 {
+        if index_mode.hotspots.offset > 0 {
+            let next_offset = index_mode
+                .hotspots
+                .offset
+                .saturating_sub(index_mode.hotspots.limit);
+            let query = index_mode.hotspots.query.clone();
+            request_index_page(state, client, query.as_deref(), next_offset);
+            return;
+        }
+    } else if delta > 0 {
+        state.selection_for_current_view_mut().move_next(row_count);
+    } else {
+        state.selection_for_current_view_mut().move_previous();
+    }
+
+    request_selected_index_inspector(state, client);
+}
+
+fn move_index_selection(state: &mut TuiAppState, delta: isize) {
+    let Some(index_mode) = state.index_mode.as_ref() else {
+        return;
+    };
+    let row_count = index_mode.hotspots.rows.len();
+    if row_count == 0 {
+        state.selection_for_current_view_mut().selected = 0;
+        return;
+    }
+
+    let selected = state.selected_index();
+    if delta > 0 && selected + 1 >= row_count {
+        let next_offset = index_mode.hotspots.offset + index_mode.hotspots.rows.len() as u64;
+        if next_offset < index_mode.hotspots.total {
+            let query = index_mode.hotspots.query.clone();
+            reload_index_hotspots(state, query.as_deref(), next_offset);
+            state.selection_for_current_view_mut().selected = 0;
+        }
+    } else if delta < 0 && selected == 0 {
+        if index_mode.hotspots.offset > 0 {
+            let next_offset = index_mode
+                .hotspots
+                .offset
+                .saturating_sub(index_mode.hotspots.limit);
+            let query = index_mode.hotspots.query.clone();
+            reload_index_hotspots(state, query.as_deref(), next_offset);
+            let last = state
+                .index_mode
+                .as_ref()
+                .map(|index_mode| index_mode.hotspots.rows.len().saturating_sub(1))
+                .unwrap_or(0);
+            state.selection_for_current_view_mut().selected = last;
+        }
+    } else if delta > 0 {
+        state.selection_for_current_view_mut().move_next(row_count);
+    } else {
+        state.selection_for_current_view_mut().move_previous();
+    }
+
+    refresh_index_inspector(state, TuiOptions::default());
+}
+
+fn reload_index_hotspots(state: &mut TuiAppState, query: Option<&str>, offset: u64) {
+    let Some(index_mode) = state.index_mode.as_ref() else {
+        return;
+    };
+    let result = load_index_hotspot_page(
+        &index_mode.worktree_root,
+        offset,
+        index_mode.hotspots.limit,
+        index_mode.include_generated_hotspots,
+        query,
+    );
+    match result {
+        Ok(page) => {
+            let row_count = page.rows.len();
+            if let Some(index_mode) = &mut state.index_mode {
+                index_mode.hotspots = page;
+                index_mode.last_query_error = None;
+            }
+            state.selection_for_current_view_mut().clamp(row_count);
+            state.status = Some(
+                match query.map(str::trim).filter(|query| !query.is_empty()) {
+                    Some(query) => format!("Filter active: {query} ({row_count} visible rows)"),
+                    None => "Filter cleared".to_owned(),
+                },
+            );
+            refresh_index_inspector(state, TuiOptions::default());
+        }
+        Err(error) => {
+            if let Some(index_mode) = &mut state.index_mode {
+                index_mode.last_query_error = Some(error.to_string());
+            }
+            state.status = Some(format!("Hotspot page read failed: {error}"));
+        }
+    }
+}
+
+fn request_index_page(
+    state: &mut TuiAppState,
+    client: &mut TuiDataClient,
+    query: Option<&str>,
+    offset: u64,
+) {
+    let Some(index_mode) = &mut state.index_mode else {
+        return;
+    };
+    let request_id = client.next_request_id();
+    let query = query
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .map(str::to_owned);
+    index_mode.pending_page = Some(TuiPendingRequest {
+        request_id,
+        started_at: Instant::now(),
+        kind: TuiPendingKind::Page,
+        detail: query.as_ref().map_or_else(
+            || format!("page offset {offset}"),
+            |query| format!("filter {query}"),
+        ),
+    });
+    index_mode.last_query_error = None;
+    state.status = Some("Loading hotspots from index".to_owned());
+    let _ = client.sender.send(TuiDataRequest::LoadPage {
+        request_id,
+        offset,
+        limit: index_mode.hotspots.limit,
+        include_generated_hotspots: index_mode.include_generated_hotspots,
+        query,
+    });
+}
+
+fn request_selected_index_inspector(state: &mut TuiAppState, client: &mut TuiDataClient) {
+    let Some(path) = selected_index_hotspot_path(state) else {
+        if let Some(index_mode) = &mut state.index_mode {
+            index_mode.inspector = None;
+            index_mode.pending_inspector = None;
+        }
+        return;
+    };
+    let Some(index_mode) = &mut state.index_mode else {
+        return;
+    };
+    let request_id = client.next_request_id();
+    index_mode.pending_inspector = Some(TuiPendingRequest {
+        request_id,
+        started_at: Instant::now(),
+        kind: TuiPendingKind::Inspector,
+        detail: path.clone(),
+    });
+    index_mode.last_query_error = None;
+    state.current_path = Some(path.clone());
+    let _ = client.sender.send(TuiDataRequest::LoadInspector {
+        request_id,
+        path,
+        include_generated_hotspots: index_mode.include_generated_hotspots,
+    });
+}
+
+fn drain_tui_data_responses(
+    state: &mut TuiAppState,
+    client: &mut TuiDataClient,
+    options: TuiOptions,
+) {
+    while let Ok(response) = client.receiver.try_recv() {
+        match response {
+            TuiDataResponse::Page { request_id, result } => {
+                let Some(index_mode) = &state.index_mode else {
+                    continue;
+                };
+                if index_mode
+                    .pending_page
+                    .as_ref()
+                    .is_none_or(|pending| pending.request_id != request_id)
+                {
+                    continue;
+                }
+                match result {
+                    Ok(page) => {
+                        let row_count = page.rows.len();
+                        if let Some(index_mode) = &mut state.index_mode {
+                            index_mode.hotspots = page;
+                            index_mode.presentation =
+                                index_presentation_from_page(&index_mode.hotspots, options.context);
+                            index_mode.pending_page = None;
+                            index_mode.last_query_error = None;
+                            index_mode.inspector = None;
+                        }
+                        state.selection_for_current_view_mut().clamp(row_count);
+                        state.status = Some(format!("{row_count} hotspot rows loaded"));
+                        request_selected_index_inspector(state, client);
+                    }
+                    Err(error) => {
+                        if let Some(index_mode) = &mut state.index_mode {
+                            index_mode.pending_page = None;
+                            index_mode.last_query_error = Some(error.clone());
+                        }
+                        state.status = Some(format!("Hotspot page read failed: {error}"));
+                    }
+                }
+            }
+            TuiDataResponse::Inspector {
+                request_id,
+                path,
+                result,
+            } => {
+                let Some(index_mode) = &state.index_mode else {
+                    continue;
+                };
+                if index_mode
+                    .pending_inspector
+                    .as_ref()
+                    .is_none_or(|pending| pending.request_id != request_id)
+                {
+                    continue;
+                }
+                if selected_index_hotspot_path(state).as_deref() != Some(path.as_str()) {
+                    continue;
+                }
+                match *result {
+                    Ok(inspector) => {
+                        if let Some(index_mode) = &mut state.index_mode {
+                            index_mode.inspector = inspector;
+                            index_mode.pending_inspector = None;
+                            index_mode.last_query_error = None;
+                        }
+                        refresh_index_presentation(state, options);
+                    }
+                    Err(error) => {
+                        if let Some(index_mode) = &mut state.index_mode {
+                            index_mode.pending_inspector = None;
+                            index_mode.last_query_error = Some(error.clone());
+                        }
+                        state.status = Some(format!("Inspector read failed: {error}"));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn update_tui_pending_status(state: &mut TuiAppState) {
+    let Some(index_mode) = &mut state.index_mode else {
+        return;
+    };
+    let now = Instant::now();
+    if let Some(pending) = &index_mode.pending_page {
+        let elapsed = now.duration_since(pending.started_at);
+        if elapsed >= TUI_PAGE_TIMEOUT {
+            let detail = pending.detail.clone();
+            index_mode.pending_page = None;
+            index_mode.last_query_error = Some(format!(
+                "Index page read timed out after {}",
+                human_duration(elapsed)
+            ));
+            state.status = Some(format!("Index page read timed out: {detail}"));
+        } else if elapsed >= TUI_INSPECTOR_LOADING_DELAY {
+            state.status = Some(format!("Loading hotspots: {}", pending.detail));
+        }
+    }
+    if let Some(pending) = &index_mode.pending_inspector {
+        let elapsed = now.duration_since(pending.started_at);
+        if elapsed >= TUI_INSPECTOR_TIMEOUT {
+            let detail = pending.detail.clone();
+            index_mode.pending_inspector = None;
+            index_mode.last_query_error = Some(format!(
+                "Inspector read timed out after {}",
+                human_duration(elapsed)
+            ));
+            state.status = Some(format!("Inspector read timed out: {detail}"));
+        } else if elapsed >= TUI_INSPECTOR_LOADING_DELAY {
+            state.status = Some(format!("Loading inspector: {}", pending.detail));
+        }
+    }
+}
+
+fn unavailable_index_view(state: &mut TuiAppState) {
+    state.status = Some("Only hotspot view is loaded for this repository size".to_owned());
+    state.current_view = TuiView::Hotspots;
 }
 
 fn reduce_escape(state: &mut TuiAppState) {
@@ -1423,11 +2142,450 @@ fn selected_row_text(state: &TuiAppState, rows: &[String]) -> Option<String> {
 }
 
 fn clamp_current_selection(state: &mut TuiAppState, snapshot: &TuiSnapshot) {
-    let row_count = filtered_visible_rows(snapshot, state).len();
+    let row_count = if state.index_mode.is_some() && state.current_view == TuiView::Hotspots {
+        index_visible_rows(state).len()
+    } else {
+        filtered_visible_rows(snapshot, state).len()
+    };
     state.selection_for_current_view_mut().clamp(row_count);
 }
 
+fn open_index_mode(worktree_root: PathBuf, options: TuiOptions) -> TuiIndexMode {
+    let hotspots = TuiHotspotPage {
+        rows: Vec::new(),
+        total: 0,
+        offset: 0,
+        limit: TUI_HOTSPOT_PAGE_SIZE,
+        query: None,
+    };
+    let presentation = index_presentation_from_page(&hotspots, options.context);
+    TuiIndexMode {
+        worktree_root,
+        include_generated_hotspots: options.include_generated_hotspots,
+        hotspots,
+        presentation,
+        inspector: None,
+        pending_page: None,
+        pending_inspector: None,
+        last_query_error: None,
+    }
+}
+
+fn load_index_hotspot_page(
+    worktree_root: &PathBuf,
+    offset: u64,
+    limit: u64,
+    include_generated_hotspots: bool,
+    query: Option<&str>,
+) -> Result<TuiHotspotPage, TuiSnapshotError> {
+    let started = Instant::now();
+    let store = storage::index::IndexStore::open_read_only(worktree_root)
+        .map_err(TuiSnapshotError::PersistScan)?;
+    load_index_hotspot_page_from_store(&store, offset, limit, include_generated_hotspots, query)
+        .inspect(|page| {
+            let elapsed = started.elapsed();
+            operation_log::event(
+                "hotpath.tui_hotspot_page_query_completed",
+                json!({
+                    "elapsed_ms": elapsed.as_millis(),
+                    "offset": offset,
+                    "limit": limit,
+                    "rows": page.rows.len(),
+                    "total": page.total,
+                }),
+            );
+            log_tui_perf(
+                "hotpath.tui_hotspot_page_query",
+                elapsed,
+                json!({
+                    "offset": offset,
+                    "limit": limit,
+                    "rows": page.rows.len(),
+                    "total": page.total,
+                    "filtered": query.map(str::trim).is_some_and(|query| !query.is_empty()),
+                }),
+            );
+        })
+}
+
+fn load_index_hotspot_page_from_store(
+    store: &storage::index::IndexStore,
+    offset: u64,
+    limit: u64,
+    include_generated_hotspots: bool,
+    query: Option<&str>,
+) -> Result<TuiHotspotPage, TuiSnapshotError> {
+    let page = store
+        .latest_hotspot_page(offset, limit, include_generated_hotspots, query)
+        .map_err(TuiSnapshotError::PersistScan)?;
+    Ok(TuiHotspotPage {
+        rows: page.rows,
+        total: page.total,
+        offset: page.offset,
+        limit: page.limit,
+        query: query
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .map(str::to_owned),
+    })
+}
+
+fn index_presentation_from_page(
+    page: &TuiHotspotPage,
+    context_options: ContextOptions,
+) -> TuiSnapshot {
+    let hotspots = page
+        .rows
+        .iter()
+        .cloned()
+        .filter_map(report_hotspot_from_persisted)
+        .collect::<Vec<_>>();
+    index_presentation_from_parts(hotspots, Vec::new(), context_options)
+}
+
+fn index_presentation_from_parts(
+    hotspots: Vec<ReportHotspot>,
+    files: Vec<FileRecord>,
+    context_options: ContextOptions,
+) -> TuiSnapshot {
+    let context = estimate_context(&files, context_options);
+    let context_estimated_tokens = context.summary.estimated_tokens;
+    let findings = hotspots.iter().map(ReportFinding::from).collect::<Vec<_>>();
+    let scan_report = ScanReport {
+        status: "completed",
+        file_walking: "completed",
+        classification: "completed",
+        warnings: Vec::new(),
+        files,
+    };
+    let report = Report {
+        schema_version: report::REPORT_SCHEMA_VERSION,
+        summary: report::ReportSummary {
+            scan: scan_report.summary(),
+            git: report::ReportGitSummary {
+                head_commit_id: "index".to_owned(),
+                recent_window_days: git::RECENT_CHURN_WINDOW_DAYS as u64,
+                file_metric_count: 0,
+                co_change_count: 0,
+            },
+            hotspot_count: hotspots.len() as u64,
+            context_estimated_tokens,
+        },
+        hotspots,
+        context: report::ReportContext {
+            options: context.options,
+            summary: context.summary,
+            groups: context.groups,
+            skipped: context.skipped,
+            budget: context.budget,
+        },
+        findings,
+    };
+    let parse = parse::scaffold_report_from_scan(&scan_report);
+    let complexity = complexity::report_from_parse(&parse);
+
+    TuiSnapshot::from_parts(report, scan_report, parse, complexity)
+}
+
+fn refresh_index_presentation(state: &mut TuiAppState, options: TuiOptions) {
+    let Some(index_mode) = &mut state.index_mode else {
+        return;
+    };
+    let mut hotspots = index_mode
+        .hotspots
+        .rows
+        .iter()
+        .cloned()
+        .filter_map(report_hotspot_from_persisted)
+        .collect::<Vec<_>>();
+    let mut files = Vec::new();
+    let mut ownership = TuiOwnershipSnapshot::default();
+    let mut fan_by_file = Vec::new();
+    let mut complexity_symbols = Vec::new();
+    if let Some(inspector) = &index_mode.inspector {
+        if hotspots
+            .iter()
+            .all(|hotspot| hotspot.path != inspector.hotspot.path)
+        {
+            if let Some(hotspot) = report_hotspot_from_persisted(inspector.hotspot.clone()) {
+                hotspots.push(hotspot);
+                hotspots.sort_by(|left, right| {
+                    left.rank
+                        .cmp(&right.rank)
+                        .then_with(|| left.path.cmp(&right.path))
+                });
+            }
+        }
+        if let Some(file) = inspector.file.clone() {
+            files.push(file_record_from_persisted(file));
+        }
+        if !inspector.owners.is_empty() {
+            ownership.by_file.push(TuiFileOwnership {
+                path: inspector.hotspot.path.clone(),
+                owners: inspector
+                    .owners
+                    .iter()
+                    .map(|owner| TuiOwnerShare {
+                        author: owner.author.clone(),
+                        touch_count: owner.touch_count,
+                        share: owner.share,
+                    })
+                    .collect(),
+            });
+        }
+        if inspector.fan_in > 0 || inspector.fan_out > 0 {
+            fan_by_file.push(TuiFileFan {
+                path: inspector.hotspot.path.clone(),
+                fan_in: inspector.fan_in,
+                fan_out: inspector.fan_out,
+            });
+        }
+        if let Some(max_complexity) = inspector.max_cyclomatic_complexity {
+            complexity_symbols.push(ComplexitySymbolRecord {
+                path: inspector.hotspot.path.clone(),
+                name: "file".to_owned(),
+                kind: "file".to_owned(),
+                start_line: 1,
+                end_line: 1,
+                length_lines: 1,
+                function_length_lines: None,
+                nesting_depth: 0,
+                cyclomatic_complexity: Some(max_complexity),
+                max_control_flow_nesting: None,
+                is_large_symbol: false,
+            });
+        }
+    }
+    let mut presentation = index_presentation_from_parts(hotspots, files, options.context);
+    presentation.ownership = ownership;
+    presentation.coupling.fan_by_file = fan_by_file;
+    presentation.complexity.symbols = complexity_symbols;
+    index_mode.presentation = presentation;
+}
+
+fn report_hotspot_from_persisted(
+    hotspot: storage::index::PersistedHotspot,
+) -> Option<ReportHotspot> {
+    let raw_metrics = hotspot
+        .raw_metrics_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<RawScoreMetrics>(json).ok())?;
+    let (normalized_metrics, weighted_terms) = hotspot
+        .explanation
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<TuiHotspotExplanationPayload>(json).ok())
+        .map(|payload| (payload.normalized_metrics, payload.weighted_terms))
+        .unwrap_or((
+            NormalizedScoreMetrics {
+                size: None,
+                churn: None,
+                recent_churn: None,
+                ownership: None,
+                coupling: None,
+            },
+            Vec::new(),
+        ));
+    let limitations = hotspot
+        .limitation
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<TuiHotspotLimitationsPayload>(json).ok())
+        .map(|payload| payload.limitations)
+        .unwrap_or_default();
+
+    Some(ReportHotspot {
+        rank: hotspot.rank,
+        path: hotspot.path,
+        score: hotspot.score,
+        formula_version: formula_version_from_index(&hotspot.formula_version),
+        raw_metrics,
+        normalized_metrics,
+        weighted_terms,
+        limitations,
+    })
+}
+
+fn formula_version_from_index(id: &str) -> FormulaVersion {
+    if id == crate::scoring::CURRENT_SCORE_FORMULA_ID {
+        FormulaVersion::current()
+    } else {
+        FormulaVersion {
+            id: id.to_owned(),
+            major: 0,
+            minor: 0,
+        }
+    }
+}
+
+fn file_record_from_persisted(file: storage::index::PersistedFileRecord) -> FileRecord {
+    FileRecord {
+        path: file.path,
+        byte_size: file.byte_size,
+        extension: file.extension,
+        language: static_language(file.language.as_deref()),
+        line_count: file.line_count,
+        is_vendor: file.is_vendor,
+        is_generated: file.is_generated,
+        content: file.content,
+        is_symlink: file.is_symlink,
+        classification: static_classification(file.classification.as_deref()),
+        warnings: Vec::new(),
+    }
+}
+
+fn static_language(language: Option<&str>) -> Option<&'static str> {
+    match language {
+        Some("Go") => Some("Go"),
+        Some("JavaScript") => Some("JavaScript"),
+        Some("JavaScript JSX") => Some("JavaScript JSX"),
+        Some("Python") => Some("Python"),
+        Some("Rust") => Some("Rust"),
+        Some("TypeScript") => Some("TypeScript"),
+        Some("TypeScript JSX") => Some("TypeScript JSX"),
+        _ => None,
+    }
+}
+
+fn static_classification(classification: Option<&str>) -> &'static str {
+    match classification {
+        Some("implemented") => "implemented",
+        Some("generated") => "generated",
+        Some("vendor") => "vendor",
+        Some("lockfile") => "lockfile",
+        Some("minified") => "minified",
+        _ => "implemented",
+    }
+}
+
+fn refresh_index_inspector(state: &mut TuiAppState, options: TuiOptions) {
+    let Some(path) = selected_index_hotspot_path(state) else {
+        if let Some(index_mode) = &mut state.index_mode {
+            index_mode.inspector = None;
+        }
+        return;
+    };
+    let Some(index_mode) = &mut state.index_mode else {
+        return;
+    };
+    let started = Instant::now();
+    let result = load_index_inspector(
+        &index_mode.worktree_root,
+        &path,
+        index_mode.include_generated_hotspots,
+    );
+    let elapsed = started.elapsed();
+    operation_log::event(
+        "hotpath.tui_inspector_query_completed",
+        json!({
+            "elapsed_ms": elapsed.as_millis(),
+            "path": path,
+        }),
+    );
+    log_tui_perf(
+        "hotpath.tui_inspector_query",
+        elapsed,
+        json!({ "path": path }),
+    );
+    match result {
+        Ok(inspector) => {
+            index_mode.inspector = inspector;
+            index_mode.last_query_error = None;
+            state.current_path = Some(path);
+            refresh_index_presentation(state, options);
+        }
+        Err(error) => {
+            index_mode.last_query_error = Some(error.to_string());
+            state.status = Some(format!("Inspector read failed: {error}"));
+        }
+    }
+}
+
+fn load_index_inspector(
+    worktree_root: &PathBuf,
+    path: &str,
+    include_generated_hotspots: bool,
+) -> Result<Option<TuiIndexInspector>, TuiSnapshotError> {
+    let store = storage::index::IndexStore::open_read_only(worktree_root)
+        .map_err(TuiSnapshotError::PersistScan)?;
+    load_index_inspector_from_store(&store, path, include_generated_hotspots)
+}
+
+fn load_index_inspector_from_store(
+    store: &storage::index::IndexStore,
+    path: &str,
+    include_generated_hotspots: bool,
+) -> Result<Option<TuiIndexInspector>, TuiSnapshotError> {
+    let Some(facts) = store
+        .latest_inspector_facts_by_path(path, include_generated_hotspots)
+        .map_err(TuiSnapshotError::PersistScan)?
+    else {
+        return Ok(None);
+    };
+    let raw_metrics = facts
+        .hotspot
+        .raw_metrics_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<RawScoreMetrics>(json).ok());
+    let (normalized_metrics, weighted_terms) = facts
+        .hotspot
+        .explanation
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<TuiHotspotExplanationPayload>(json).ok())
+        .map(|payload| (Some(payload.normalized_metrics), payload.weighted_terms))
+        .unwrap_or((None, Vec::new()));
+    let limitations = facts
+        .hotspot
+        .limitation
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<TuiHotspotLimitationsPayload>(json).ok())
+        .map(|payload| payload.limitations)
+        .unwrap_or_default();
+
+    Ok(Some(TuiIndexInspector {
+        hotspot: facts.hotspot,
+        file: facts.file,
+        owners: facts.owners,
+        max_cyclomatic_complexity: facts.max_cyclomatic_complexity,
+        fan_in: facts.fan_in,
+        fan_out: facts.fan_out,
+        raw_metrics,
+        normalized_metrics,
+        weighted_terms,
+        limitations,
+    }))
+}
+
+fn selected_index_hotspot_path(state: &TuiAppState) -> Option<String> {
+    state
+        .index_mode
+        .as_ref()
+        .and_then(|index_mode| index_mode.hotspots.rows.get(state.selected_index()))
+        .map(|hotspot| hotspot.path.clone())
+}
+
+fn log_tui_perf(event: &'static str, elapsed: Duration, fields: serde_json::Value) {
+    if !tui_perf_enabled() {
+        return;
+    }
+    operation_log::event(
+        event,
+        json!({
+            "elapsed_ms": elapsed.as_millis(),
+            "fields": fields,
+        }),
+    );
+}
+
+fn tui_perf_enabled() -> bool {
+    env::var_os("HOTPATH_PERF").is_some_and(|value| {
+        let value = value.to_string_lossy();
+        !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+    })
+}
+
 fn filtered_visible_rows(snapshot: &TuiSnapshot, state: &TuiAppState) -> Vec<String> {
+    if state.index_mode.is_some() && state.current_view == TuiView::Hotspots {
+        return index_visible_rows(state);
+    }
     let rows = visible_rows(snapshot, state);
     let Some(search) = &state.search else {
         return rows;
@@ -1439,6 +2597,31 @@ fn filtered_visible_rows(snapshot: &TuiSnapshot, state: &TuiAppState) -> Vec<Str
 
     rows.into_iter()
         .filter(|row| row.to_lowercase().contains(&query))
+        .collect()
+}
+
+fn index_visible_rows(state: &TuiAppState) -> Vec<String> {
+    let Some(index_mode) = &state.index_mode else {
+        return Vec::new();
+    };
+    if index_mode.hotspots.rows.is_empty() && index_mode.pending_page.is_some() {
+        return vec!["Loading hotspots from index...".to_owned()];
+    }
+    if index_mode.hotspots.rows.is_empty() {
+        return vec!["No current files were ranked as hotspots.".to_owned()];
+    }
+    index_mode
+        .hotspots
+        .rows
+        .iter()
+        .map(|hotspot| {
+            format!(
+                "#{rank} {path} score {score:.3}",
+                rank = hotspot.rank,
+                path = hotspot.path,
+                score = hotspot.score
+            )
+        })
         .collect()
 }
 
@@ -2231,9 +3414,48 @@ fn layout_mode(area: Rect) -> TuiLayoutMode {
 }
 
 fn display_rows(snapshot: &TuiSnapshot, state: &TuiAppState) -> Vec<DisplayRow> {
+    if let (Some(index_mode), TuiView::Hotspots) = (&state.index_mode, state.current_view) {
+        return index_display_rows(index_mode);
+    }
     filtered_visible_rows(snapshot, state)
         .into_iter()
         .map(|text| display_row_from_text(snapshot, state.current_view, text))
+        .collect()
+}
+
+fn index_display_rows(index_mode: &TuiIndexMode) -> Vec<DisplayRow> {
+    if index_mode.hotspots.rows.is_empty() {
+        if index_mode.pending_page.is_some() {
+            return vec![DisplayRow {
+                text: "Loading hotspots from index...".to_owned(),
+                label: String::new(),
+                meta: String::new(),
+                severity: TuiSeverity::Muted,
+                hotspot: None,
+            }];
+        }
+        return vec![DisplayRow {
+            text: "No current files were ranked as hotspots.".to_owned(),
+            label: String::new(),
+            meta: String::new(),
+            severity: TuiSeverity::Muted,
+            hotspot: None,
+        }];
+    }
+
+    index_mode
+        .hotspots
+        .rows
+        .iter()
+        .map(|hotspot| {
+            let text = format!(
+                "#{rank} {path} score {score:.3}",
+                rank = hotspot.rank,
+                path = hotspot.path,
+                score = hotspot.score
+            );
+            hotspot_display_row(&index_mode.presentation, text)
+        })
         .collect()
 }
 
@@ -2456,6 +3678,19 @@ fn render_header(
     let title_style = style(options, TuiSeverity::Low).add_modifier(Modifier::BOLD);
     let muted = style(options, TuiSeverity::Muted);
     let nav = navigation_line(state, options);
+    let summary = if let Some(index_mode) = &state.index_mode {
+        format!(
+            "{} hotspots loaded from index",
+            format_compact_count(index_mode.hotspots.total)
+        )
+    } else {
+        format!(
+            "{} files  {} hotspots  {} tokens",
+            snapshot.scan.summary.total_files,
+            snapshot.report.summary.hotspot_count,
+            format_compact_count(snapshot.report.summary.context_estimated_tokens)
+        )
+    };
     let header = Paragraph::new(vec![
         nav,
         Line::styled(
@@ -2480,15 +3715,7 @@ fn render_header(
                 area.width.saturating_sub(48) as usize,
             )),
             Span::raw("  "),
-            Span::styled(
-                format!(
-                    "{} files  {} hotspots  {} tokens",
-                    snapshot.scan.summary.total_files,
-                    snapshot.report.summary.hotspot_count,
-                    format_compact_count(snapshot.report.summary.context_estimated_tokens)
-                ),
-                muted,
-            ),
+            Span::styled(summary, muted),
         ]),
     ]);
 
@@ -2790,7 +4017,16 @@ fn progress_status_text_at(
     } else if update.detail.is_empty() {
         update.phase.to_owned()
     } else {
-        format!("{}... {}", update.phase, update.detail)
+        let elapsed = update
+            .started_at
+            .map(|started_at| {
+                format!(
+                    "{HOTSPOT_TAG_SEPARATOR}{} elapsed",
+                    human_duration(now.duration_since(started_at))
+                )
+            })
+            .unwrap_or_default();
+        format!("{}... {}{}", update.phase, update.detail, elapsed)
     };
 
     if text.chars().count() > width {
@@ -2798,6 +4034,15 @@ fn progress_status_text_at(
     }
 
     text
+}
+
+fn human_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    }
 }
 
 fn progress_rate_per_second(update: &TuiProgressUpdate, now: Instant) -> Option<u64> {
@@ -3627,6 +4872,9 @@ fn inspector_lines(
     width: u16,
     options: TuiOptions,
 ) -> Vec<Line<'static>> {
+    if state.index_mode.is_some() && state.current_view == TuiView::Hotspots {
+        return index_inspector_lines(state, width, options);
+    }
     let selected_text = rows
         .get(state.selected_index())
         .map(|row| row.text.as_str());
@@ -3649,6 +4897,42 @@ fn inspector_lines(
         Some(path) => file_inspector_lines(snapshot, &path, width, options),
         None => repo_inspector_lines(snapshot, options),
     }
+}
+
+fn index_inspector_lines(
+    state: &TuiAppState,
+    width: u16,
+    options: TuiOptions,
+) -> Vec<Line<'static>> {
+    let Some(index_mode) = &state.index_mode else {
+        return Vec::new();
+    };
+    if let Some(error) = &index_mode.last_query_error {
+        return vec![Line::styled(
+            format!("Index read failed: {error}"),
+            style(options, TuiSeverity::High),
+        )];
+    }
+    if let Some(pending) = &index_mode.pending_inspector {
+        if pending.started_at.elapsed() >= TUI_INSPECTOR_LOADING_DELAY {
+            return vec![Line::styled(
+                format!("Loading inspector for {}", pending.detail),
+                style(options, TuiSeverity::Muted),
+            )];
+        }
+    }
+    let Some(inspector) = &index_mode.inspector else {
+        return vec![Line::styled(
+            "No hotspot selected",
+            style(options, TuiSeverity::Muted),
+        )];
+    };
+    file_inspector_lines(
+        &index_mode.presentation,
+        &inspector.hotspot.path,
+        width,
+        options,
+    )
 }
 
 fn file_inspector_lines(
@@ -4281,6 +5565,75 @@ mod tests {
     }
 
     #[test]
+    fn index_mode_renders_paged_hotspots_and_disables_other_views() {
+        let snapshot = test_snapshot();
+        let mut state = TuiAppState {
+            index_mode: Some(TuiIndexMode {
+                worktree_root: PathBuf::from("."),
+                include_generated_hotspots: false,
+                hotspots: TuiHotspotPage {
+                    rows: vec![storage::index::PersistedHotspot {
+                        path: "src/lib.rs".to_owned(),
+                        score: 0.64,
+                        rank: 1,
+                        formula_version: "hotpath.score.v3".to_owned(),
+                        raw_metrics_json: None,
+                        explanation: None,
+                        limitation: None,
+                    }],
+                    total: 1,
+                    offset: 0,
+                    limit: 200,
+                    query: None,
+                },
+                presentation: snapshot.clone(),
+                inspector: None,
+                pending_page: None,
+                pending_inspector: None,
+                last_query_error: None,
+            }),
+            ..TuiAppState::default()
+        };
+
+        let rows = display_rows(&snapshot, &state);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].hotspot.as_ref().map(|row| row.path.as_str()),
+            Some("src/lib.rs")
+        );
+        assert_eq!(rows[0].meta, "risk 6/10  churn 120  authors 3");
+
+        reduce_test_key(&mut state, &snapshot, KeyCode::Char('2'), None);
+
+        assert_eq!(state.current_view(), TuiView::Hotspots);
+        assert_eq!(
+            state.status(),
+            Some("Only hotspot view is loaded for this repository size")
+        );
+    }
+
+    #[test]
+    fn find_existing_index_root_walks_parents_without_git_discovery() {
+        let root = std::env::current_dir()
+            .expect("test should have cwd")
+            .join("target")
+            .join(format!(
+                "tui-index-root-{}-{}",
+                std::process::id(),
+                Instant::now().elapsed().as_nanos()
+            ));
+        let nested = root.join("src").join("nested");
+        std::fs::create_dir_all(root.join(".hotpath")).expect("index dir should be created");
+        std::fs::create_dir_all(&nested).expect("nested dir should be created");
+        std::fs::write(storage::index::default_index_path(&root), b"")
+            .expect("index marker should be created");
+
+        assert_eq!(find_existing_index_root(&nested), Some(root.clone()));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn reducer_drills_down_and_escape_navigates_back() {
         let snapshot = test_snapshot();
         let mut state = TuiAppState::default();
@@ -4583,6 +5936,49 @@ mod tests {
             &messages[2],
             TuiWorkerMessage::Progress(TuiProgressUpdate { detail, .. }) if detail == "done"
         ));
+    }
+
+    #[test]
+    fn indeterminate_progress_shows_elapsed_time() {
+        let started_at = Instant::now() - Duration::from_secs(75);
+        let mut update = TuiProgressUpdate::indeterminate(
+            "Writing index",
+            "persisting scan, parser, Git, and hotspot facts",
+        );
+        update.started_at = Some(started_at);
+
+        let text = progress_status_text_at(
+            &update,
+            120,
+            TuiOptions::default(),
+            started_at + Duration::from_secs(75),
+        );
+
+        assert!(text.contains("Writing index"));
+        assert!(text.contains("persisting scan"));
+        assert!(text.contains(&format!("{HOTSPOT_TAG_SEPARATOR}1m 15s elapsed")));
+    }
+
+    #[test]
+    fn progress_rate_uses_first_emitted_completion_as_baseline() {
+        let (sender, receiver) = mpsc::channel();
+        let mut emitter = TuiProgressEmitter::new(sender);
+
+        emitter.emit(TuiProgressUpdate::measured(
+            "Git history",
+            "diffing reachable commits",
+            500,
+            1_000,
+            "commits",
+        ));
+
+        let messages = receiver.try_iter().collect::<Vec<_>>();
+        let TuiWorkerMessage::Progress(update) = &messages[0];
+        let rate = update
+            .rate
+            .expect("measured progress should carry rate data");
+
+        assert_eq!(rate.completed_at_start, 500);
     }
 
     #[test]

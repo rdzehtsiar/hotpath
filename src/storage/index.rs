@@ -5,7 +5,7 @@ use std::env;
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -16,22 +16,26 @@ use rusqlite::{
 use serde::Serialize;
 use serde_json::json;
 
+use crate::complexity::ComplexityReport;
+use crate::dependency::FileDependencyFan;
 use crate::git::{GitCoChange, GitFileChange, GitFileMetrics};
 use crate::operation_log;
+use crate::ownership::OperationalOwnershipSnapshot;
 use crate::scoring::{NormalizedScoreMetrics, RankedHotspotScore, ScoreLimitation, WeightedTerm};
 use crate::{
     dependency, ContentKind, FileRecord, FileWarning, ParseReport, ParseSymbolRecord, ScanReport,
     ScanWarning, SCAN_SCHEMA_VERSION,
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 const HOTPATH_DIR: &str = ".hotpath";
 const INDEX_FILE: &str = "index.db";
 const SCHEMA_IDENTIFIER_V1: &str = "hotpath.index.v1";
 const SCHEMA_IDENTIFIER_V2: &str = "hotpath.index.v2";
 const SCHEMA_IDENTIFIER_V3: &str = "hotpath.index.v3";
-const SCHEMA_IDENTIFIER: &str = "hotpath.index.v4";
+const SCHEMA_IDENTIFIER_V4: &str = "hotpath.index.v4";
+const SCHEMA_IDENTIFIER: &str = "hotpath.index.v5";
 const SCHEMA_IDENTIFIER_KEY: &str = "schema_identifier";
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 const GIT_ANALYSIS_KEY: &str = "git-analysis-current";
@@ -47,6 +51,8 @@ const REQUIRED_SCHEMA_TABLES: &[&str] = &[
     "git_file_stats",
     "git_co_changes",
     "dependencies",
+    "ui_file_facts",
+    "ui_owner_shares",
     "hotspots",
     "git_commit_diffs",
 ];
@@ -165,6 +171,23 @@ pub struct PersistedHotspot {
     pub limitation: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedHotspotPage {
+    pub rows: Vec<PersistedHotspot>,
+    pub total: u64,
+    pub offset: u64,
+    pub limit: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistProgress {
+    pub phase: &'static str,
+    pub completed: u64,
+    pub total: u64,
+    pub unit: &'static str,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedSymbol {
     pub id: i64,
@@ -175,6 +198,30 @@ pub struct PersistedSymbol {
     pub line_start: Option<u64>,
     pub line_end: Option<u64>,
     pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedDependencyEdge {
+    pub source_path: String,
+    pub target_path: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedOwnerShare {
+    pub author: String,
+    pub touch_count: u64,
+    pub share: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedInspectorFacts {
+    pub hotspot: PersistedHotspot,
+    pub file: Option<PersistedFileRecord>,
+    pub owners: Vec<PersistedOwnerShare>,
+    pub max_cyclomatic_complexity: Option<u64>,
+    pub fan_in: u64,
+    pub fan_out: u64,
 }
 
 #[derive(Serialize)]
@@ -245,7 +292,7 @@ impl IndexStore {
             return Err(IndexError::CorruptMetadata {
                 path,
                 message: format!(
-                    "schema version {schema_version} is not initialized for this binary; run 'hotpath scan' to create or migrate the index"
+                    "schema version {schema_version} is not initialized for this binary; run 'hotpath analyze' to create or migrate the index"
                 ),
             });
         }
@@ -293,6 +340,95 @@ impl IndexStore {
         })
     }
 
+    pub fn open_read_only(repo_root: impl AsRef<Path>) -> Result<Self, IndexError> {
+        let path = default_index_path(repo_root);
+        let parent = path
+            .parent()
+            .expect("default index path should always have a parent");
+
+        if !existing_index_dir_is_safe(parent)? {
+            return Err(IndexError::AccessIndex {
+                path: parent.to_path_buf(),
+                source: io::Error::new(ErrorKind::NotFound, ".hotpath does not exist"),
+            });
+        }
+
+        let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|source| IndexError::OpenDatabase {
+                path: path.clone(),
+                source,
+            })?;
+        verify_database_integrity(&connection, &path)?;
+        let schema_version = read_user_version(&connection, &path)?;
+
+        if schema_version > CURRENT_SCHEMA_VERSION {
+            return Err(IndexError::IncompatibleFutureSchema {
+                path,
+                found_version: schema_version,
+                supported_version: CURRENT_SCHEMA_VERSION,
+            });
+        }
+        if schema_version != CURRENT_SCHEMA_VERSION {
+            return Err(IndexError::CorruptMetadata {
+                path,
+                message: format!(
+                    "schema version {schema_version} is not initialized for this binary; run 'hotpath analyze' to create or migrate the index"
+                ),
+            });
+        }
+        verify_metadata(&connection, &path)?;
+
+        Ok(Self {
+            connection,
+            path,
+            schema_version,
+        })
+    }
+
+    pub fn open_read_only_fast(repo_root: impl AsRef<Path>) -> Result<Self, IndexError> {
+        let path = default_index_path(repo_root);
+        let parent = path
+            .parent()
+            .expect("default index path should always have a parent");
+
+        if !existing_index_dir_is_safe(parent)? {
+            return Err(IndexError::AccessIndex {
+                path: parent.to_path_buf(),
+                source: io::Error::new(ErrorKind::NotFound, ".hotpath does not exist"),
+            });
+        }
+
+        let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|source| IndexError::OpenDatabase {
+                path: path.clone(),
+                source,
+            })?;
+        let schema_version = read_user_version(&connection, &path)?;
+
+        if schema_version > CURRENT_SCHEMA_VERSION {
+            return Err(IndexError::IncompatibleFutureSchema {
+                path,
+                found_version: schema_version,
+                supported_version: CURRENT_SCHEMA_VERSION,
+            });
+        }
+        if schema_version != CURRENT_SCHEMA_VERSION {
+            return Err(IndexError::CorruptMetadata {
+                path,
+                message: format!(
+                    "schema version {schema_version} is not initialized for this binary; run 'hotpath analyze' to recreate the index"
+                ),
+            });
+        }
+        verify_metadata_without_integrity_check(&connection, &path)?;
+
+        Ok(Self {
+            connection,
+            path,
+            schema_version,
+        })
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -302,6 +438,17 @@ impl IndexStore {
     }
 
     pub fn persist_scan(&mut self, scan: &ScanReport) -> Result<PersistedScanRun, IndexError> {
+        self.persist_scan_with_progress(scan, |_| {})
+    }
+
+    pub fn persist_scan_with_progress<F>(
+        &mut self,
+        scan: &ScanReport,
+        mut progress: F,
+    ) -> Result<PersistedScanRun, IndexError>
+    where
+        F: FnMut(PersistProgress),
+    {
         let index_path = self.path.clone();
         let transaction =
             self.connection
@@ -417,7 +564,7 @@ impl IndexStore {
                 VALUES (?1, ?2, ?3, ?4, ?5);",
             )?;
 
-            for file in &scan.files {
+            for (index, file) in scan.files.iter().enumerate() {
                 let file_id = persist_file(
                     &mut file_upsert,
                     &mut file_id_query,
@@ -433,9 +580,23 @@ impl IndexStore {
                     scan_run_id,
                     &file.warnings,
                 )?;
+                progress(PersistProgress {
+                    phase: "scan_files",
+                    completed: (index + 1) as u64,
+                    total: scan.files.len() as u64,
+                    unit: "files",
+                    detail: "persisting scanned files".to_owned(),
+                });
             }
         }
 
+        progress(PersistProgress {
+            phase: "scan_finalize",
+            completed: scan.files.len() as u64,
+            total: scan.files.len() as u64,
+            unit: "files",
+            detail: "deleting stale file rows".to_owned(),
+        });
         delete_stale_files(&transaction, &index_path, repo_id, scan_run_id)?;
 
         transaction
@@ -465,6 +626,28 @@ impl IndexStore {
         metrics: &[GitFileMetrics],
         co_changes: &[GitCoChange],
     ) -> Result<PersistedGitAnalysisRun, IndexError> {
+        self.persist_git_analysis_with_progress(
+            git_head,
+            head_commit_time,
+            recent_window_days,
+            metrics,
+            co_changes,
+            |_| {},
+        )
+    }
+
+    pub fn persist_git_analysis_with_progress<F>(
+        &mut self,
+        git_head: &str,
+        head_commit_time: i64,
+        recent_window_days: u64,
+        metrics: &[GitFileMetrics],
+        co_changes: &[GitCoChange],
+        mut progress: F,
+    ) -> Result<PersistedGitAnalysisRun, IndexError>
+    where
+        F: FnMut(PersistProgress),
+    {
         let index_path = self.path.clone();
         let transaction =
             self.connection
@@ -522,7 +705,7 @@ impl IndexStore {
         let analysis_run_id = transaction.last_insert_rowid();
 
         let mut file_ids = BTreeMap::new();
-        for metric in metrics {
+        for (index, metric) in metrics.iter().enumerate() {
             ensure_git_path_file(
                 &transaction,
                 &index_path,
@@ -530,8 +713,15 @@ impl IndexStore {
                 &metric.path,
                 &mut file_ids,
             )?;
+            progress(PersistProgress {
+                phase: "git_paths",
+                completed: (index + 1) as u64,
+                total: metrics.len() as u64 + co_changes.len().saturating_mul(2) as u64,
+                unit: "paths",
+                detail: "ensuring Git metric paths".to_owned(),
+            });
         }
-        for co_change in co_changes {
+        for (index, co_change) in co_changes.iter().enumerate() {
             ensure_git_path_file(
                 &transaction,
                 &index_path,
@@ -546,6 +736,13 @@ impl IndexStore {
                 &co_change.right_path,
                 &mut file_ids,
             )?;
+            progress(PersistProgress {
+                phase: "git_paths",
+                completed: metrics.len() as u64 + ((index + 1) * 2) as u64,
+                total: metrics.len() as u64 + co_changes.len().saturating_mul(2) as u64,
+                unit: "paths",
+                detail: "ensuring Git co-change paths".to_owned(),
+            });
         }
 
         {
@@ -577,7 +774,7 @@ impl IndexStore {
                     source,
                 })?;
 
-            for metric in metrics {
+            for (index, metric) in metrics.iter().enumerate() {
                 let file_id = file_ids[&metric.path];
                 insert
                     .execute(params![
@@ -627,6 +824,13 @@ impl IndexStore {
                         path: index_path.clone(),
                         source,
                     })?;
+                progress(PersistProgress {
+                    phase: "git_metrics",
+                    completed: (index + 1) as u64,
+                    total: metrics.len() as u64,
+                    unit: "rows",
+                    detail: "persisting Git file metrics".to_owned(),
+                });
             }
         }
 
@@ -649,7 +853,7 @@ impl IndexStore {
                     source,
                 })?;
 
-            for co_change in co_changes {
+            for (index, co_change) in co_changes.iter().enumerate() {
                 insert
                     .execute(params![
                         repo_id,
@@ -664,6 +868,13 @@ impl IndexStore {
                         path: index_path.clone(),
                         source,
                     })?;
+                progress(PersistProgress {
+                    phase: "git_cochanges",
+                    completed: (index + 1) as u64,
+                    total: co_changes.len() as u64,
+                    unit: "rows",
+                    detail: "persisting Git co-change rows".to_owned(),
+                });
             }
         }
 
@@ -692,6 +903,18 @@ impl IndexStore {
         scan_run_id: i64,
         ranked_scores: &[RankedHotspotScore],
     ) -> Result<(), IndexError> {
+        self.persist_hotspots_with_progress(scan_run_id, ranked_scores, |_| {})
+    }
+
+    pub fn persist_hotspots_with_progress<F>(
+        &mut self,
+        scan_run_id: i64,
+        ranked_scores: &[RankedHotspotScore],
+        mut progress: F,
+    ) -> Result<(), IndexError>
+    where
+        F: FnMut(PersistProgress),
+    {
         let index_path = self.path.clone();
         let transaction =
             self.connection
@@ -708,6 +931,13 @@ impl IndexStore {
                 path: index_path.clone(),
                 source,
             })?;
+        progress(PersistProgress {
+            phase: "hotspot_cleanup",
+            completed: 0,
+            total: ranked_scores.len() as u64,
+            unit: "hotspots",
+            detail: "replacing hotspot rows".to_owned(),
+        });
 
         {
             let mut file_id_query = transaction
@@ -736,7 +966,7 @@ impl IndexStore {
                     source,
                 })?;
 
-            for ranked_score in ranked_scores {
+            for (index, ranked_score) in ranked_scores.iter().enumerate() {
                 persist_hotspot(
                     &mut file_id_query,
                     &mut insert,
@@ -745,6 +975,13 @@ impl IndexStore {
                     scan_run_id,
                     ranked_score,
                 )?;
+                progress(PersistProgress {
+                    phase: "hotspots",
+                    completed: (index + 1) as u64,
+                    total: ranked_scores.len() as u64,
+                    unit: "hotspots",
+                    detail: "persisting hotspot rows".to_owned(),
+                });
             }
         }
 
@@ -759,6 +996,17 @@ impl IndexStore {
     }
 
     pub fn persist_symbols(&mut self, report: &ParseReport) -> Result<(), IndexError> {
+        self.persist_symbols_with_progress(report, |_| {})
+    }
+
+    pub fn persist_symbols_with_progress<F>(
+        &mut self,
+        report: &ParseReport,
+        mut progress: F,
+    ) -> Result<(), IndexError>
+    where
+        F: FnMut(PersistProgress),
+    {
         let index_path = self.path.clone();
         let transaction =
             self.connection
@@ -779,18 +1027,26 @@ impl IndexStore {
                     source,
                 })?;
 
-            for file_id in file_ids.values() {
+            for (index, file_id) in file_ids.values().enumerate() {
                 delete
                     .execute(params![file_id])
                     .map_err(|source| IndexError::PersistSymbols {
                         path: index_path.clone(),
                         source,
                     })?;
+                progress(PersistProgress {
+                    phase: "symbol_cleanup",
+                    completed: (index + 1) as u64,
+                    total: file_ids.len() as u64,
+                    unit: "files",
+                    detail: "deleting stale symbol rows".to_owned(),
+                });
             }
         }
 
         let mut sorted_symbols = report.symbols.iter().collect::<Vec<_>>();
         sorted_symbols.sort_by(|left, right| symbol_sort_key(left).cmp(&symbol_sort_key(right)));
+        let symbol_total = sorted_symbols.len() as u64;
 
         let mut inserted_symbols = Vec::with_capacity(sorted_symbols.len());
         let mut symbol_paths: BTreeMap<(String, String), Vec<SymbolLookup>> = BTreeMap::new();
@@ -814,7 +1070,7 @@ impl IndexStore {
                     source,
                 })?;
 
-            for symbol in sorted_symbols {
+            for (index, symbol) in sorted_symbols.into_iter().enumerate() {
                 let file_id = symbol_file_id(&file_ids, &index_path, symbol)?;
                 let line_start = symbol_line_to_i64(symbol.start_line, &index_path, symbol)?;
                 let line_end = symbol_line_to_i64(symbol.end_line, &index_path, symbol)?;
@@ -877,6 +1133,13 @@ impl IndexStore {
                     line_start: symbol.start_line,
                     line_end: symbol.end_line,
                 });
+                progress(PersistProgress {
+                    phase: "symbols",
+                    completed: (index + 1) as u64,
+                    total: symbol_total,
+                    unit: "symbols",
+                    detail: "persisting symbol rows".to_owned(),
+                });
             }
         }
 
@@ -888,31 +1151,49 @@ impl IndexStore {
                     source,
                 })?;
 
-            for symbol in &inserted_symbols {
-                let Some(parent_path) = &symbol.parent_path else {
-                    continue;
-                };
-                let Some(parent_id) = resolved_parent_symbol_id(
-                    &symbol_paths,
-                    &symbol.file_path,
-                    parent_path,
-                    symbol.id,
-                    symbol.line_start,
-                    symbol.line_end,
-                ) else {
-                    continue;
-                };
-
-                update
-                    .execute(params![parent_id, symbol.id])
-                    .map_err(|source| IndexError::PersistSymbols {
-                        path: index_path.clone(),
-                        source,
-                    })?;
+            for (index, symbol) in inserted_symbols.iter().enumerate() {
+                if let Some(parent_id) = symbol.parent_path.as_ref().and_then(|parent_path| {
+                    resolved_parent_symbol_id(
+                        &symbol_paths,
+                        &symbol.file_path,
+                        parent_path,
+                        symbol.id,
+                        symbol.line_start,
+                        symbol.line_end,
+                    )
+                }) {
+                    update
+                        .execute(params![parent_id, symbol.id])
+                        .map_err(|source| IndexError::PersistSymbols {
+                            path: index_path.clone(),
+                            source,
+                        })?;
+                }
+                progress(PersistProgress {
+                    phase: "symbol_parents",
+                    completed: (index + 1) as u64,
+                    total: inserted_symbols.len() as u64,
+                    unit: "symbols",
+                    detail: "linking parent symbols".to_owned(),
+                });
             }
         }
 
+        progress(PersistProgress {
+            phase: "dependencies",
+            completed: 0,
+            total: report.imports.len() as u64,
+            unit: "imports",
+            detail: "replacing dependency edges".to_owned(),
+        });
         replace_dependencies_for_report(&transaction, &index_path, repo_id, &file_ids, report)?;
+        progress(PersistProgress {
+            phase: "dependencies",
+            completed: report.imports.len() as u64,
+            total: report.imports.len() as u64,
+            unit: "imports",
+            detail: "replaced dependency edges".to_owned(),
+        });
 
         transaction
             .commit()
@@ -942,6 +1223,209 @@ impl IndexStore {
         transaction
             .commit()
             .map_err(|source| IndexError::PersistSymbols {
+                path: index_path,
+                source,
+            })?;
+
+        Ok(())
+    }
+
+    pub fn persist_ui_facts_with_progress<F>(
+        &mut self,
+        scan_run_id: i64,
+        complexity: &ComplexityReport,
+        fan_by_path: &BTreeMap<String, FileDependencyFan>,
+        ownership: &OperationalOwnershipSnapshot,
+        mut progress: F,
+    ) -> Result<(), IndexError>
+    where
+        F: FnMut(PersistProgress),
+    {
+        let index_path = self.path.clone();
+        let transaction =
+            self.connection
+                .transaction()
+                .map_err(|source| IndexError::PersistUiFacts {
+                    path: index_path.clone(),
+                    source,
+                })?;
+        let repo_id = ensure_repo(&transaction, &index_path)?;
+
+        transaction
+            .execute(
+                "DELETE FROM ui_owner_shares WHERE repo_id = ?1;",
+                params![repo_id],
+            )
+            .map_err(|source| IndexError::PersistUiFacts {
+                path: index_path.clone(),
+                source,
+            })?;
+        transaction
+            .execute(
+                "DELETE FROM ui_file_facts WHERE repo_id = ?1;",
+                params![repo_id],
+            )
+            .map_err(|source| IndexError::PersistUiFacts {
+                path: index_path.clone(),
+                source,
+            })?;
+
+        let complexity_by_path = complexity
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file.max_cyclomatic_complexity))
+            .collect::<BTreeMap<_, _>>();
+        let paths = complexity
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .chain(fan_by_path.keys().map(String::as_str))
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut file_id_query = transaction
+            .prepare("SELECT id FROM files WHERE repo_id = ?1 AND scan_run_id = ?2 AND path = ?3;")
+            .map_err(|source| IndexError::PersistUiFacts {
+                path: index_path.clone(),
+                source,
+            })?;
+        let mut insert_fact = transaction
+            .prepare(
+                "INSERT INTO ui_file_facts (
+                    file_id,
+                    repo_id,
+                    scan_run_id,
+                    path,
+                    max_cyclomatic_complexity,
+                    fan_in,
+                    fan_out
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
+            )
+            .map_err(|source| IndexError::PersistUiFacts {
+                path: index_path.clone(),
+                source,
+            })?;
+
+        for (index, path) in paths.iter().enumerate() {
+            let Some(file_id) = file_id_query
+                .query_row(params![repo_id, scan_run_id, path], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .optional()
+                .map_err(|source| IndexError::PersistUiFacts {
+                    path: index_path.clone(),
+                    source,
+                })?
+            else {
+                continue;
+            };
+            let fan = fan_by_path.get(*path).copied().unwrap_or_default();
+            insert_fact
+                .execute(params![
+                    file_id,
+                    repo_id,
+                    scan_run_id,
+                    path,
+                    optional_u64_to_i64_for_symbols(
+                        complexity_by_path.get(path).copied().flatten(),
+                        &index_path,
+                        "max_cyclomatic_complexity",
+                    )?,
+                    u64_to_i64_for_symbols(fan.fan_in, &index_path, "fan_in")?,
+                    u64_to_i64_for_symbols(fan.fan_out, &index_path, "fan_out")?,
+                ])
+                .map_err(|source| IndexError::PersistUiFacts {
+                    path: index_path.clone(),
+                    source,
+                })?;
+            progress(PersistProgress {
+                phase: "ui_facts",
+                completed: (index + 1) as u64,
+                total: paths.len() as u64,
+                unit: "files",
+                detail: "persisting UI file presentation facts".to_owned(),
+            });
+        }
+        drop(insert_fact);
+        drop(file_id_query);
+
+        let mut file_id_query = transaction
+            .prepare("SELECT id FROM files WHERE repo_id = ?1 AND scan_run_id = ?2 AND path = ?3;")
+            .map_err(|source| IndexError::PersistUiFacts {
+                path: index_path.clone(),
+                source,
+            })?;
+        let mut insert_owner = transaction
+            .prepare(
+                "INSERT INTO ui_owner_shares (
+                    file_id,
+                    repo_id,
+                    scan_run_id,
+                    path,
+                    owner_order,
+                    author,
+                    touch_count,
+                    share
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);",
+            )
+            .map_err(|source| IndexError::PersistUiFacts {
+                path: index_path.clone(),
+                source,
+            })?;
+        for (file_index, file) in ownership.by_file.iter().enumerate() {
+            let Some(file_id) = file_id_query
+                .query_row(params![repo_id, scan_run_id, &file.path], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .optional()
+                .map_err(|source| IndexError::PersistUiFacts {
+                    path: index_path.clone(),
+                    source,
+                })?
+            else {
+                continue;
+            };
+            let mut owners = file
+                .owners
+                .iter()
+                .map(|owner| (owner.author.as_str(), owner.meaningful_commits, owner.share))
+                .collect::<Vec<_>>();
+            if file.others_share > 0.0 {
+                owners.push(("others", 1, file.others_share));
+            }
+            for (owner_index, (author, touch_count, share)) in owners.into_iter().enumerate() {
+                let author = ui_owner_author(author);
+                let share = ui_owner_share(share);
+                insert_owner
+                    .execute(params![
+                        file_id,
+                        repo_id,
+                        scan_run_id,
+                        &file.path,
+                        usize_to_i64_for_symbols(owner_index, &index_path, "owner_order")?,
+                        author,
+                        u64_to_i64_for_symbols(touch_count, &index_path, "touch_count")?,
+                        share,
+                    ])
+                    .map_err(|source| IndexError::PersistUiFacts {
+                        path: index_path.clone(),
+                        source,
+                    })?;
+            }
+            progress(PersistProgress {
+                phase: "ui_owners",
+                completed: (file_index + 1) as u64,
+                total: ownership.by_file.len() as u64,
+                unit: "files",
+                detail: "persisting UI ownership facts".to_owned(),
+            });
+        }
+        drop(insert_owner);
+        drop(file_id_query);
+
+        transaction
+            .commit()
+            .map_err(|source| IndexError::PersistUiFacts {
                 path: index_path,
                 source,
             })?;
@@ -1064,6 +1548,57 @@ impl IndexStore {
         }))
     }
 
+    pub fn latest_git_file_stats(&self) -> Result<Vec<PersistedGitFileStats>, IndexError> {
+        let Some(run_id) = self.latest_git_analysis_run_id()? else {
+            return Ok(Vec::new());
+        };
+
+        read_git_file_stats(&self.connection, &self.path, run_id)
+    }
+
+    pub fn latest_git_analysis_run(&self) -> Result<Option<PersistedGitAnalysisRun>, IndexError> {
+        self.connection
+            .query_row(
+                "SELECT
+                    id,
+                    analysis_key,
+                    status,
+                    analyzer_version,
+                    git_head,
+                    head_commit_time,
+                    recent_window_days,
+                    metrics_observed,
+                    co_changes_observed
+                 FROM git_analysis_runs
+                 ORDER BY id DESC
+                 LIMIT 1;",
+                [],
+                read_persisted_git_analysis_run,
+            )
+            .optional()
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    fn latest_git_analysis_run_id(&self) -> Result<Option<i64>, IndexError> {
+        self.connection
+            .query_row(
+                "SELECT id
+                 FROM git_analysis_runs
+                 ORDER BY id DESC
+                 LIMIT 1;",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub fn latest_hotspots(&self) -> Result<Vec<PersistedHotspot>, IndexError> {
         let mut statement = self
             .connection
@@ -1100,6 +1635,321 @@ impl IndexStore {
             })
     }
 
+    pub fn latest_hotspot_page(
+        &self,
+        offset: u64,
+        limit: u64,
+        include_generated: bool,
+        query: Option<&str>,
+    ) -> Result<PersistedHotspotPage, IndexError> {
+        let limit = limit.max(1);
+        let offset_i64 = u64_to_i64(offset, &self.path, "offset")?;
+        let limit_i64 = u64_to_i64(limit, &self.path, "limit")?;
+        let include_generated = if include_generated { 1 } else { 0 };
+        let query = query.map(str::trim).filter(|query| !query.is_empty());
+
+        let total = if let Some(query) = query {
+            let pattern = hotspot_like_pattern(query);
+            self.connection
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM hotspots
+                     INNER JOIN files ON files.id = hotspots.file_id
+                     INNER JOIN repos ON repos.id = hotspots.repo_id
+                     WHERE repos.root_key = '.'
+                       AND (?1 = 1 OR files.is_generated = 0)
+                       AND files.path LIKE ?2 ESCAPE '\\';",
+                    params![include_generated, pattern],
+                    |row| i64_to_u64(row.get(0)?, 0),
+                )
+                .map_err(|source| IndexError::ReadIndex {
+                    path: self.path.clone(),
+                    source,
+                })?
+        } else {
+            self.connection
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM hotspots
+                     INNER JOIN files ON files.id = hotspots.file_id
+                     INNER JOIN repos ON repos.id = hotspots.repo_id
+                     WHERE repos.root_key = '.'
+                       AND (?1 = 1 OR files.is_generated = 0);",
+                    params![include_generated],
+                    |row| i64_to_u64(row.get(0)?, 0),
+                )
+                .map_err(|source| IndexError::ReadIndex {
+                    path: self.path.clone(),
+                    source,
+                })?
+        };
+
+        let rows = if let Some(query) = query {
+            let pattern = hotspot_like_pattern(query);
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT
+                        files.path,
+                        hotspots.score,
+                        hotspots.rank,
+                        hotspots.formula_version,
+                        hotspots.raw_metrics_json,
+                        hotspots.explanation,
+                        hotspots.limitation
+                     FROM hotspots
+                     INNER JOIN files ON files.id = hotspots.file_id
+                     INNER JOIN repos ON repos.id = hotspots.repo_id
+                     WHERE repos.root_key = '.'
+                       AND (?1 = 1 OR files.is_generated = 0)
+                       AND files.path LIKE ?2 ESCAPE '\\'
+                     ORDER BY hotspots.rank, files.path
+                     LIMIT ?3 OFFSET ?4;",
+                )
+                .map_err(|source| IndexError::ReadIndex {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            let rows = statement
+                .query_map(
+                    params![include_generated, pattern, limit_i64, offset_i64],
+                    read_persisted_hotspot,
+                )
+                .map_err(|source| IndexError::ReadIndex {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|source| IndexError::ReadIndex {
+                    path: self.path.clone(),
+                    source,
+                })?
+        } else {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT
+                        files.path,
+                        hotspots.score,
+                        hotspots.rank,
+                        hotspots.formula_version,
+                        hotspots.raw_metrics_json,
+                        hotspots.explanation,
+                        hotspots.limitation
+                     FROM hotspots
+                     INNER JOIN files ON files.id = hotspots.file_id
+                     INNER JOIN repos ON repos.id = hotspots.repo_id
+                     WHERE repos.root_key = '.'
+                       AND (?1 = 1 OR files.is_generated = 0)
+                     ORDER BY hotspots.rank, files.path
+                     LIMIT ?2 OFFSET ?3;",
+                )
+                .map_err(|source| IndexError::ReadIndex {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            let rows = statement
+                .query_map(
+                    params![include_generated, limit_i64, offset_i64],
+                    read_persisted_hotspot,
+                )
+                .map_err(|source| IndexError::ReadIndex {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|source| IndexError::ReadIndex {
+                    path: self.path.clone(),
+                    source,
+                })?
+        };
+
+        Ok(PersistedHotspotPage {
+            rows,
+            total,
+            offset,
+            limit,
+        })
+    }
+
+    pub fn latest_hotspot_by_path(
+        &self,
+        path: &str,
+        include_generated: bool,
+    ) -> Result<Option<PersistedHotspot>, IndexError> {
+        let include_generated = if include_generated { 1 } else { 0 };
+        self.connection
+            .query_row(
+                "SELECT
+                    files.path,
+                    hotspots.score,
+                    hotspots.rank,
+                    hotspots.formula_version,
+                    hotspots.raw_metrics_json,
+                    hotspots.explanation,
+                    hotspots.limitation
+                 FROM hotspots
+                 INNER JOIN files ON files.id = hotspots.file_id
+                 INNER JOIN repos ON repos.id = hotspots.repo_id
+                 WHERE repos.root_key = '.'
+                   AND (?1 = 1 OR files.is_generated = 0)
+                   AND files.path = ?2
+                 ORDER BY hotspots.rank, files.path
+                 LIMIT 1;",
+                params![include_generated, path],
+                read_persisted_hotspot,
+            )
+            .optional()
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub fn latest_inspector_facts_by_path(
+        &self,
+        path: &str,
+        include_generated: bool,
+    ) -> Result<Option<PersistedInspectorFacts>, IndexError> {
+        let Some(hotspot) = self.latest_hotspot_by_path(path, include_generated)? else {
+            return Ok(None);
+        };
+        let file = self.latest_file_by_path(path)?;
+        let Some(scan_run_id) = self.latest_scan_run_id()? else {
+            return Ok(Some(PersistedInspectorFacts {
+                hotspot,
+                file,
+                owners: Vec::new(),
+                max_cyclomatic_complexity: None,
+                fan_in: 0,
+                fan_out: 0,
+            }));
+        };
+        let ui_fact = self
+            .connection
+            .query_row(
+                "SELECT max_cyclomatic_complexity, fan_in, fan_out
+                 FROM ui_file_facts
+                 WHERE scan_run_id = ?1 AND path = ?2
+                 LIMIT 1;",
+                params![scan_run_id, path],
+                |row| {
+                    Ok((
+                        optional_i64_to_u64(row.get(0)?, 0)?,
+                        i64_to_u64(row.get(1)?, 1)?,
+                        i64_to_u64(row.get(2)?, 2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })?;
+        let (max_cyclomatic_complexity, fan_in, fan_out) = ui_fact.unwrap_or((None, 0, 0));
+        let owners = self.latest_owner_shares(scan_run_id, path)?;
+
+        Ok(Some(PersistedInspectorFacts {
+            hotspot,
+            file,
+            owners,
+            max_cyclomatic_complexity,
+            fan_in,
+            fan_out,
+        }))
+    }
+
+    fn latest_owner_shares(
+        &self,
+        scan_run_id: i64,
+        path: &str,
+    ) -> Result<Vec<PersistedOwnerShare>, IndexError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT author, touch_count, share
+                 FROM ui_owner_shares
+                 WHERE scan_run_id = ?1 AND path = ?2
+                 ORDER BY owner_order;",
+            )
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })?;
+        let rows = statement
+            .query_map(params![scan_run_id, path], read_persisted_owner_share)
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub fn latest_file_by_path(
+        &self,
+        path: &str,
+    ) -> Result<Option<PersistedFileRecord>, IndexError> {
+        let Some(scan_run_id) = self.latest_scan_run_id()? else {
+            return Ok(None);
+        };
+        let Some((file_id, mut file)) = self
+            .connection
+            .query_row(
+                "SELECT
+                    id,
+                    path,
+                    byte_size,
+                    extension,
+                    language,
+                    line_count,
+                    is_vendor,
+                    is_generated,
+                    content_kind,
+                    is_symlink,
+                    classification
+                 FROM files
+                 WHERE scan_run_id = ?1
+                   AND path = ?2
+                 ORDER BY path
+                 LIMIT 1;",
+                params![scan_run_id, path],
+                read_persisted_file_record,
+            )
+            .optional()
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })?
+        else {
+            return Ok(None);
+        };
+
+        file.warnings = read_file_warnings(&self.connection, &self.path, scan_run_id, file_id)?;
+        Ok(Some(file))
+    }
+
+    fn latest_scan_run_id(&self) -> Result<Option<i64>, IndexError> {
+        self.connection
+            .query_row(
+                "SELECT id
+                 FROM scan_runs
+                 ORDER BY id DESC
+                 LIMIT 1;",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub fn latest_symbols(&self) -> Result<Vec<PersistedSymbol>, IndexError> {
         let mut statement = self
             .connection
@@ -1125,6 +1975,38 @@ impl IndexStore {
             })?;
         let rows = statement
             .query_map([], read_persisted_symbol)
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub fn latest_dependency_edges(&self) -> Result<Vec<PersistedDependencyEdge>, IndexError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT
+                    source_files.path,
+                    dependencies.target_path,
+                    dependencies.kind
+                 FROM dependencies
+                 INNER JOIN files AS source_files ON source_files.id = dependencies.source_file_id
+                 INNER JOIN repos ON repos.id = dependencies.repo_id
+                 WHERE repos.root_key = '.'
+                 ORDER BY source_files.path, dependencies.target_path, dependencies.kind;",
+            )
+            .map_err(|source| IndexError::ReadIndex {
+                path: self.path.clone(),
+                source,
+            })?;
+        let rows = statement
+            .query_map([], read_persisted_dependency_edge)
             .map_err(|source| IndexError::ReadIndex {
                 path: self.path.clone(),
                 source,
@@ -1412,6 +2294,10 @@ pub enum IndexError {
         path: PathBuf,
         source: rusqlite::Error,
     },
+    PersistUiFacts {
+        path: PathBuf,
+        source: rusqlite::Error,
+    },
     PersistHotspots {
         path: PathBuf,
         source: rusqlite::Error,
@@ -1501,6 +2387,11 @@ impl fmt::Display for IndexError {
                 "failed to persist parser symbols to Hotpath index '{}': {source}",
                 path.display()
             ),
+            Self::PersistUiFacts { path, source } => write!(
+                f,
+                "failed to persist TUI presentation facts to Hotpath index '{}': {source}",
+                path.display()
+            ),
             Self::PersistHotspots { path, source } => write!(
                 f,
                 "failed to persist hotspot scores to Hotpath index '{}': {source}",
@@ -1546,6 +2437,7 @@ impl StdError for IndexError {
             | Self::PersistScan { source, .. }
             | Self::PersistGitAnalysis { source, .. }
             | Self::PersistSymbols { source, .. }
+            | Self::PersistUiFacts { source, .. }
             | Self::PersistHotspots { source, .. }
             | Self::ReadIndex { source, .. } => Some(source),
             Self::CorruptMetadata { .. }
@@ -2375,6 +3267,22 @@ fn read_persisted_hotspot(row: &Row<'_>) -> rusqlite::Result<PersistedHotspot> {
     })
 }
 
+fn hotspot_like_pattern(query: &str) -> String {
+    let mut pattern = String::with_capacity(query.len() + 2);
+    pattern.push('%');
+    for character in query.chars() {
+        match character {
+            '%' | '_' | '\\' => {
+                pattern.push('\\');
+                pattern.push(character);
+            }
+            _ => pattern.push(character),
+        }
+    }
+    pattern.push('%');
+    pattern
+}
+
 fn read_persisted_symbol(row: &Row<'_>) -> rusqlite::Result<PersistedSymbol> {
     Ok(PersistedSymbol {
         id: row.get(0)?,
@@ -2386,6 +3294,39 @@ fn read_persisted_symbol(row: &Row<'_>) -> rusqlite::Result<PersistedSymbol> {
         line_end: optional_i64_to_u64(row.get(6)?, 6)?,
         signature: row.get(7)?,
     })
+}
+
+fn read_persisted_dependency_edge(row: &Row<'_>) -> rusqlite::Result<PersistedDependencyEdge> {
+    Ok(PersistedDependencyEdge {
+        source_path: row.get(0)?,
+        target_path: row.get(1)?,
+        kind: row.get(2)?,
+    })
+}
+
+fn read_persisted_owner_share(row: &Row<'_>) -> rusqlite::Result<PersistedOwnerShare> {
+    Ok(PersistedOwnerShare {
+        author: row.get(0)?,
+        touch_count: i64_to_u64(row.get(1)?, 1)?,
+        share: row.get(2)?,
+    })
+}
+
+fn ui_owner_author(author: &str) -> &str {
+    let author = author.trim();
+    if author.is_empty() {
+        "unknown"
+    } else {
+        author
+    }
+}
+
+fn ui_owner_share(share: f64) -> f64 {
+    if share.is_finite() {
+        share.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 fn read_persisted_scan_warning(row: &Row<'_>) -> rusqlite::Result<PersistedScanWarning> {
@@ -2443,6 +3384,38 @@ fn u64_to_i64_for_git(
 
 fn u64_to_i64_for_symbol(
     value: u64,
+    path: &Path,
+    field_name: &'static str,
+) -> Result<i64, IndexError> {
+    i64::try_from(value).map_err(|_| IndexError::InvalidSymbolData {
+        path: path.to_path_buf(),
+        message: format!("{field_name} value {value} exceeds SQLite INTEGER range"),
+    })
+}
+
+fn optional_u64_to_i64_for_symbols(
+    value: Option<u64>,
+    path: &Path,
+    field_name: &'static str,
+) -> Result<Option<i64>, IndexError> {
+    value
+        .map(|value| u64_to_i64_for_symbols(value, path, field_name))
+        .transpose()
+}
+
+fn u64_to_i64_for_symbols(
+    value: u64,
+    path: &Path,
+    field_name: &'static str,
+) -> Result<i64, IndexError> {
+    i64::try_from(value).map_err(|_| IndexError::InvalidSymbolData {
+        path: path.to_path_buf(),
+        message: format!("{field_name} value {value} exceeds SQLite INTEGER range"),
+    })
+}
+
+fn usize_to_i64_for_symbols(
+    value: usize,
     path: &Path,
     field_name: &'static str,
 ) -> Result<i64, IndexError> {
@@ -2655,6 +3628,10 @@ fn migrate_to_current(
                 migrate_3_to_4(connection, path)?;
                 version = 4;
             }
+            4 => {
+                migrate_4_to_5(connection, path)?;
+                version = 5;
+            }
             _ => {
                 return Err(IndexError::CorruptMetadata {
                     path: path.to_path_buf(),
@@ -2663,6 +3640,38 @@ fn migrate_to_current(
             }
         }
     }
+
+    Ok(())
+}
+
+fn migrate_4_to_5(connection: &mut Connection, path: &Path) -> Result<(), IndexError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|source| migration_error(path, 4, 5, source))?;
+
+    create_ui_schema_v5(&transaction, path)?;
+    transaction
+        .execute(
+            "INSERT INTO hotpath_metadata (key, value)
+             VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+            params![SCHEMA_VERSION_KEY, CURRENT_SCHEMA_VERSION.to_string()],
+        )
+        .map_err(|source| migration_error(path, 4, 5, source))?;
+    transaction
+        .execute(
+            "INSERT INTO hotpath_metadata (key, value)
+             VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+            params![SCHEMA_IDENTIFIER_KEY, SCHEMA_IDENTIFIER],
+        )
+        .map_err(|source| migration_error(path, 4, 5, source))?;
+    transaction
+        .execute_batch("PRAGMA user_version = 5;")
+        .map_err(|source| migration_error(path, 4, 5, source))?;
+    transaction
+        .commit()
+        .map_err(|source| migration_error(path, 4, 5, source))?;
 
     Ok(())
 }
@@ -2685,7 +3694,7 @@ fn migrate_2_to_3(connection: &mut Connection, path: &Path) -> Result<(), IndexE
             "INSERT INTO hotpath_metadata (key, value)
              VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
-            params![SCHEMA_VERSION_KEY, CURRENT_SCHEMA_VERSION.to_string()],
+            params![SCHEMA_VERSION_KEY, "3"],
         )
         .map_err(|source| migration_error(path, 2, 3, source))?;
     transaction
@@ -2725,7 +3734,7 @@ fn migrate_3_to_4(connection: &mut Connection, path: &Path) -> Result<(), IndexE
             "INSERT INTO hotpath_metadata (key, value)
              VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
-            params![SCHEMA_VERSION_KEY, CURRENT_SCHEMA_VERSION.to_string()],
+            params![SCHEMA_VERSION_KEY, "4"],
         )
         .map_err(|source| migration_error(path, 3, 4, source))?;
     transaction
@@ -2733,7 +3742,7 @@ fn migrate_3_to_4(connection: &mut Connection, path: &Path) -> Result<(), IndexE
             "INSERT INTO hotpath_metadata (key, value)
              VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
-            params![SCHEMA_IDENTIFIER_KEY, SCHEMA_IDENTIFIER],
+            params![SCHEMA_IDENTIFIER_KEY, SCHEMA_IDENTIFIER_V4],
         )
         .map_err(|source| migration_error(path, 3, 4, source))?;
     transaction
@@ -3167,6 +4176,83 @@ fn create_cache_schema_v4(connection: &Connection, path: &Path) -> Result<(), In
         .map_err(|source| migration_error(path, 3, 4, source))
 }
 
+fn create_ui_schema_v5(connection: &Connection, path: &Path) -> Result<(), IndexError> {
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS ui_file_facts (
+                file_id INTEGER PRIMARY KEY,
+                repo_id INTEGER NOT NULL,
+                scan_run_id INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                max_cyclomatic_complexity INTEGER,
+                fan_in INTEGER NOT NULL DEFAULT 0,
+                fan_out INTEGER NOT NULL DEFAULT 0,
+                CHECK (length(path) > 0),
+                CHECK (path != '..'),
+                CHECK (path NOT LIKE '/%'),
+                CHECK (path NOT LIKE './%'),
+                CHECK (path NOT LIKE '../%'),
+                CHECK (path NOT LIKE '%/../%'),
+                CHECK (path NOT LIKE '%/..'),
+                CHECK (path NOT LIKE '~%'),
+                CHECK (path NOT GLOB '[A-Za-z]:*'),
+                CHECK (instr(path, '\\') = 0),
+                CHECK (instr(path, char(0)) = 0),
+                CHECK (max_cyclomatic_complexity IS NULL OR max_cyclomatic_complexity >= 0),
+                CHECK (fan_in >= 0),
+                CHECK (fan_out >= 0),
+                FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+                FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE,
+                FOREIGN KEY (scan_run_id) REFERENCES scan_runs(id) ON DELETE CASCADE
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS ui_owner_shares (
+                id INTEGER PRIMARY KEY,
+                file_id INTEGER NOT NULL,
+                repo_id INTEGER NOT NULL,
+                scan_run_id INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                owner_order INTEGER NOT NULL,
+                author TEXT NOT NULL,
+                touch_count INTEGER NOT NULL,
+                share REAL NOT NULL,
+                UNIQUE (file_id, owner_order),
+                CHECK (length(path) > 0),
+                CHECK (path != '..'),
+                CHECK (path NOT LIKE '/%'),
+                CHECK (path NOT LIKE './%'),
+                CHECK (path NOT LIKE '../%'),
+                CHECK (path NOT LIKE '%/../%'),
+                CHECK (path NOT LIKE '%/..'),
+                CHECK (path NOT LIKE '~%'),
+                CHECK (path NOT GLOB '[A-Za-z]:*'),
+                CHECK (instr(path, '\\') = 0),
+                CHECK (instr(path, char(0)) = 0),
+                CHECK (owner_order >= 0),
+                CHECK (length(author) > 0),
+                CHECK (touch_count >= 0),
+                CHECK (share >= 0.0 AND share <= 1.0),
+                FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+                FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE,
+                FOREIGN KEY (scan_run_id) REFERENCES scan_runs(id) ON DELETE CASCADE
+            ) STRICT;
+
+            CREATE INDEX IF NOT EXISTS ui_file_facts_by_run_path
+                ON ui_file_facts (scan_run_id, path);
+            CREATE INDEX IF NOT EXISTS ui_owner_shares_by_run_path_order
+                ON ui_owner_shares (scan_run_id, path, owner_order);
+            CREATE INDEX IF NOT EXISTS files_by_scan_path
+                ON files (scan_run_id, path);
+            CREATE INDEX IF NOT EXISTS hotspots_by_scan_rank
+                ON hotspots (scan_run_id, rank, file_id);
+            CREATE INDEX IF NOT EXISTS hotspots_by_scan_path
+                ON hotspots (scan_run_id, file_id);
+            ",
+        )
+        .map_err(|source| migration_error(path, 4, 5, source))
+}
+
 fn migration_error(
     path: &Path,
     from_version: u32,
@@ -3218,6 +4304,13 @@ fn verify_database_integrity(connection: &Connection, path: &Path) -> Result<(),
 
 fn verify_metadata(connection: &Connection, path: &Path) -> Result<(), IndexError> {
     verify_database_integrity(connection, path)?;
+    verify_metadata_without_integrity_check(connection, path)
+}
+
+fn verify_metadata_without_integrity_check(
+    connection: &Connection,
+    path: &Path,
+) -> Result<(), IndexError> {
     verify_schema_objects(connection, path)?;
 
     let user_version = read_user_version(connection, path)?;
@@ -3530,6 +4623,28 @@ const HOTSPOTS_COLUMNS: &[ExpectedColumn] = &[
     expected_column("limitation", "TEXT", false, None, 0),
 ];
 
+const UI_FILE_FACTS_COLUMNS: &[ExpectedColumn] = &[
+    expected_column("file_id", "INTEGER", false, None, 1),
+    expected_column("repo_id", "INTEGER", true, None, 0),
+    expected_column("scan_run_id", "INTEGER", true, None, 0),
+    expected_column("path", "TEXT", true, None, 0),
+    expected_column("max_cyclomatic_complexity", "INTEGER", false, None, 0),
+    expected_column("fan_in", "INTEGER", true, Some("0"), 0),
+    expected_column("fan_out", "INTEGER", true, Some("0"), 0),
+];
+
+const UI_OWNER_SHARES_COLUMNS: &[ExpectedColumn] = &[
+    expected_column("id", "INTEGER", false, None, 1),
+    expected_column("file_id", "INTEGER", true, None, 0),
+    expected_column("repo_id", "INTEGER", true, None, 0),
+    expected_column("scan_run_id", "INTEGER", true, None, 0),
+    expected_column("path", "TEXT", true, None, 0),
+    expected_column("owner_order", "INTEGER", true, None, 0),
+    expected_column("author", "TEXT", true, None, 0),
+    expected_column("touch_count", "INTEGER", true, None, 0),
+    expected_column("share", "REAL", true, None, 0),
+];
+
 const GIT_COMMIT_DIFFS_COLUMNS: &[ExpectedColumn] = &[
     expected_column("repo_id", "INTEGER", true, None, 1),
     expected_column("commit_id", "TEXT", true, None, 2),
@@ -3593,6 +4708,11 @@ const HOTSPOTS_FOREIGN_KEYS: &[ExpectedForeignKey] = &[
 ];
 const GIT_COMMIT_DIFFS_FOREIGN_KEYS: &[ExpectedForeignKey] =
     &[expected_foreign_key("repo_id", "repos", "id", "CASCADE")];
+const UI_FACTS_FOREIGN_KEYS: &[ExpectedForeignKey] = &[
+    expected_foreign_key("file_id", "files", "id", "CASCADE"),
+    expected_foreign_key("repo_id", "repos", "id", "CASCADE"),
+    expected_foreign_key("scan_run_id", "scan_runs", "id", "CASCADE"),
+];
 
 const REPOS_UNIQUE_CONSTRAINTS: &[ExpectedUniqueConstraint] =
     &[expected_unique_constraint(&["root_key"])];
@@ -3625,6 +4745,8 @@ const DEPENDENCIES_UNIQUE_CONSTRAINTS: &[ExpectedUniqueConstraint] =
         "kind",
         "symbol_name",
     ])];
+const UI_OWNER_SHARES_UNIQUE_CONSTRAINTS: &[ExpectedUniqueConstraint] =
+    &[expected_unique_constraint(&["file_id", "owner_order"])];
 
 const REPOS_CHECK_CONSTRAINTS: &[&str] = &["CHECK (length(root_key) > 0)"];
 const SCAN_RUNS_CHECK_CONSTRAINTS: &[&str] = &[
@@ -3748,6 +4870,39 @@ const GIT_COMMIT_DIFFS_CHECK_CONSTRAINTS: &[&str] = &[
     "CHECK (length(analyzer_version) > 0)",
     "CHECK (length(changes_json) > 0)",
 ];
+const UI_FILE_FACTS_CHECK_CONSTRAINTS: &[&str] = &[
+    "CHECK (length(path) > 0)",
+    "CHECK (path != '..')",
+    "CHECK (path NOT LIKE '/%')",
+    "CHECK (path NOT LIKE './%')",
+    "CHECK (path NOT LIKE '../%')",
+    "CHECK (path NOT LIKE '%/../%')",
+    "CHECK (path NOT LIKE '%/..')",
+    "CHECK (path NOT LIKE '~%')",
+    "CHECK (path NOT GLOB '[A-Za-z]:*')",
+    "CHECK (instr(path, '\\') = 0)",
+    "CHECK (instr(path, char(0)) = 0)",
+    "CHECK (max_cyclomatic_complexity IS NULL OR max_cyclomatic_complexity >= 0)",
+    "CHECK (fan_in >= 0)",
+    "CHECK (fan_out >= 0)",
+];
+const UI_OWNER_SHARES_CHECK_CONSTRAINTS: &[&str] = &[
+    "CHECK (length(path) > 0)",
+    "CHECK (path != '..')",
+    "CHECK (path NOT LIKE '/%')",
+    "CHECK (path NOT LIKE './%')",
+    "CHECK (path NOT LIKE '../%')",
+    "CHECK (path NOT LIKE '%/../%')",
+    "CHECK (path NOT LIKE '%/..')",
+    "CHECK (path NOT LIKE '~%')",
+    "CHECK (path NOT GLOB '[A-Za-z]:*')",
+    "CHECK (instr(path, '\\') = 0)",
+    "CHECK (instr(path, char(0)) = 0)",
+    "CHECK (owner_order >= 0)",
+    "CHECK (length(author) > 0)",
+    "CHECK (touch_count >= 0)",
+    "CHECK (share >= 0.0 AND share <= 1.0)",
+];
 
 const REQUIRED_INDEXES: &[ExpectedIndex] = &[
     expected_index(
@@ -3805,6 +4960,27 @@ const REQUIRED_INDEXES: &[ExpectedIndex] = &[
         "hotspots_by_repo_score",
         "hotspots",
         &["repo_id", "score", "file_id"],
+    ),
+    expected_index(
+        "ui_file_facts_by_run_path",
+        "ui_file_facts",
+        &["scan_run_id", "path"],
+    ),
+    expected_index(
+        "ui_owner_shares_by_run_path_order",
+        "ui_owner_shares",
+        &["scan_run_id", "path", "owner_order"],
+    ),
+    expected_index("files_by_scan_path", "files", &["scan_run_id", "path"]),
+    expected_index(
+        "hotspots_by_scan_rank",
+        "hotspots",
+        &["scan_run_id", "rank", "file_id"],
+    ),
+    expected_index(
+        "hotspots_by_scan_path",
+        "hotspots",
+        &["scan_run_id", "file_id"],
     ),
     expected_index(
         "git_commit_diffs_by_repo_commit",
@@ -3962,6 +5138,8 @@ fn expected_columns(table_name: &str) -> &'static [ExpectedColumn] {
         "git_co_changes" => GIT_CO_CHANGES_COLUMNS,
         "dependencies" => DEPENDENCIES_COLUMNS,
         "hotspots" => HOTSPOTS_COLUMNS,
+        "ui_file_facts" => UI_FILE_FACTS_COLUMNS,
+        "ui_owner_shares" => UI_OWNER_SHARES_COLUMNS,
         "git_commit_diffs" => GIT_COMMIT_DIFFS_COLUMNS,
         _ => &[],
     }
@@ -3980,6 +5158,7 @@ fn expected_foreign_keys(table_name: &str) -> &'static [ExpectedForeignKey] {
         "git_co_changes" => GIT_CO_CHANGES_FOREIGN_KEYS,
         "dependencies" => DEPENDENCIES_FOREIGN_KEYS,
         "hotspots" => HOTSPOTS_FOREIGN_KEYS,
+        "ui_file_facts" | "ui_owner_shares" => UI_FACTS_FOREIGN_KEYS,
         "git_commit_diffs" => GIT_COMMIT_DIFFS_FOREIGN_KEYS,
         _ => NO_FOREIGN_KEYS,
     }
@@ -3996,6 +5175,7 @@ fn expected_unique_constraints(table_name: &str) -> &'static [ExpectedUniqueCons
         "git_analysis_runs" => GIT_ANALYSIS_RUNS_UNIQUE_CONSTRAINTS,
         "git_co_changes" => GIT_CO_CHANGES_UNIQUE_CONSTRAINTS,
         "dependencies" => DEPENDENCIES_UNIQUE_CONSTRAINTS,
+        "ui_owner_shares" => UI_OWNER_SHARES_UNIQUE_CONSTRAINTS,
         "git_commit_diffs" => NO_UNIQUE_CONSTRAINTS,
         _ => NO_UNIQUE_CONSTRAINTS,
     }
@@ -4014,6 +5194,8 @@ fn expected_check_constraints(table_name: &str) -> &'static [&'static str] {
         "git_co_changes" => GIT_CO_CHANGES_CHECK_CONSTRAINTS,
         "dependencies" => DEPENDENCIES_CHECK_CONSTRAINTS,
         "hotspots" => HOTSPOTS_CHECK_CONSTRAINTS,
+        "ui_file_facts" => UI_FILE_FACTS_CHECK_CONSTRAINTS,
+        "ui_owner_shares" => UI_OWNER_SHARES_CHECK_CONSTRAINTS,
         "git_commit_diffs" => GIT_COMMIT_DIFFS_CHECK_CONSTRAINTS,
         _ => NO_CHECK_CONSTRAINTS,
     }
@@ -5634,6 +6816,202 @@ mod tests {
     }
 
     #[test]
+    fn persist_ui_facts_sanitizes_real_world_owner_values() {
+        let fixture = Fixture::new("persist-ui-owner-sanitize");
+        let mut store = IndexStore::open(&fixture.path).expect("index should open");
+        let mut file = scan_file("src/lib.rs", Some(200), Some("Rust"), ContentKind::Text);
+        file.line_count = Some(10);
+        let scan_run = store
+            .persist_scan(&scan_report(vec![file]))
+            .expect("scan should persist");
+        let score = calculate_hotspot_score(RawScoreMetrics {
+            path: "src/lib.rs".to_owned(),
+            byte_size: Some(200),
+            line_count: Some(10),
+            commits_per_file: Some(2),
+            total_churn_lines: Some(50),
+            recent_churn_lines: Some(10),
+            author_count: Some(1),
+            owner_count: Some(1),
+            dominant_owner_share: Some(1.0),
+            co_changed_file_count: Some(0),
+            file_age_days: Some(10),
+            repository_age_days: Some(10),
+            repository_author_count: Some(1),
+            repository_file_count: Some(1),
+        });
+        store
+            .persist_hotspots(scan_run.id, &rank_hotspot_scores(&[score]))
+            .expect("hotspot should persist");
+        let complexity = crate::complexity::report_from_parse(&parse_report(
+            vec![parse_file("src/lib.rs")],
+            vec![parse_symbol("src/lib.rs", "lib", "function", 1, 10, None)],
+        ));
+        let fan_by_path = BTreeMap::from([(
+            "src/lib.rs".to_owned(),
+            crate::dependency::FileDependencyFan {
+                fan_in: 2,
+                fan_out: 3,
+            },
+        )]);
+        let ownership = crate::ownership::OperationalOwnershipSnapshot {
+            by_file: vec![crate::ownership::OperationalFileOwnership {
+                path: "src/lib.rs".to_owned(),
+                owners: vec![crate::ownership::OperationalOwnerShare {
+                    author: "   ".to_owned(),
+                    meaningful_commits: 2,
+                    effective_lines: 10.0,
+                    score: 10.0,
+                    share: 1.0000000000000002,
+                }],
+                others_share: 1.0000000000000002,
+            }],
+        };
+
+        store
+            .persist_ui_facts_with_progress(
+                scan_run.id,
+                &complexity,
+                &fan_by_path,
+                &ownership,
+                |_| {},
+            )
+            .expect("UI facts should persist");
+
+        let inspector = store
+            .latest_inspector_facts_by_path("src/lib.rs", false)
+            .expect("inspector facts should read")
+            .expect("inspector facts should exist");
+        assert_eq!(inspector.max_cyclomatic_complexity, Some(1));
+        assert_eq!((inspector.fan_in, inspector.fan_out), (2, 3));
+        assert_eq!(
+            inspector.owners,
+            vec![
+                PersistedOwnerShare {
+                    author: "unknown".to_owned(),
+                    touch_count: 2,
+                    share: 1.0,
+                },
+                PersistedOwnerShare {
+                    author: "others".to_owned(),
+                    touch_count: 1,
+                    share: 1.0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn latest_hotspot_page_pages_filters_and_reads_selected_file_facts() {
+        let fixture = Fixture::new("hotspot-page");
+        let mut store = IndexStore::open(&fixture.path).expect("index should open");
+        let mut generated = scan_file(
+            "src/generated_risky.rs",
+            Some(131_072),
+            Some("Rust"),
+            ContentKind::Text,
+        );
+        generated.is_generated = true;
+        generated.classification = "generated";
+        generated.line_count = Some(20);
+        let mut risky = scan_file(
+            "src/risky.rs",
+            Some(65_536),
+            Some("Rust"),
+            ContentKind::Text,
+        );
+        risky.line_count = Some(100);
+        let stable = scan_file("src/stable.rs", Some(20), Some("Rust"), ContentKind::Text);
+        let scan_run = store
+            .persist_scan(&scan_report(vec![generated, risky, stable]))
+            .expect("scan should persist");
+        let scores = vec![
+            calculate_hotspot_score(RawScoreMetrics {
+                path: "src/generated_risky.rs".to_owned(),
+                byte_size: Some(131_072),
+                line_count: Some(20),
+                commits_per_file: Some(10),
+                total_churn_lines: Some(2_000),
+                recent_churn_lines: Some(500),
+                author_count: Some(1),
+                owner_count: Some(1),
+                dominant_owner_share: Some(1.0),
+                co_changed_file_count: Some(10),
+                file_age_days: Some(30),
+                repository_age_days: Some(365),
+                repository_author_count: Some(5),
+                repository_file_count: Some(3),
+            }),
+            calculate_hotspot_score(RawScoreMetrics {
+                path: "src/risky.rs".to_owned(),
+                byte_size: Some(65_536),
+                line_count: Some(100),
+                commits_per_file: Some(8),
+                total_churn_lines: Some(1_500),
+                recent_churn_lines: Some(300),
+                author_count: Some(3),
+                owner_count: Some(3),
+                dominant_owner_share: Some(0.4),
+                co_changed_file_count: Some(5),
+                file_age_days: Some(60),
+                repository_age_days: Some(365),
+                repository_author_count: Some(5),
+                repository_file_count: Some(3),
+            }),
+            calculate_hotspot_score(RawScoreMetrics {
+                path: "src/stable.rs".to_owned(),
+                byte_size: Some(20),
+                line_count: None,
+                commits_per_file: Some(1),
+                total_churn_lines: Some(1),
+                recent_churn_lines: Some(0),
+                author_count: Some(1),
+                owner_count: Some(1),
+                dominant_owner_share: Some(1.0),
+                co_changed_file_count: Some(0),
+                file_age_days: Some(365),
+                repository_age_days: Some(365),
+                repository_author_count: Some(5),
+                repository_file_count: Some(3),
+            }),
+        ];
+        let ranked = rank_hotspot_scores(&scores);
+        store
+            .persist_hotspots(scan_run.id, &ranked)
+            .expect("hotspots should persist");
+
+        let first_page = store
+            .latest_hotspot_page(0, 1, false, None)
+            .expect("hotspot page should read");
+        assert_eq!(first_page.total, 2);
+        assert_eq!(first_page.rows.len(), 1);
+        assert_ne!(first_page.rows[0].path, "src/generated_risky.rs");
+
+        let filtered = store
+            .latest_hotspot_page(0, 10, false, Some("stable"))
+            .expect("filtered hotspot page should read");
+        assert_eq!(
+            filtered
+                .rows
+                .iter()
+                .map(|hotspot| hotspot.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/stable.rs"]
+        );
+
+        assert!(store
+            .latest_hotspot_by_path("src/generated_risky.rs", false)
+            .expect("generated hotspot lookup should read")
+            .is_none());
+        let file = store
+            .latest_file_by_path("src/risky.rs")
+            .expect("file facts should read")
+            .expect("file should exist");
+        assert_eq!(file.language.as_deref(), Some("Rust"));
+        assert_eq!(file.line_count, Some(100));
+    }
+
+    #[test]
     fn failed_persist_does_not_delete_previous_file_rows() {
         let fixture = Fixture::new("failed-persist-keeps-files");
         let mut store = IndexStore::open(&fixture.path).expect("index should open");
@@ -5719,6 +7097,33 @@ mod tests {
                 .expect("metadata identifier should read"),
             SCHEMA_IDENTIFIER
         );
+    }
+
+    #[test]
+    fn open_read_only_does_not_create_missing_index() {
+        let fixture = Fixture::new("read-only-missing-index");
+        let error = IndexStore::open_read_only(&fixture.path)
+            .expect_err("missing read-only index should fail");
+
+        assert!(
+            matches!(
+                error,
+                IndexError::AccessIndex { .. } | IndexError::OpenDatabase { .. }
+            ),
+            "unexpected read-only open error: {error:?}"
+        );
+        assert!(!fixture.path.join(".hotpath").exists());
+    }
+
+    #[test]
+    fn open_read_only_reads_existing_index_without_migration() {
+        let fixture = Fixture::new("read-only-existing-index");
+        IndexStore::open(&fixture.path).expect("index should be created");
+
+        let store = IndexStore::open_read_only(&fixture.path).expect("read-only index should open");
+
+        assert_eq!(store.schema_version(), CURRENT_SCHEMA_VERSION);
+        assert_eq!(store.path(), default_index_path(&fixture.path));
     }
 
     #[test]
@@ -6203,7 +7608,10 @@ mod tests {
             .expect("index directory should be created");
         let connection = Connection::open(&index_path).expect("test database should open");
         connection
-            .execute_batch("PRAGMA user_version = 5;")
+            .execute_batch(&format!(
+                "PRAGMA user_version = {};",
+                CURRENT_SCHEMA_VERSION + 1
+            ))
             .expect("test schema version should be set");
         drop(connection);
 
@@ -6212,10 +7620,10 @@ mod tests {
         assert!(matches!(
             error,
             IndexError::IncompatibleFutureSchema {
-                found_version: 5,
+                found_version,
                 supported_version: CURRENT_SCHEMA_VERSION,
                 ..
-            }
+            } if found_version == CURRENT_SCHEMA_VERSION + 1
         ));
     }
 
@@ -6282,7 +7690,7 @@ mod tests {
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 ) STRICT;
-                PRAGMA user_version = 1;",
+                PRAGMA user_version = 5;",
             )
             .expect("test metadata should be created");
         drop(connection);
@@ -6335,7 +7743,7 @@ mod tests {
                     value TEXT NOT NULL
                 ) STRICT;
                 INSERT INTO hotpath_metadata (key, value)
-                VALUES ('schema_version', '5'), ('schema_identifier', 'hotpath.index.v4');",
+                VALUES ('schema_version', '6'), ('schema_identifier', 'hotpath.index.v5');",
             )
             .expect("future metadata should be created");
         drop(connection);
@@ -6346,10 +7754,10 @@ mod tests {
         assert!(matches!(
             error,
             IndexError::IncompatibleFutureSchema {
-                found_version: 5,
+                found_version,
                 supported_version: CURRENT_SCHEMA_VERSION,
                 ..
-            }
+            } if found_version == CURRENT_SCHEMA_VERSION + 1
         ));
         let connection = Connection::open(&index_path).expect("test database should reopen");
         assert_eq!(
@@ -6444,8 +7852,8 @@ mod tests {
         let connection = Connection::open(&index_path).expect("test database should reopen");
         connection
             .execute(
-                "UPDATE hotpath_metadata SET value = '5' WHERE key = ?1;",
-                params![SCHEMA_VERSION_KEY],
+                "UPDATE hotpath_metadata SET value = ?1 WHERE key = ?2;",
+                params![(CURRENT_SCHEMA_VERSION + 1).to_string(), SCHEMA_VERSION_KEY],
             )
             .expect("metadata schema version should be updated");
         drop(connection);
@@ -6456,14 +7864,17 @@ mod tests {
         assert!(matches!(
             error,
             IndexError::IncompatibleFutureSchema {
-                found_version: 5,
+                found_version,
                 supported_version: CURRENT_SCHEMA_VERSION,
                 ..
-            }
+            } if found_version == CURRENT_SCHEMA_VERSION + 1
         ));
         let message = error.to_string();
         assert!(message.contains(index_path.to_string_lossy().as_ref()));
-        assert!(message.contains("supports up to version 4"));
+        assert!(message.contains(&format!(
+            "supports up to version {}",
+            CURRENT_SCHEMA_VERSION
+        )));
     }
 
     #[test]
@@ -6481,8 +7892,8 @@ mod tests {
                     extra TEXT
                 ) STRICT;
                 INSERT INTO hotpath_metadata (key, value)
-                VALUES ('schema_version', '3');
-                PRAGMA user_version = 3;",
+                VALUES ('schema_version', '5'), ('schema_identifier', 'hotpath.index.v5');
+                PRAGMA user_version = 5;",
             )
             .expect("malformed current metadata should be created");
         drop(connection);

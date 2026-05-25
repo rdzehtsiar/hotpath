@@ -1,19 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
-use std::num::NonZeroUsize;
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, Receiver, TrySendError};
-use git2::{Delta, Diff, DiffLineType, DiffOptions, ErrorClass, ErrorCode, Oid, Repository, Sort};
+use git2::{ErrorClass, ErrorCode, Repository};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -26,12 +25,14 @@ const RECENT_CHURN_WINDOW_SECONDS: i64 = RECENT_CHURN_WINDOW_DAYS * SECONDS_PER_
 const CO_CHANGED_FILE_COUNT_SATURATION: u64 = 25;
 const MAX_PAIRWISE_CO_CHANGE_PATHS: usize = 256;
 const GIT_CACHE_LOOKUP_BATCH_SIZE: usize = 1024;
-const GIT_DIFF_JOB_COMMIT_CHUNK_SIZE: usize = 64;
 const GIT_COMMIT_CACHE_WRITE_BATCH_SIZE: usize = 512;
-const GIT_DIFF_QUEUE_FACTOR: usize = 4;
-const GIT_RESULT_QUEUE_FACTOR: usize = 8;
-const MAX_DEFAULT_GIT_WORKERS: usize = 16;
 const GIT_PERF_ENV: &str = "HOTPATH_PERF";
+const GIT_STREAM_WORKERS_ENV: &str = "HOTPATH_GIT_WORKERS";
+const GIT_HISTORY_BACKEND: &str = "cli-stream";
+pub const GIT_HISTORY_CACHE_VERSION: &str = "hotpath.git-history-cli.v1";
+const GIT_STREAM_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+const GIT_STREAM_PERF_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(10);
+const GIT_RECORD_SEPARATOR: u8 = 0x1e;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// A raw repository-relative file change observed in one reachable commit.
@@ -126,158 +127,180 @@ pub struct GitHistoryProgress {
     pub total_commits: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GitPipelineOptions {
-    pub git_jobs: usize,
-    pub job_commit_chunk_size: usize,
-    pub diff_queue_capacity: usize,
-    pub result_queue_capacity: usize,
-}
-
 #[derive(Debug)]
-struct GitPerf {
+struct GitStreamPerf {
     enabled: bool,
     started_at: Instant,
+    last_progress_at: Instant,
+    last_snapshot_at: Instant,
     total_commits: usize,
-    git_jobs: usize,
-    job_commit_chunk_size: usize,
-    diff_queue_capacity: usize,
-    result_queue_capacity: usize,
-    revwalk_ms: u128,
+    cached_commits: u64,
+    missing_commits: u64,
+    stream_workers: u64,
+    completed_commits: u64,
     cache_batches: u64,
     cache_lookup_ms: u128,
     cache_hits: u64,
     cache_misses: u64,
-    jobs_sent: u64,
-    queue_full_count: u64,
-    enqueue_wait_ms: u128,
-    result_receive_wait_ms: u128,
-    result_batches: u64,
-    reducer_handle_ms: u128,
-    reducer_commits: u64,
-    reducer_changes: u64,
-    reducer_deltas: u64,
-    reducer_changed_lines: u64,
+    rev_list_ms: u128,
+    spawn_ms: u128,
+    stdin_write_ms: u128,
+    stdout_read_ms: u128,
+    stdout_bytes: u64,
+    parsed_commits: u64,
+    raw_records: u64,
+    numstat_records: u64,
+    parsed_changes: u64,
     cache_flushes: u64,
     final_sort_ms: u128,
     aggregation_ms: u128,
-    workers: Arc<Mutex<Vec<GitWorkerPerf>>>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct GitWorkerPerf {
-    worker_id: usize,
-    jobs: u64,
-    commits: u64,
-    changes: u64,
-    deltas: u64,
-    changed_lines: u64,
-    active_ms: u128,
-    send_wait_ms: u128,
-    errors: u64,
-}
-
-impl GitPerf {
-    fn new(enabled: bool, options: GitPipelineOptions) -> Self {
+impl GitStreamPerf {
+    fn new(enabled: bool) -> Self {
+        let now = Instant::now();
         Self {
             enabled,
-            started_at: Instant::now(),
+            started_at: now,
+            last_progress_at: now,
+            last_snapshot_at: now,
             total_commits: 0,
-            git_jobs: options.git_jobs,
-            job_commit_chunk_size: options.job_commit_chunk_size,
-            diff_queue_capacity: options.diff_queue_capacity,
-            result_queue_capacity: options.result_queue_capacity,
-            revwalk_ms: 0,
+            cached_commits: 0,
+            missing_commits: 0,
+            stream_workers: 0,
+            completed_commits: 0,
             cache_batches: 0,
             cache_lookup_ms: 0,
             cache_hits: 0,
             cache_misses: 0,
-            jobs_sent: 0,
-            queue_full_count: 0,
-            enqueue_wait_ms: 0,
-            result_receive_wait_ms: 0,
-            result_batches: 0,
-            reducer_handle_ms: 0,
-            reducer_commits: 0,
-            reducer_changes: 0,
-            reducer_deltas: 0,
-            reducer_changed_lines: 0,
+            rev_list_ms: 0,
+            spawn_ms: 0,
+            stdin_write_ms: 0,
+            stdout_read_ms: 0,
+            stdout_bytes: 0,
+            parsed_commits: 0,
+            raw_records: 0,
+            numstat_records: 0,
+            parsed_changes: 0,
             cache_flushes: 0,
             final_sort_ms: 0,
             aggregation_ms: 0,
-            workers: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     fn disabled() -> Self {
-        Self::new(false, GitPipelineOptions::default())
+        Self::new(false)
     }
 
-    fn emit_summary(&self) {
-        if !self.enabled {
-            return;
-        }
-
-        let workers = self
-            .workers
-            .lock()
-            .map(|workers| workers.clone())
-            .unwrap_or_default();
+    fn emit_started(&self) {
         operation_log::event(
-            "hotpath.git_perf_summary",
+            "hotpath.git_analysis_started",
             json!({
-                "elapsed_ms": elapsed_ms(self.started_at.elapsed()),
+                "backend": GIT_HISTORY_BACKEND,
                 "total_commits": self.total_commits,
-                "git_jobs": self.git_jobs,
-                "job_commit_chunk_size": self.job_commit_chunk_size,
-                "diff_queue_capacity": self.diff_queue_capacity,
-                "result_queue_capacity": self.result_queue_capacity,
-                "revwalk_ms": self.revwalk_ms,
-                "cache_batches": self.cache_batches,
-                "cache_lookup_ms": self.cache_lookup_ms,
-                "cache_hits": self.cache_hits,
-                "cache_misses": self.cache_misses,
-                "jobs_sent": self.jobs_sent,
-                "queue_full_count": self.queue_full_count,
-                "enqueue_wait_ms": self.enqueue_wait_ms,
-                "result_receive_wait_ms": self.result_receive_wait_ms,
-                "result_batches": self.result_batches,
-                "reducer_handle_ms": self.reducer_handle_ms,
-                "reducer_commits": self.reducer_commits,
-                "reducer_changes": self.reducer_changes,
-                "reducer_deltas": self.reducer_deltas,
-                "reducer_changed_lines": self.reducer_changed_lines,
-                "cache_flushes": self.cache_flushes,
-                "final_sort_ms": self.final_sort_ms,
-                "aggregation_ms": self.aggregation_ms,
-                "workers": workers.iter().map(|worker| {
-                    json!({
-                        "worker_id": worker.worker_id,
-                        "jobs": worker.jobs,
-                        "commits": worker.commits,
-                        "changes": worker.changes,
-                        "deltas": worker.deltas,
-                        "changed_lines": worker.changed_lines,
-                        "active_ms": worker.active_ms,
-                        "send_wait_ms": worker.send_wait_ms,
-                        "errors": worker.errors,
-                    })
-                }).collect::<Vec<_>>(),
+                "cached_commits": self.cached_commits,
+                "missing_commits": self.missing_commits,
+                "stream_workers": self.stream_workers,
+                "cache_key": GIT_HISTORY_CACHE_VERSION,
             }),
         );
     }
 
-    fn record_send_stats(&mut self, stats: SendDiffJobStats) {
-        self.jobs_sent += 1;
-        self.queue_full_count += stats.queue_full_count;
-        self.enqueue_wait_ms += stats.enqueue_wait_ms;
+    fn maybe_emit_progress(&mut self) {
+        if self.last_progress_at.elapsed() < GIT_STREAM_PROGRESS_INTERVAL {
+            return;
+        }
+        self.last_progress_at = Instant::now();
+        operation_log::event("hotpath.git_analysis_progress", self.progress_payload());
     }
-}
 
-#[derive(Debug, Clone, Copy, Default)]
-struct SendDiffJobStats {
-    queue_full_count: u64,
-    enqueue_wait_ms: u128,
+    fn maybe_emit_perf_snapshot(&mut self) {
+        if !self.enabled || self.last_snapshot_at.elapsed() < GIT_STREAM_PERF_SNAPSHOT_INTERVAL {
+            return;
+        }
+        self.last_snapshot_at = Instant::now();
+        operation_log::event("hotpath.git_stream_perf_snapshot", self.summary_payload());
+    }
+
+    fn emit_completed(&self, changes: usize, file_metrics: usize, co_changes: usize) {
+        operation_log::event(
+            "hotpath.git_analysis_completed",
+            json!({
+                "backend": GIT_HISTORY_BACKEND,
+                "elapsed_ms": elapsed_ms(self.started_at.elapsed()),
+                "commits_per_second": commits_per_second(self.completed_commits, self.started_at.elapsed()),
+                "completed_commits": self.completed_commits,
+                "total_commits": self.total_commits,
+                "changes": changes,
+                "file_metrics": file_metrics,
+                "co_changes": co_changes,
+                "cache_hits": self.cache_hits,
+                "cache_misses": self.cache_misses,
+            }),
+        );
+    }
+
+    fn emit_failed(&self, phase: &'static str, error: &str) {
+        operation_log::event(
+            "hotpath.git_analysis_failed",
+            json!({
+                "backend": GIT_HISTORY_BACKEND,
+                "phase": phase,
+                "elapsed_ms": elapsed_ms(self.started_at.elapsed()),
+                "completed_commits": self.completed_commits,
+                "total_commits": self.total_commits,
+                "error": error,
+            }),
+        );
+    }
+
+    fn emit_perf_summary(&self) {
+        if self.enabled {
+            operation_log::event("hotpath.git_stream_perf_summary", self.summary_payload());
+        }
+    }
+
+    fn progress_payload(&self) -> serde_json::Value {
+        json!({
+            "backend": GIT_HISTORY_BACKEND,
+            "elapsed_ms": elapsed_ms(self.started_at.elapsed()),
+            "completed_commits": self.completed_commits,
+            "total_commits": self.total_commits,
+            "commits_per_second": commits_per_second(self.completed_commits, self.started_at.elapsed()),
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "parsed_commits": self.parsed_commits,
+        })
+    }
+
+    fn summary_payload(&self) -> serde_json::Value {
+        json!({
+            "backend": GIT_HISTORY_BACKEND,
+            "elapsed_ms": elapsed_ms(self.started_at.elapsed()),
+            "total_commits": self.total_commits,
+            "cached_commits": self.cached_commits,
+            "missing_commits": self.missing_commits,
+            "stream_workers": self.stream_workers,
+            "completed_commits": self.completed_commits,
+            "commits_per_second": commits_per_second(self.completed_commits, self.started_at.elapsed()),
+            "rev_list_ms": self.rev_list_ms,
+            "cache_batches": self.cache_batches,
+            "cache_lookup_ms": self.cache_lookup_ms,
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "spawn_ms": self.spawn_ms,
+            "stdin_write_ms": self.stdin_write_ms,
+            "stdout_read_ms": self.stdout_read_ms,
+            "stdout_bytes": self.stdout_bytes,
+            "parsed_commits": self.parsed_commits,
+            "raw_records": self.raw_records,
+            "numstat_records": self.numstat_records,
+            "parsed_changes": self.parsed_changes,
+            "cache_flushes": self.cache_flushes,
+            "final_sort_ms": self.final_sort_ms,
+            "aggregation_ms": self.aggregation_ms,
+        })
+    }
 }
 
 struct GitCacheCallbacks<L, S> {
@@ -294,32 +317,28 @@ fn git_perf_enabled() -> bool {
     })
 }
 
+fn git_stream_worker_count() -> usize {
+    env::var(GIT_STREAM_WORKERS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|workers| *workers > 0)
+        .unwrap_or_else(|| {
+            thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+        })
+}
+
 fn elapsed_ms(duration: Duration) -> u128 {
     duration.as_millis()
 }
 
-impl Default for GitPipelineOptions {
-    fn default() -> Self {
-        let parallelism = thread::available_parallelism()
-            .map(NonZeroUsize::get)
-            .unwrap_or(1);
-        let git_jobs = env::var("HOTPATH_GIT_JOBS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or_else(|| parallelism.clamp(1, MAX_DEFAULT_GIT_WORKERS));
-        let job_commit_chunk_size = env::var("HOTPATH_GIT_CHUNK_SIZE")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(GIT_DIFF_JOB_COMMIT_CHUNK_SIZE);
-
-        Self {
-            git_jobs,
-            job_commit_chunk_size,
-            diff_queue_capacity: git_jobs.saturating_mul(GIT_DIFF_QUEUE_FACTOR).max(1),
-            result_queue_capacity: git_jobs.saturating_mul(GIT_RESULT_QUEUE_FACTOR).max(1),
-        }
+fn commits_per_second(completed_commits: u64, duration: Duration) -> u64 {
+    let elapsed = duration.as_secs_f64();
+    if elapsed <= 0.0 {
+        0
+    } else {
+        (completed_commits as f64 / elapsed).round() as u64
     }
 }
 
@@ -372,6 +391,19 @@ pub enum GitHistoryError {
         context: &'static str,
         source: git2::Error,
     },
+    GitCommandSpawn {
+        context: &'static str,
+        source: io::Error,
+    },
+    GitCommandFailed {
+        context: &'static str,
+        status: Option<i32>,
+        stderr: String,
+    },
+    MalformedGitStream {
+        context: &'static str,
+        detail: String,
+    },
     UnsupportedAuthorIdentity {
         commit_id: String,
     },
@@ -407,9 +439,12 @@ impl StdError for GitHistoryError {
             | Self::OpenRepository { source, .. }
             | Self::HeadNotCommit { source, .. }
             | Self::Git { source, .. } => Some(source),
+            Self::GitCommandSpawn { source, .. } => Some(source),
             Self::MissingHead { .. }
             | Self::ShallowRepository { .. }
             | Self::BareRepository { .. }
+            | Self::GitCommandFailed { .. }
+            | Self::MalformedGitStream { .. }
             | Self::UnsupportedAuthorIdentity { .. }
             | Self::UnsupportedPathEncoding { .. }
             | Self::WorkerFailed { .. } => None,
@@ -461,6 +496,25 @@ pub(crate) fn write_git_history_error(
         }
         GitHistoryError::Git { context, source } => {
             write!(f, "failed to traverse Git history while {context}: {source}")
+        }
+        GitHistoryError::GitCommandSpawn { context, source } => write!(
+            f,
+            "failed to run Git while {context}: {source}; ensure the git executable is available on PATH"
+        ),
+        GitHistoryError::GitCommandFailed {
+            context,
+            status,
+            stderr,
+        } => write!(
+            f,
+            "Git command failed while {context} with status {}: {}",
+            status
+                .map(|status| status.to_string())
+                .unwrap_or_else(|| "unknown".to_owned()),
+            stderr
+        ),
+        GitHistoryError::MalformedGitStream { context, detail } => {
+            write!(f, "failed to parse Git history while {context}: {detail}")
         }
         GitHistoryError::UnsupportedAuthorIdentity { commit_id } => write!(
             f,
@@ -561,7 +615,7 @@ pub fn file_changes_from_head(
     reject_shallow_repository(&repository, worktree_path)?;
     let head_commit = head_commit(&repository, worktree_path)?;
 
-    file_changes_from_repository(&repository, head_commit.id())
+    file_changes_from_repository(&repository, &head_commit.id().to_string())
 }
 
 /// Return the canonical Git worktree root discovered from a path inside a
@@ -655,18 +709,15 @@ where
             path: worktree_path.to_path_buf(),
         })?
         .to_path_buf();
-    let options = GitPipelineOptions::default();
-    let mut perf = GitPerf::new(git_perf_enabled(), options);
+    let mut perf = GitStreamPerf::new(git_perf_enabled());
     let changes = file_changes_from_repository_with_progress_and_cache(
-        &repository,
         &worktree_root,
-        head_commit_id,
+        &head_commit_id.to_string(),
         progress,
         GitCacheCallbacks {
             load: load_cached_commits,
             store: store_commits,
         },
-        options,
         &mut perf,
     )?;
     let aggregation_started = Instant::now();
@@ -675,7 +726,8 @@ where
         file_metrics_from_changes_with_ownership(&changes, head_commit_time, &ownership);
     let co_changes = co_changes_from_changes(&changes);
     perf.aggregation_ms = elapsed_ms(aggregation_started.elapsed());
-    perf.emit_summary();
+    perf.emit_completed(changes.len(), file_metrics.len(), co_changes.len());
+    perf.emit_perf_summary();
 
     Ok(GitAnalysis {
         worktree_root,
@@ -691,14 +743,14 @@ where
 
 fn file_changes_from_repository(
     repository: &Repository,
-    head_commit_id: Oid,
+    head_commit_id: &str,
 ) -> Result<Vec<GitFileChange>, GitHistoryError> {
     file_changes_from_repository_with_progress(repository, head_commit_id, |_| {})
 }
 
 fn file_changes_from_repository_with_progress<F>(
     repository: &Repository,
-    head_commit_id: Oid,
+    head_commit_id: &str,
     progress: F,
 ) -> Result<Vec<GitFileChange>, GitHistoryError>
 where
@@ -710,9 +762,8 @@ where
             path: PathBuf::from("."),
         })?
         .to_path_buf();
-    let mut perf = GitPerf::disabled();
+    let mut perf = GitStreamPerf::disabled();
     file_changes_from_repository_with_progress_and_cache(
-        repository,
         &worktree_root,
         head_commit_id,
         progress,
@@ -720,7 +771,6 @@ where
             load: no_cached_commits,
             store: ignore_cached_commits,
         },
-        GitPipelineOptions::default(),
         &mut perf,
     )
 }
@@ -732,167 +782,91 @@ fn no_cached_commits(_: &[String]) -> BTreeMap<String, Vec<GitFileChange>> {
 fn ignore_cached_commits(_: &[(String, Vec<GitFileChange>)]) {}
 
 fn file_changes_from_repository_with_progress_and_cache<F, L, S>(
-    repository: &Repository,
     worktree_root: &Path,
-    head_commit_id: Oid,
+    head_commit_id: &str,
     mut progress: F,
     mut cache: GitCacheCallbacks<L, S>,
-    options: GitPipelineOptions,
-    perf: &mut GitPerf,
+    perf: &mut GitStreamPerf,
 ) -> Result<Vec<GitFileChange>, GitHistoryError>
 where
     F: FnMut(GitHistoryProgress),
     L: FnMut(&[String]) -> BTreeMap<String, Vec<GitFileChange>>,
     S: FnMut(&[(String, Vec<GitFileChange>)]),
 {
-    let revwalk_started = Instant::now();
-    let commits = reachable_commits(repository, head_commit_id)?;
-    perf.revwalk_ms = elapsed_ms(revwalk_started.elapsed());
+    let rev_list_started = Instant::now();
+    let commits = reachable_commit_ids(worktree_root, head_commit_id)?;
+    perf.rev_list_ms = elapsed_ms(rev_list_started.elapsed());
     let mut changes = Vec::new();
     let total_commits = commits.len();
     perf.total_commits = total_commits;
-    perf.git_jobs = options.git_jobs;
-    perf.job_commit_chunk_size = options.job_commit_chunk_size;
-    perf.diff_queue_capacity = options.diff_queue_capacity;
-    perf.result_queue_capacity = options.result_queue_capacity;
     if total_commits == 0 {
-        perf.emit_summary();
+        perf.emit_started();
         return Ok(changes);
     }
-    let git_jobs = options.git_jobs.clamp(1, total_commits.max(1));
-    let job_commit_chunk_size = options.job_commit_chunk_size.max(1);
-    let (job_sender, job_receiver) = bounded::<DiffJob>(options.diff_queue_capacity.max(git_jobs));
-    let (result_sender, result_receiver) =
-        bounded::<DiffWorkerResult>(options.result_queue_capacity.max(git_jobs));
-    let mut workers = Vec::with_capacity(git_jobs);
-    for worker_id in 0..git_jobs {
-        let worktree_root = worktree_root.to_path_buf();
-        let job_receiver = job_receiver.clone();
-        let result_sender = result_sender.clone();
-        let worker_perf = perf.workers.clone();
-        let enabled = perf.enabled;
-        workers.push(thread::spawn(move || {
-            diff_worker(
-                worker_id,
-                &worktree_root,
-                job_receiver,
-                result_sender,
-                worker_perf,
-                enabled,
-            );
-        }));
-    }
-    drop(result_sender);
 
     let mut completed_commits = 0usize;
     let mut fresh_cache_writes = Vec::<(String, Vec<GitFileChange>)>::new();
-    let mut diff_batch = Vec::<Oid>::with_capacity(job_commit_chunk_size);
+    let mut missing_commits = Vec::<String>::new();
 
     for commit_batch in commits.chunks(GIT_CACHE_LOOKUP_BATCH_SIZE) {
-        let commit_ids = commit_batch
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
+        let commit_ids = commit_batch.to_vec();
         let cache_lookup_started = Instant::now();
         let mut cached_changes = (cache.load)(&commit_ids);
         perf.cache_batches += 1;
         perf.cache_lookup_ms += elapsed_ms(cache_lookup_started.elapsed());
         for commit_id in commit_batch {
-            let commit_id_string = commit_id.to_string();
-            if let Some(cached) = cached_changes.remove(&commit_id_string) {
+            if let Some(cached) = cached_changes.remove(commit_id) {
                 perf.cache_hits += 1;
+                perf.cached_commits += 1;
                 changes.extend(cached);
                 completed_commits += 1;
+                perf.completed_commits = completed_commits as u64;
                 progress(GitHistoryProgress {
                     completed_commits,
                     total_commits,
                 });
+                perf.maybe_emit_progress();
             } else {
                 perf.cache_misses += 1;
-                diff_batch.push(*commit_id);
-                if diff_batch.len() < job_commit_chunk_size {
-                    continue;
-                }
-                send_diff_job(
-                    std::mem::take(&mut diff_batch),
-                    &job_sender,
-                    &result_receiver,
-                    &mut |result| {
-                        DiffReducer {
-                            changes: &mut changes,
-                            fresh_cache_writes: &mut fresh_cache_writes,
-                            store_commits: &mut cache.store,
-                            completed_commits: &mut completed_commits,
-                            total_commits,
-                            progress: &mut progress,
-                            perf,
-                        }
-                        .handle(result)
-                    },
-                )
-                .map(|stats| perf.record_send_stats(stats))?;
+                missing_commits.push(commit_id.clone());
             }
         }
-        if !diff_batch.is_empty() {
-            send_diff_job(
-                std::mem::take(&mut diff_batch),
-                &job_sender,
-                &result_receiver,
-                &mut |result| {
-                    DiffReducer {
-                        changes: &mut changes,
-                        fresh_cache_writes: &mut fresh_cache_writes,
-                        store_commits: &mut cache.store,
-                        completed_commits: &mut completed_commits,
-                        total_commits,
-                        progress: &mut progress,
-                        perf,
-                    }
-                    .handle(result)
-                },
-            )
-            .map(|stats| perf.record_send_stats(stats))?;
-        }
     }
-    drop(job_sender);
+    perf.missing_commits = missing_commits.len() as u64;
+    perf.emit_started();
 
-    while completed_commits < total_commits {
-        let receive_started = Instant::now();
-        let result = result_receiver
-            .recv()
-            .map_err(|_| GitHistoryError::WorkerFailed {
-                context: "receiving Git diff worker result",
-            })?;
-        perf.result_receive_wait_ms += elapsed_ms(receive_started.elapsed());
-        DiffReducer {
-            changes: &mut changes,
-            fresh_cache_writes: &mut fresh_cache_writes,
-            store_commits: &mut cache.store,
-            completed_commits: &mut completed_commits,
-            total_commits,
-            progress: &mut progress,
+    if !missing_commits.is_empty() {
+        stream_missing_commits(
+            worktree_root,
+            &missing_commits,
+            |commit_id, commit_changes, perf| {
+                changes.extend(commit_changes.iter().cloned());
+                fresh_cache_writes.push((commit_id.to_owned(), commit_changes.to_vec()));
+                if fresh_cache_writes.len() >= GIT_COMMIT_CACHE_WRITE_BATCH_SIZE {
+                    (cache.store)(&fresh_cache_writes);
+                    perf.cache_flushes += 1;
+                    fresh_cache_writes.clear();
+                }
+                completed_commits += 1;
+                perf.completed_commits = completed_commits as u64;
+                progress(GitHistoryProgress {
+                    completed_commits,
+                    total_commits,
+                });
+                perf.maybe_emit_progress();
+            },
             perf,
-        }
-        .handle(result)?;
+        )
+        .inspect_err(|error| {
+            perf.emit_failed("streaming missing commits", &error.to_string());
+        })?;
     }
 
-    if completed_commits != total_commits {
-        return Err(GitHistoryError::WorkerFailed {
-            context: "collecting Git diff worker results",
-        });
-    }
     if !fresh_cache_writes.is_empty() {
         (cache.store)(&fresh_cache_writes);
         perf.cache_flushes += 1;
     }
     fresh_cache_writes.clear();
-    for worker in workers {
-        if worker.join().is_err() {
-            return Err(GitHistoryError::WorkerFailed {
-                context: "joining Git diff worker",
-            });
-        }
-    }
 
     let sort_started = Instant::now();
     changes.sort_by(|left, right| {
@@ -918,245 +892,335 @@ where
     Ok(changes)
 }
 
-type DiffJob = Vec<Oid>;
-type DiffWorkerResult = Result<DiffBatch, GitHistoryError>;
-
-#[derive(Debug)]
-struct DiffBatch {
-    commits: Vec<(String, Vec<GitFileChange>)>,
-    change_count: u64,
-    delta_count: u64,
-    changed_lines: u64,
-}
-
-#[derive(Debug)]
-struct DiffCommitOutput {
-    commit_id: String,
-    changes: Vec<GitFileChange>,
-    delta_count: u64,
-    changed_lines: u64,
-}
-
-fn send_diff_job<F>(
-    job: DiffJob,
-    sender: &crossbeam_channel::Sender<DiffJob>,
-    result_receiver: &Receiver<DiffWorkerResult>,
-    handle_result: &mut F,
-) -> Result<SendDiffJobStats, GitHistoryError>
-where
-    F: FnMut(DiffWorkerResult) -> Result<(), GitHistoryError>,
-{
-    let started = Instant::now();
-    let mut stats = SendDiffJobStats::default();
-    let mut pending = job;
-    loop {
-        match sender.try_send(pending) {
-            Ok(()) => {
-                stats.enqueue_wait_ms = elapsed_ms(started.elapsed());
-                return Ok(stats);
-            }
-            Err(TrySendError::Full(job)) => {
-                stats.queue_full_count += 1;
-                pending = job;
-                let result = result_receiver
-                    .recv()
-                    .map_err(|_| GitHistoryError::WorkerFailed {
-                        context: "receiving Git diff worker result",
-                    })?;
-                handle_result(result)?;
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                return Err(GitHistoryError::WorkerFailed {
-                    context: "sending Git diff worker job",
-                });
-            }
-        }
-    }
-}
-
-struct DiffReducer<'a, F, S> {
-    changes: &'a mut Vec<GitFileChange>,
-    fresh_cache_writes: &'a mut Vec<(String, Vec<GitFileChange>)>,
-    store_commits: &'a mut S,
-    completed_commits: &'a mut usize,
-    total_commits: usize,
-    progress: &'a mut F,
-    perf: &'a mut GitPerf,
-}
-
-impl<F, S> DiffReducer<'_, F, S>
-where
-    F: FnMut(GitHistoryProgress),
-    S: FnMut(&[(String, Vec<GitFileChange>)]),
-{
-    fn handle(self, result: DiffWorkerResult) -> Result<(), GitHistoryError> {
-        let started = Instant::now();
-        let batch = result?;
-        self.perf.result_batches += 1;
-        self.perf.reducer_commits += batch.commits.len() as u64;
-        self.perf.reducer_changes += batch.change_count;
-        self.perf.reducer_deltas += batch.delta_count;
-        self.perf.reducer_changed_lines += batch.changed_lines;
-        for (commit_id, commit_changes) in batch.commits {
-            self.changes.extend(commit_changes.clone());
-            self.fresh_cache_writes.push((commit_id, commit_changes));
-            if self.fresh_cache_writes.len() >= GIT_COMMIT_CACHE_WRITE_BATCH_SIZE {
-                (self.store_commits)(self.fresh_cache_writes);
-                self.perf.cache_flushes += 1;
-                self.fresh_cache_writes.clear();
-            }
-            *self.completed_commits += 1;
-            (self.progress)(GitHistoryProgress {
-                completed_commits: *self.completed_commits,
-                total_commits: self.total_commits,
-            });
-        }
-        self.perf.reducer_handle_ms += elapsed_ms(started.elapsed());
-        Ok(())
-    }
-}
-
-fn diff_worker(
-    worker_id: usize,
+fn stream_missing_commits<F>(
     worktree_root: &Path,
-    receiver: Receiver<DiffJob>,
-    sender: crossbeam_channel::Sender<DiffWorkerResult>,
-    worker_perf: Arc<Mutex<Vec<GitWorkerPerf>>>,
-    perf_enabled: bool,
-) {
-    let mut local_perf = GitWorkerPerf {
-        worker_id,
-        ..GitWorkerPerf::default()
-    };
-    let repository = match open_repository(worktree_root) {
-        Ok(repository) => repository,
-        Err(error) => {
-            local_perf.errors += 1;
-            record_worker_perf(perf_enabled, worker_perf, local_perf);
-            let _ = sender.send(Err(error));
-            return;
-        }
-    };
+    missing_commits: &[String],
+    mut handle_commit: F,
+    perf: &mut GitStreamPerf,
+) -> Result<(), GitHistoryError>
+where
+    F: FnMut(&str, &[GitFileChange], &mut GitStreamPerf),
+{
+    let worker_count = git_stream_worker_count().min(missing_commits.len()).max(1);
+    perf.stream_workers = worker_count as u64;
+    if worker_count == 1 {
+        return stream_missing_commits_worker(worktree_root, missing_commits, handle_commit, perf);
+    }
 
-    for job in receiver {
-        let active_started = Instant::now();
-        let mut commits = Vec::with_capacity(job.len());
-        let mut change_count = 0u64;
-        let mut delta_count = 0u64;
-        let mut changed_lines = 0u64;
-        for commit_id in job {
-            match diff_commit_file_changes(&repository, commit_id) {
-                Ok(output) => {
-                    change_count += output.changes.len() as u64;
-                    delta_count += output.delta_count;
-                    changed_lines += output.changed_lines;
-                    commits.push((output.commit_id, output.changes));
+    let (sender, receiver) = mpsc::channel::<GitStreamWorkerMessage>();
+    let chunks = split_commit_ids_for_workers(missing_commits, worker_count);
+    let mut workers = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let worker_root = worktree_root.to_path_buf();
+        let worker_sender = sender.clone();
+        workers.push(thread::spawn(move || {
+            let mut worker_perf = GitStreamPerf::disabled();
+            let result = stream_missing_commits_worker(
+                &worker_root,
+                &chunk,
+                |commit_id, changes, _| {
+                    let _ = worker_sender.send(GitStreamWorkerMessage::Commit(StreamedGitCommit {
+                        commit_id: commit_id.to_owned(),
+                        changes: changes.to_vec(),
+                    }));
+                },
+                &mut worker_perf,
+            );
+            match result {
+                Ok(()) => {
+                    let _ = worker_sender.send(GitStreamWorkerMessage::Perf(
+                        GitStreamWorkerPerf::from(&worker_perf),
+                    ));
                 }
                 Err(error) => {
-                    local_perf.errors += 1;
-                    record_worker_perf(perf_enabled, worker_perf, local_perf);
-                    let _ = sender.send(Err(error));
-                    return;
+                    let _ = worker_sender.send(GitStreamWorkerMessage::Error(error));
+                }
+            }
+        }));
+    }
+    drop(sender);
+
+    let mut first_error = None;
+    for message in receiver {
+        match message {
+            GitStreamWorkerMessage::Commit(commit) => {
+                handle_commit(&commit.commit_id, &commit.changes, perf);
+                perf.maybe_emit_perf_snapshot();
+            }
+            GitStreamWorkerMessage::Perf(worker_perf) => {
+                worker_perf.add_to(perf);
+            }
+            GitStreamWorkerMessage::Error(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
                 }
             }
         }
-        local_perf.active_ms += elapsed_ms(active_started.elapsed());
-        local_perf.jobs += 1;
-        local_perf.commits += commits.len() as u64;
-        local_perf.changes += change_count;
-        local_perf.deltas += delta_count;
-        local_perf.changed_lines += changed_lines;
-
-        let send_started = Instant::now();
-        if sender
-            .send(Ok(DiffBatch {
-                commits,
-                change_count,
-                delta_count,
-                changed_lines,
-            }))
-            .is_err()
-        {
-            local_perf.send_wait_ms += elapsed_ms(send_started.elapsed());
-            record_worker_perf(perf_enabled, worker_perf, local_perf);
-            return;
-        }
-        local_perf.send_wait_ms += elapsed_ms(send_started.elapsed());
     }
-    record_worker_perf(perf_enabled, worker_perf, local_perf);
-}
 
-fn record_worker_perf(
-    enabled: bool,
-    worker_perf: Arc<Mutex<Vec<GitWorkerPerf>>>,
-    local_perf: GitWorkerPerf,
-) {
-    if enabled {
-        if let Ok(mut workers) = worker_perf.lock() {
-            workers.push(local_perf);
+    let mut worker_failed = false;
+    for worker in workers {
+        if worker.join().is_err() {
+            worker_failed = true;
         }
     }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    if worker_failed {
+        return Err(GitHistoryError::WorkerFailed {
+            context: "streaming Git history",
+        });
+    }
+
+    Ok(())
 }
 
-fn diff_commit_file_changes(
-    repository: &Repository,
-    commit_id: Oid,
-) -> Result<DiffCommitOutput, GitHistoryError> {
-    let commit = repository
-        .find_commit(commit_id)
-        .map_err(|source| GitHistoryError::Git {
-            context: "loading a reachable commit",
+fn stream_missing_commits_worker<F>(
+    worktree_root: &Path,
+    missing_commits: &[String],
+    mut handle_commit: F,
+    perf: &mut GitStreamPerf,
+) -> Result<(), GitHistoryError>
+where
+    F: FnMut(&str, &[GitFileChange], &mut GitStreamPerf),
+{
+    let spawn_started = Instant::now();
+    let mut child = Command::new("git")
+        .args([
+            "show",
+            "--stdin",
+            "--raw",
+            "--numstat",
+            "-z",
+            "--no-renames",
+            "--diff-merges=first-parent",
+            "--no-ext-diff",
+            "--no-color",
+            "--format=%x1e%H%x00%ct%x00%an%x00%ae%x00%P%x00",
+        ])
+        .current_dir(worktree_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("LC_ALL", "C")
+        .spawn()
+        .map_err(|source| GitHistoryError::GitCommandSpawn {
+            context: "starting Git history stream",
             source,
         })?;
-    let commit_id_string = commit.id().to_string();
-    let parent_count = commit.parent_count();
-    let author = author_identity(&commit_id_string, commit.author())?;
-    let commit_time = commit.time().seconds();
-    let tree = commit.tree().map_err(|source| GitHistoryError::Git {
-        context: "loading a commit tree",
-        source,
-    })?;
-    let parent_tree = if parent_count == 0 {
-        None
-    } else {
-        Some(
-            commit
-                .parent(0)
-                .and_then(|parent| parent.tree())
-                .map_err(|source| GitHistoryError::Git {
-                    context: "loading the first parent tree",
+    perf.spawn_ms = elapsed_ms(spawn_started.elapsed());
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .expect("piped stdin should be available for git show");
+    let ids = missing_commits.to_vec();
+    let stdin_writer = thread::spawn(move || -> io::Result<u128> {
+        let started = Instant::now();
+        for commit_id in ids {
+            stdin.write_all(commit_id.as_bytes())?;
+            stdin.write_all(b"\n")?;
+        }
+        Ok(elapsed_ms(started.elapsed()))
+    });
+
+    let mut stderr = child
+        .stderr
+        .take()
+        .expect("piped stderr should be available for git show");
+    let stderr_reader = thread::spawn(move || {
+        let mut stderr_bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut stderr_bytes);
+        String::from_utf8_lossy(&stderr_bytes).trim().to_owned()
+    });
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .expect("piped stdout should be available for git show");
+    let read_started = Instant::now();
+    let mut buffer = Vec::<u8>::new();
+    let mut read_buffer = [0u8; 64 * 1024];
+    loop {
+        let read =
+            stdout
+                .read(&mut read_buffer)
+                .map_err(|source| GitHistoryError::GitCommandSpawn {
+                    context: "reading Git history stream",
                     source,
-                })?,
-        )
-    };
-    let mut diff_options = DiffOptions::new();
-    diff_options.context_lines(0).interhunk_lines(0);
-    let diff = repository
-        .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut diff_options))
-        .map_err(|source| GitHistoryError::Git {
-            context: "diffing commit trees",
+                })?;
+        if read == 0 {
+            break;
+        }
+        perf.stdout_bytes += read as u64;
+        buffer.extend_from_slice(&read_buffer[..read]);
+        drain_complete_git_records(&mut buffer, &mut handle_commit, perf)?;
+        perf.maybe_emit_perf_snapshot();
+    }
+    perf.stdout_read_ms = elapsed_ms(read_started.elapsed());
+    drain_final_git_record(&mut buffer, &mut handle_commit, perf)?;
+
+    perf.stdin_write_ms = stdin_writer.join().ok().and_then(Result::ok).unwrap_or(0);
+    let stderr = stderr_reader.join().unwrap_or_default();
+    let status = child
+        .wait()
+        .map_err(|source| GitHistoryError::GitCommandSpawn {
+            context: "waiting for Git history stream",
             source,
         })?;
-    let changes = diff_file_changes(
-        &diff,
-        commit_id_string.clone(),
-        parent_count,
-        author,
-        commit_time,
-    )?;
+    if !status.success() {
+        return Err(GitHistoryError::GitCommandFailed {
+            context: "streaming Git history",
+            status: status.code(),
+            stderr,
+        });
+    }
 
-    let delta_count = changes.len() as u64;
-    let changed_lines = changes
-        .iter()
-        .map(|change| change.added_lines.saturating_add(change.deleted_lines))
-        .sum();
+    Ok(())
+}
 
-    Ok(DiffCommitOutput {
-        commit_id: commit_id_string,
-        changes,
-        delta_count,
-        changed_lines,
-    })
+#[derive(Debug)]
+struct StreamedGitCommit {
+    commit_id: String,
+    changes: Vec<GitFileChange>,
+}
+
+#[derive(Debug)]
+enum GitStreamWorkerMessage {
+    Commit(StreamedGitCommit),
+    Perf(GitStreamWorkerPerf),
+    Error(GitHistoryError),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct GitStreamWorkerPerf {
+    spawn_ms: u128,
+    stdin_write_ms: u128,
+    stdout_read_ms: u128,
+    stdout_bytes: u64,
+    parsed_commits: u64,
+    raw_records: u64,
+    numstat_records: u64,
+    parsed_changes: u64,
+}
+
+impl GitStreamWorkerPerf {
+    fn from(perf: &GitStreamPerf) -> Self {
+        Self {
+            spawn_ms: perf.spawn_ms,
+            stdin_write_ms: perf.stdin_write_ms,
+            stdout_read_ms: perf.stdout_read_ms,
+            stdout_bytes: perf.stdout_bytes,
+            parsed_commits: perf.parsed_commits,
+            raw_records: perf.raw_records,
+            numstat_records: perf.numstat_records,
+            parsed_changes: perf.parsed_changes,
+        }
+    }
+
+    fn add_to(self, perf: &mut GitStreamPerf) {
+        perf.spawn_ms += self.spawn_ms;
+        perf.stdin_write_ms += self.stdin_write_ms;
+        perf.stdout_read_ms += self.stdout_read_ms;
+        perf.stdout_bytes += self.stdout_bytes;
+        perf.parsed_commits += self.parsed_commits;
+        perf.raw_records += self.raw_records;
+        perf.numstat_records += self.numstat_records;
+        perf.parsed_changes += self.parsed_changes;
+    }
+}
+
+fn split_commit_ids_for_workers(commit_ids: &[String], worker_count: usize) -> Vec<Vec<String>> {
+    let worker_count = worker_count.min(commit_ids.len()).max(1);
+    let base = commit_ids.len() / worker_count;
+    let extra = commit_ids.len() % worker_count;
+    let mut chunks = Vec::with_capacity(worker_count);
+    let mut start = 0usize;
+    for worker_index in 0..worker_count {
+        let len = base + usize::from(worker_index < extra);
+        let end = start + len;
+        chunks.push(commit_ids[start..end].to_vec());
+        start = end;
+    }
+    chunks
+}
+
+fn drain_complete_git_records<F>(
+    buffer: &mut Vec<u8>,
+    handle_commit: &mut F,
+    perf: &mut GitStreamPerf,
+) -> Result<(), GitHistoryError>
+where
+    F: FnMut(&str, &[GitFileChange], &mut GitStreamPerf),
+{
+    discard_before_record_separator(buffer);
+    while buffer.first() == Some(&GIT_RECORD_SEPARATOR) {
+        let Some(next_separator) = buffer
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find_map(|(index, byte)| (*byte == GIT_RECORD_SEPARATOR).then_some(index))
+        else {
+            break;
+        };
+        let record = buffer[..next_separator].to_vec();
+        buffer.drain(..next_separator);
+        handle_git_record(&record, handle_commit, perf)?;
+    }
+    Ok(())
+}
+
+fn drain_final_git_record<F>(
+    buffer: &mut Vec<u8>,
+    handle_commit: &mut F,
+    perf: &mut GitStreamPerf,
+) -> Result<(), GitHistoryError>
+where
+    F: FnMut(&str, &[GitFileChange], &mut GitStreamPerf),
+{
+    discard_before_record_separator(buffer);
+    if buffer.first() == Some(&GIT_RECORD_SEPARATOR) && buffer.len() > 1 {
+        let record = std::mem::take(buffer);
+        handle_git_record(&record, handle_commit, perf)?;
+    }
+    Ok(())
+}
+
+fn discard_before_record_separator(buffer: &mut Vec<u8>) {
+    if buffer.first() == Some(&GIT_RECORD_SEPARATOR) {
+        return;
+    }
+    if let Some(separator) = buffer.iter().position(|byte| *byte == GIT_RECORD_SEPARATOR) {
+        buffer.drain(..separator);
+    } else {
+        buffer.clear();
+    }
+}
+
+fn handle_git_record<F>(
+    record: &[u8],
+    handle_commit: &mut F,
+    perf: &mut GitStreamPerf,
+) -> Result<(), GitHistoryError>
+where
+    F: FnMut(&str, &[GitFileChange], &mut GitStreamPerf),
+{
+    let parsed = parse_git_stream_record(record)?;
+    perf.parsed_commits += 1;
+    perf.raw_records += parsed.raw_records;
+    perf.numstat_records += parsed.numstat_records;
+    perf.parsed_changes += parsed.changes.len() as u64;
+    handle_commit(&parsed.commit_id, &parsed.changes, perf);
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ParsedGitRecord {
+    commit_id: String,
+    changes: Vec<GitFileChange>,
+    raw_records: u64,
+    numstat_records: u64,
 }
 
 /// Explain local Git history metrics and co-changes for one requested file.
@@ -1441,130 +1505,124 @@ fn head_commit<'repo>(
         })
 }
 
-fn reachable_commits(repository: &Repository, head: Oid) -> Result<Vec<Oid>, GitHistoryError> {
-    let mut revwalk = repository
-        .revwalk()
-        .map_err(|source| GitHistoryError::Git {
-            context: "creating the revision walk",
+fn reachable_commit_ids(worktree_root: &Path, head: &str) -> Result<Vec<String>, GitHistoryError> {
+    let output = Command::new("git")
+        .args(["rev-list", "--date-order", head])
+        .current_dir(worktree_root)
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(|source| GitHistoryError::GitCommandSpawn {
+            context: "listing reachable commits",
             source,
         })?;
-    revwalk
-        .set_sorting(Sort::TIME)
-        .map_err(|source| GitHistoryError::Git {
-            context: "configuring the revision walk",
-            source,
-        })?;
-    revwalk.push(head).map_err(|source| GitHistoryError::Git {
-        context: "starting the revision walk at HEAD",
-        source,
-    })?;
 
-    revwalk
-        .map(|commit| {
-            commit.map_err(|source| GitHistoryError::Git {
-                context: "walking commits reachable from HEAD",
-                source,
-            })
+    if !output.status.success() {
+        return Err(GitHistoryError::GitCommandFailed {
+            context: "listing reachable commits",
+            status: output.status.code(),
+            stderr: sanitize_git_stderr(&output.stderr),
+        });
+    }
+
+    String::from_utf8(output.stdout)
+        .map_err(|source| GitHistoryError::MalformedGitStream {
+            context: "listing reachable commits",
+            detail: format!("rev-list output is not UTF-8: {source}"),
         })
-        .collect::<Result<Vec<_>, _>>()
+        .map(|stdout| {
+            stdout
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
 }
 
-fn diff_file_changes(
-    diff: &Diff<'_>,
-    commit_id: String,
-    parent_count: usize,
-    author: String,
-    commit_time: i64,
-) -> Result<Vec<GitFileChange>, GitHistoryError> {
-    #[derive(Debug)]
-    struct PendingChange {
-        path: String,
-        change_kind: GitChangeKind,
-        added_lines: u64,
-        deleted_lines: u64,
+fn parse_git_stream_record(record: &[u8]) -> Result<ParsedGitRecord, GitHistoryError> {
+    let record = record
+        .strip_prefix(&[GIT_RECORD_SEPARATOR])
+        .ok_or_else(|| malformed_stream("commit record", "missing record separator"))?;
+    let mut fields = record.split(|byte| *byte == 0);
+    let commit_id = utf8_field(fields.next(), "commit id", "")?;
+    let commit_time = parse_i64_field(fields.next(), "commit time", &commit_id)?;
+    let author_name = utf8_field(fields.next(), "author name", &commit_id)?;
+    let author_email = utf8_field(fields.next(), "author email", &commit_id)?;
+    let parents = utf8_field(fields.next(), "parent ids", &commit_id)?;
+    let terminator = fields
+        .next()
+        .ok_or_else(|| malformed_stream("commit header", "missing header terminator"))?;
+    if !terminator.is_empty() {
+        return Err(malformed_stream(
+            "commit header",
+            "header terminator was not empty",
+        ));
     }
 
-    let pending_changes = RefCell::new(Vec::<PendingChange>::new());
-    let current_change_index = Cell::new(None::<usize>);
-    let callback_error = RefCell::new(None::<GitHistoryError>);
-
-    let mut file_cb = |delta: git2::DiffDelta<'_>, _progress: f32| {
-        let Some(change_kind) = change_kind(delta.status()) else {
-            current_change_index.set(None);
-            return true;
-        };
-        let path = match delta_path(&commit_id, delta) {
-            Ok(path) => path,
-            Err(error) => {
-                *callback_error.borrow_mut() = Some(error);
-                return false;
+    let parent_count = parents.split_whitespace().count();
+    let author = format!("{author_name} <{author_email}>");
+    let mut kinds_by_path = BTreeMap::<String, GitChangeKind>::new();
+    let mut numstats = Vec::<(String, u64, u64)>::new();
+    let mut raw_records = 0u64;
+    let mut numstat_records = 0u64;
+    let tokens = fields.collect::<Vec<_>>();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        let token = trim_record_token(tokens[index]);
+        index += 1;
+        if token.is_empty() {
+            continue;
+        }
+        if token.starts_with(b":") {
+            raw_records += 1;
+            let Some(change_kind) = raw_change_kind(token) else {
+                continue;
+            };
+            let path_token = tokens
+                .get(index)
+                .copied()
+                .ok_or_else(|| malformed_stream("raw record", "missing raw path"))?;
+            index += 1;
+            let mut path = utf8_bytes(path_token, "raw path", &commit_id)?;
+            if matches!(change_kind, GitChangeKind::Renamed | GitChangeKind::Copied) {
+                if let Some(destination) = tokens.get(index).copied() {
+                    path = utf8_bytes(destination, "raw destination path", &commit_id)?;
+                    index += 1;
+                }
             }
-        };
-        if is_internal_analysis_path(&path) {
-            current_change_index.set(None);
-            return true;
+            let path = normalize_git_path(path);
+            if !is_internal_analysis_path(&path) {
+                kinds_by_path.insert(path, change_kind);
+            }
+            continue;
         }
 
-        let mut changes = pending_changes.borrow_mut();
-        changes.push(PendingChange {
-            path,
-            change_kind,
-            added_lines: 0,
-            deleted_lines: 0,
-        });
-        current_change_index.set(Some(changes.len() - 1));
-        true
-    };
-    let mut line_cb = |_delta: git2::DiffDelta<'_>,
-                       _hunk: Option<git2::DiffHunk<'_>>,
-                       line: git2::DiffLine<'_>| {
-        let Some(index) = current_change_index.get() else {
-            return true;
-        };
-        let mut changes = pending_changes.borrow_mut();
-        let Some(change) = changes.get_mut(index) else {
-            return true;
-        };
-        match line.origin_value() {
-            DiffLineType::Addition | DiffLineType::AddEOFNL => {
-                change.added_lines += 1;
+        if let Some((path, added, deleted)) = parse_numstat_token(token, &commit_id)? {
+            numstat_records += 1;
+            if !is_internal_analysis_path(&path) {
+                numstats.push((path, added, deleted));
             }
-            DiffLineType::Deletion | DiffLineType::DeleteEOFNL => {
-                change.deleted_lines += 1;
-            }
-            _ => {}
         }
-        true
-    };
-
-    diff.foreach(&mut file_cb, None, None, Some(&mut line_cb))
-        .map_err(|source| {
-            callback_error
-                .borrow_mut()
-                .take()
-                .unwrap_or(GitHistoryError::Git {
-                    context: "counting changed lines",
-                    source,
-                })
-        })?;
-
-    if let Some(error) = callback_error.into_inner() {
-        return Err(error);
     }
 
-    let mut changes = pending_changes
-        .into_inner()
+    let mut changes = numstats
         .into_iter()
-        .map(|change| GitFileChange {
-            commit_id: commit_id.clone(),
-            parent_count,
-            is_merge: parent_count > 1,
-            author: author.clone(),
-            commit_time,
-            path: change.path,
-            change_kind: change.change_kind,
-            added_lines: change.added_lines,
-            deleted_lines: change.deleted_lines,
+        .map(|(path, added_lines, deleted_lines)| {
+            let change_kind = kinds_by_path
+                .get(&path)
+                .copied()
+                .unwrap_or(GitChangeKind::Modified);
+            GitFileChange {
+                commit_id: commit_id.clone(),
+                parent_count,
+                is_merge: parent_count > 1,
+                author: author.clone(),
+                commit_time,
+                path,
+                change_kind,
+                added_lines,
+                deleted_lines,
+            }
         })
         .collect::<Vec<_>>();
 
@@ -1583,59 +1641,134 @@ fn diff_file_changes(
             ))
     });
 
-    Ok(changes)
+    Ok(ParsedGitRecord {
+        commit_id,
+        changes,
+        raw_records,
+        numstat_records,
+    })
+}
+
+fn trim_record_token(token: &[u8]) -> &[u8] {
+    let mut start = 0usize;
+    while token
+        .get(start)
+        .is_some_and(|byte| *byte == b'\n' || *byte == b'\r')
+    {
+        start += 1;
+    }
+    &token[start..]
+}
+
+fn raw_change_kind(token: &[u8]) -> Option<GitChangeKind> {
+    let status = token.rsplit(|byte| *byte == b' ').next()?;
+    match status.first().copied()? {
+        b'A' => Some(GitChangeKind::Added),
+        b'M' => Some(GitChangeKind::Modified),
+        b'D' => Some(GitChangeKind::Deleted),
+        b'R' => Some(GitChangeKind::Renamed),
+        b'C' => Some(GitChangeKind::Copied),
+        b'T' => Some(GitChangeKind::TypeChanged),
+        _ => None,
+    }
+}
+
+fn parse_numstat_token(
+    token: &[u8],
+    commit_id: &str,
+) -> Result<Option<(String, u64, u64)>, GitHistoryError> {
+    let mut fields = token.splitn(3, |byte| *byte == b'\t');
+    let Some(added) = fields.next() else {
+        return Ok(None);
+    };
+    let Some(deleted) = fields.next() else {
+        return Ok(None);
+    };
+    let Some(path) = fields.next() else {
+        return Ok(None);
+    };
+
+    let added = parse_numstat_count(added, "added line count", commit_id)?;
+    let deleted = parse_numstat_count(deleted, "deleted line count", commit_id)?;
+    let path = normalize_git_path(utf8_bytes(path, "numstat path", commit_id)?);
+
+    Ok(Some((path, added, deleted)))
+}
+
+fn parse_numstat_count(
+    value: &[u8],
+    field: &'static str,
+    commit_id: &str,
+) -> Result<u64, GitHistoryError> {
+    if value == b"-" {
+        return Ok(0);
+    }
+    let value = utf8_bytes(value, field, commit_id)?;
+    value.parse::<u64>().map_err(|source| {
+        malformed_stream(field, format!("invalid count in {commit_id}: {source}"))
+    })
 }
 
 fn is_internal_analysis_path(path: &str) -> bool {
     path == ".hotpath" || path.starts_with(".hotpath/")
 }
 
-fn author_identity(
+fn utf8_field(
+    field: Option<&[u8]>,
+    name: &'static str,
     commit_id: &str,
-    author: git2::Signature<'_>,
 ) -> Result<String, GitHistoryError> {
-    let name = author
-        .name()
-        .ok_or_else(|| GitHistoryError::UnsupportedAuthorIdentity {
-            commit_id: commit_id.to_owned(),
-        })?;
-    let email = author
-        .email()
-        .ok_or_else(|| GitHistoryError::UnsupportedAuthorIdentity {
-            commit_id: commit_id.to_owned(),
-        })?;
-
-    Ok(format!("{name} <{email}>"))
+    let field = field.ok_or_else(|| malformed_stream(name, "missing field"))?;
+    utf8_bytes(field, name, commit_id)
 }
 
-fn delta_path(commit_id: &str, delta: git2::DiffDelta<'_>) -> Result<String, GitHistoryError> {
-    let file = if delta.status() == Delta::Deleted {
-        delta.old_file()
-    } else {
-        delta.new_file()
-    };
-    let path = file.path().and_then(Path::to_str).ok_or_else(|| {
-        GitHistoryError::UnsupportedPathEncoding {
-            commit_id: commit_id.to_owned(),
+fn utf8_bytes(
+    bytes: &[u8],
+    name: &'static str,
+    commit_id: &str,
+) -> Result<String, GitHistoryError> {
+    String::from_utf8(bytes.to_vec()).map_err(|_| {
+        if matches!(name, "author name" | "author email") {
+            GitHistoryError::UnsupportedAuthorIdentity {
+                commit_id: commit_id.to_owned(),
+            }
+        } else {
+            GitHistoryError::UnsupportedPathEncoding {
+                commit_id: commit_id.to_owned(),
+            }
         }
-    })?;
-
-    Ok(path.replace('\\', "/"))
+    })
 }
 
-fn change_kind(delta: Delta) -> Option<GitChangeKind> {
-    match delta {
-        Delta::Added => Some(GitChangeKind::Added),
-        Delta::Modified => Some(GitChangeKind::Modified),
-        Delta::Deleted => Some(GitChangeKind::Deleted),
-        Delta::Renamed => Some(GitChangeKind::Renamed),
-        Delta::Copied => Some(GitChangeKind::Copied),
-        Delta::Typechange => Some(GitChangeKind::TypeChanged),
-        Delta::Unmodified
-        | Delta::Ignored
-        | Delta::Untracked
-        | Delta::Unreadable
-        | Delta::Conflicted => None,
+fn parse_i64_field(
+    field: Option<&[u8]>,
+    name: &'static str,
+    commit_id: &str,
+) -> Result<i64, GitHistoryError> {
+    let value = utf8_field(field, name, commit_id)?;
+    value.parse::<i64>().map_err(|source| {
+        malformed_stream(name, format!("invalid integer in {commit_id}: {source}"))
+    })
+}
+
+fn normalize_git_path(path: String) -> String {
+    path.replace('\\', "/")
+}
+
+fn malformed_stream(context: &'static str, detail: impl Into<String>) -> GitHistoryError {
+    GitHistoryError::MalformedGitStream {
+        context,
+        detail: detail.into(),
+    }
+}
+
+fn sanitize_git_stderr(stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        "no stderr output".to_owned()
+    } else {
+        trimmed.lines().take(5).collect::<Vec<_>>().join(" ")
     }
 }
 
@@ -1765,6 +1898,132 @@ fn render_file_explanation(
     );
 
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        parse_git_stream_record, split_commit_ids_for_workers, GitChangeKind, GitHistoryError,
+        GIT_RECORD_SEPARATOR,
+    };
+
+    #[test]
+    fn stream_parser_joins_raw_status_and_numstat_rows() {
+        let record = stream_record(
+            "abc",
+            "100",
+            "Ada",
+            "ada@example.invalid",
+            "parent",
+            [
+                b":000000 100644 0000000 1111111 A".as_slice(),
+                b"src/lib.rs",
+                b"3\t0\tsrc/lib.rs",
+            ],
+        );
+
+        let parsed = parse_git_stream_record(&record).expect("record should parse");
+
+        assert_eq!(parsed.commit_id, "abc");
+        assert_eq!(parsed.raw_records, 1);
+        assert_eq!(parsed.numstat_records, 1);
+        assert_eq!(parsed.changes.len(), 1);
+        assert_eq!(parsed.changes[0].change_kind, GitChangeKind::Added);
+        assert_eq!(parsed.changes[0].added_lines, 3);
+        assert_eq!(parsed.changes[0].deleted_lines, 0);
+        assert_eq!(parsed.changes[0].author, "Ada <ada@example.invalid>");
+    }
+
+    #[test]
+    fn stream_parser_treats_binary_numstat_counts_as_zero() {
+        let record = stream_record(
+            "bin",
+            "100",
+            "Binary",
+            "binary@example.invalid",
+            "parent",
+            [
+                b":100644 100644 1111111 2222222 M".as_slice(),
+                b"image.bin",
+                b"-\t-\timage.bin",
+            ],
+        );
+
+        let parsed = parse_git_stream_record(&record).expect("record should parse");
+
+        assert_eq!(parsed.changes[0].path, "image.bin");
+        assert_eq!(parsed.changes[0].added_lines, 0);
+        assert_eq!(parsed.changes[0].deleted_lines, 0);
+    }
+
+    #[test]
+    fn stream_parser_keeps_tabs_inside_paths_after_numstat_counts() {
+        let record = stream_record(
+            "tab",
+            "100",
+            "Tab",
+            "tab@example.invalid",
+            "parent",
+            [
+                b":100644 100644 1111111 2222222 M".as_slice(),
+                b"src/has\ttab.rs",
+                b"1\t2\tsrc/has\ttab.rs",
+            ],
+        );
+
+        let parsed = parse_git_stream_record(&record).expect("record should parse");
+
+        assert_eq!(parsed.changes[0].path, "src/has\ttab.rs");
+        assert_eq!(parsed.changes[0].added_lines, 1);
+        assert_eq!(parsed.changes[0].deleted_lines, 2);
+    }
+
+    #[test]
+    fn stream_parser_rejects_malformed_headers() {
+        let error = parse_git_stream_record(&[GIT_RECORD_SEPARATOR, b'a', 0])
+            .expect_err("malformed record should fail");
+
+        assert!(matches!(error, GitHistoryError::MalformedGitStream { .. }));
+    }
+
+    #[test]
+    fn stream_worker_chunks_are_contiguous_and_balanced() {
+        let commits = (0..10)
+            .map(|index| format!("commit-{index}"))
+            .collect::<Vec<_>>();
+
+        let chunks = split_commit_ids_for_workers(&commits, 3);
+
+        assert_eq!(
+            chunks[0],
+            vec!["commit-0", "commit-1", "commit-2", "commit-3"]
+        );
+        assert_eq!(chunks[1], vec!["commit-4", "commit-5", "commit-6"]);
+        assert_eq!(chunks[2], vec!["commit-7", "commit-8", "commit-9"]);
+        assert_eq!(chunks.into_iter().flatten().collect::<Vec<_>>(), commits);
+    }
+
+    fn stream_record<const N: usize>(
+        commit_id: &str,
+        commit_time: &str,
+        author_name: &str,
+        author_email: &str,
+        parents: &str,
+        body_tokens: [&[u8]; N],
+    ) -> Vec<u8> {
+        let mut record = Vec::new();
+        record.push(GIT_RECORD_SEPARATOR);
+        for field in [commit_id, commit_time, author_name, author_email, parents] {
+            record.extend_from_slice(field.as_bytes());
+            record.push(0);
+        }
+        record.push(0);
+        for token in body_tokens {
+            record.extend_from_slice(token);
+            record.push(0);
+        }
+        record
+    }
 }
 
 fn observed_commit(commit_id: Option<&str>, commit_time: Option<i64>) -> String {
