@@ -9,3 +9,4 @@ pub mod file_analyzer;
 pub mod file_risk_assessor;
 pub mod git_history_analyzer;
 pub mod repo_risk_assessor;
+pub mod scheduler;

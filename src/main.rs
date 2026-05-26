@@ -32,6 +32,7 @@ fn run_scan() -> ExitCode {
     let mut renderer = ScanLineRenderer::default();
     let result = env::current_dir()
         .map_err(hotpath::pipeline::enumerator::EnumerationError::CurrentDir)
+        .map_err(hotpath::pipeline::analysis_engine::AnalysisEngineError::Enumeration)
         .and_then(|root| {
             let engine = hotpath::pipeline::analysis_engine::AnalysisEngine::new(root);
             engine.scan(|progress| {

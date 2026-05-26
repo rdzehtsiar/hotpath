@@ -11,6 +11,11 @@ use ignore::{DirEntry, Error as IgnoreError, WalkBuilder};
 const PROGRESS_ENTRY_INTERVAL: u64 = 512;
 const PROGRESS_TIME_INTERVAL: Duration = Duration::from_millis(100);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumeratedFile {
+    pub path: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnumerationProgress {
     pub files_detected: u64,
@@ -98,15 +103,27 @@ impl StdError for EnumerationError {
 }
 
 pub fn enumerate_repository(root: impl AsRef<Path>) -> Result<EnumerationResult, EnumerationError> {
-    enumerate_repository_with_progress(root, |_| {})
+    enumerate_repository_with_callbacks(root, |_| {}, |_| {})
 }
 
 pub fn enumerate_repository_with_progress<F>(
     root: impl AsRef<Path>,
-    mut progress: F,
+    progress: F,
 ) -> Result<EnumerationResult, EnumerationError>
 where
     F: FnMut(EnumerationProgress),
+{
+    enumerate_repository_with_callbacks(root, progress, |_| {})
+}
+
+pub fn enumerate_repository_with_callbacks<F, G>(
+    root: impl AsRef<Path>,
+    mut progress: F,
+    mut file_detected: G,
+) -> Result<EnumerationResult, EnumerationError>
+where
+    F: FnMut(EnumerationProgress),
+    G: FnMut(EnumeratedFile),
 {
     let started = Instant::now();
     let requested_root = root.as_ref();
@@ -160,6 +177,9 @@ where
 
         if is_walked_file(&entry) {
             files_detected += 1;
+            file_detected(EnumeratedFile {
+                path: entry.path().to_path_buf(),
+            });
         }
 
         if entries_walked.is_multiple_of(PROGRESS_ENTRY_INTERVAL)
@@ -247,7 +267,10 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{enumerate_repository, enumerate_repository_with_progress};
+    use super::{
+        enumerate_repository, enumerate_repository_with_callbacks,
+        enumerate_repository_with_progress,
+    };
 
     static NEXT_FIXTURE_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -377,5 +400,27 @@ mod tests {
         let final_progress = progress.last().expect("final progress should be emitted");
         assert_eq!(final_progress.files_detected, result.files_detected);
         assert_eq!(final_progress.entries_walked, result.entries_walked);
+    }
+
+    #[test]
+    fn reports_each_detected_file_to_callback() {
+        let fixture = Fixture::new("file-callback");
+        fixture.write("a.go", "package main\n");
+        fixture.write("nested/b.go", "package nested\n");
+        let mut files = Vec::new();
+
+        let result = enumerate_repository_with_callbacks(
+            &fixture.path,
+            |_| {},
+            |file| {
+                files.push(file.path);
+            },
+        )
+        .expect("enumeration should succeed");
+
+        assert_eq!(result.files_detected, 2);
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|path| path.ends_with("a.go")));
+        assert!(files.iter().any(|path| path.ends_with("b.go")));
     }
 }
