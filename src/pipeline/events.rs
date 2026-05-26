@@ -16,6 +16,10 @@ pub enum PipelineEvent {
     FileDiscovered {
         path: PathBuf,
     },
+    TotalFilesCounted {
+        files_detected: u64,
+        elapsed: Duration,
+    },
     EnumerationCompleted {
         result: EnumerationResult,
     },
@@ -72,6 +76,9 @@ impl PipelineState {
             PipelineEvent::FileDiscovered { .. } => {
                 self.enumerated_files += 1;
             }
+            PipelineEvent::TotalFilesCounted { files_detected, .. } => {
+                self.total_files = Some(*files_detected);
+            }
             PipelineEvent::EnumerationCompleted { result } => {
                 self.enumerated_files = result.files_detected;
                 self.entries_walked = result.entries_walked;
@@ -111,8 +118,7 @@ impl PipelineState {
     }
 
     pub fn analysis_display_total(&self) -> u64 {
-        self.total_files
-            .unwrap_or_else(|| self.enumerated_files.max(self.analyzed_files))
+        self.total_files.unwrap_or(0)
     }
 }
 
@@ -170,6 +176,20 @@ mod tests {
         assert_eq!(state.total_files, Some(7));
         assert_eq!(state.remaining_files(), Some(7));
         assert_eq!(state.enumeration_files_per_second(), 3.5);
+    }
+
+    #[test]
+    fn total_file_count_event_sets_total_before_enumeration_completes() {
+        let mut state = PipelineState::default();
+
+        state.apply(&PipelineEvent::TotalFilesCounted {
+            files_detected: 4,
+            elapsed: Duration::from_secs(1),
+        });
+
+        assert_eq!(state.total_files, Some(4));
+        assert_eq!(state.remaining_files(), Some(4));
+        assert_eq!(state.analysis_display_total(), 4);
     }
 
     #[test]

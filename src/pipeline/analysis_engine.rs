@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::pipeline::enumerator::{
-    enumerate_repository_with_callbacks, EnumerationError, EnumerationResult,
+    enumerate_repository, enumerate_repository_with_callbacks, EnumerationError, EnumerationResult,
 };
 use crate::pipeline::events::{PipelineEvent, PipelineState};
 use crate::pipeline::file_analyzer::FileAnalyzerOptions;
@@ -113,6 +113,7 @@ impl AnalysisEngine {
         let mut scheduler_options = self.options.scheduler.clone();
         scheduler_options.file_analyzer = self.options.file_analyzer.clone();
         let (event_sender, event_receiver) = mpsc::channel();
+        let total_counter = spawn_total_counter(self.root.clone(), event_sender.clone());
         let scheduler = Scheduler::start_with_events(scheduler_options, Some(event_sender));
         let dispatcher = RefCell::new(EventDispatcher::new(observer));
         dispatcher.borrow_mut().emit(PipelineEvent::ScanStarted);
@@ -166,6 +167,7 @@ impl AnalysisEngine {
                 }
             }
         };
+        let _ = total_counter.join();
         drain_scheduler_events(&event_receiver, &dispatcher);
 
         if let Ok(result) = &result {
@@ -177,6 +179,20 @@ impl AnalysisEngine {
 
         result
     }
+}
+
+fn spawn_total_counter(
+    root: PathBuf,
+    event_sender: mpsc::Sender<PipelineEvent>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        if let Ok(result) = enumerate_repository(root) {
+            let _ = event_sender.send(PipelineEvent::TotalFilesCounted {
+                files_detected: result.files_detected,
+                elapsed: result.elapsed,
+            });
+        }
+    })
 }
 
 struct EventDispatcher<F> {
@@ -290,6 +306,9 @@ mod tests {
         assert!(events
             .iter()
             .any(|(_, event)| matches!(event, PipelineEvent::EnumerationProgress { .. })));
+        assert!(events
+            .iter()
+            .any(|(_, event)| matches!(event, PipelineEvent::TotalFilesCounted { .. })));
         assert!(events
             .iter()
             .any(|(_, event)| matches!(event, PipelineEvent::EnumerationCompleted { .. })));
