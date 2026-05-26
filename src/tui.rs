@@ -2333,13 +2333,11 @@ fn refresh_index_presentation(state: &mut TuiAppState, options: TuiOptions) {
                     .collect(),
             });
         }
-        if inspector.fan_in > 0 || inspector.fan_out > 0 {
-            fan_by_file.push(TuiFileFan {
-                path: inspector.hotspot.path.clone(),
-                fan_in: inspector.fan_in,
-                fan_out: inspector.fan_out,
-            });
-        }
+        fan_by_file.push(TuiFileFan {
+            path: inspector.hotspot.path.clone(),
+            fan_in: inspector.fan_in,
+            fan_out: inspector.fan_out,
+        });
         if let Some(max_complexity) = inspector.max_cyclomatic_complexity {
             complexity_symbols.push(ComplexitySymbolRecord {
                 path: inspector.hotspot.path.clone(),
@@ -4563,7 +4561,18 @@ fn context_pressure_for_path(snapshot: &TuiSnapshot, path: &str) -> Option<(f64,
 }
 
 fn coupling_pressure_for_path(snapshot: &TuiSnapshot, path: &str) -> Option<f64> {
-    let fan = fan_for_path(snapshot, path)?;
+    let zero_fan;
+    let fan = match fan_for_path(snapshot, path) {
+        Some(fan) => fan,
+        None => {
+            zero_fan = TuiFileFan {
+                path: path.to_owned(),
+                fan_in: 0,
+                fan_out: 0,
+            };
+            &zero_fan
+        }
+    };
     let degree = fan.fan_in.saturating_add(fan.fan_out);
     let cochange_count = hotspot_for_path(snapshot, path)
         .and_then(|hotspot| hotspot.raw_metrics.co_changed_file_count)
@@ -4572,24 +4581,33 @@ fn coupling_pressure_for_path(snapshot: &TuiSnapshot, path: &str) -> Option<f64>
         return Some(0.0);
     }
 
-    let fan_in_values = snapshot
+    let mut fan_in_values = snapshot
         .coupling
         .fan_by_file
         .iter()
         .map(|fan| fan.fan_in as f64)
         .collect::<Vec<_>>();
-    let fan_out_values = snapshot
+    if fan_for_path(snapshot, path).is_none() {
+        fan_in_values.push(0.0);
+    }
+    let mut fan_out_values = snapshot
         .coupling
         .fan_by_file
         .iter()
         .map(|fan| fan.fan_out as f64)
         .collect::<Vec<_>>();
-    let degree_values = snapshot
+    if fan_for_path(snapshot, path).is_none() {
+        fan_out_values.push(0.0);
+    }
+    let mut degree_values = snapshot
         .coupling
         .fan_by_file
         .iter()
         .map(|fan| fan.fan_in.saturating_add(fan.fan_out) as f64)
         .collect::<Vec<_>>();
+    if fan_for_path(snapshot, path).is_none() {
+        degree_values.push(0.0);
+    }
     let cochange_values = snapshot
         .report
         .hotspots
@@ -4638,6 +4656,16 @@ fn complexity_score_for_path(snapshot: &TuiSnapshot, path: &str) -> Option<f64> 
         .max()?;
 
     Some(max_complexity as f64)
+}
+
+fn unavailable_metric_line(label: &str, options: TuiOptions) -> Line<'static> {
+    metric_bar_line(
+        label,
+        0.0,
+        "unavailable".to_owned(),
+        TuiSeverity::Muted,
+        options,
+    )
 }
 
 fn normalized_u64(value: u64, saturation: u64) -> f64 {
@@ -4962,23 +4990,23 @@ fn file_inspector_lines(
             options,
         ));
 
-        if let Some(coupling) = coupling_pressure_for_path(snapshot, path) {
-            lines.push(metric_bar_line(
-                "COUPLING",
-                coupling,
-                coupling_severity_label(coupling).to_owned(),
-                severity_for_score(coupling),
-                options,
-            ));
-        }
-        if let Some(complexity) = complexity_score_for_path(snapshot, path) {
-            lines.push(metric_bar_line(
+        let coupling = coupling_pressure_for_path(snapshot, path).unwrap_or(0.0);
+        lines.push(metric_bar_line(
+            "COUPLING",
+            coupling,
+            coupling_severity_label(coupling).to_owned(),
+            severity_for_score(coupling),
+            options,
+        ));
+        match complexity_score_for_path(snapshot, path) {
+            Some(complexity) => lines.push(metric_bar_line(
                 "COMPLEXITY",
                 (complexity / 35.0).clamp(0.0, 1.0),
                 complexity_severity_label(complexity).to_owned(),
                 severity_for_complexity_score(complexity),
                 options,
-            ));
+            )),
+            None => lines.push(unavailable_metric_line("COMPLEXITY", options)),
         }
         if let Some(line_count) = file_for_path(snapshot, path).and_then(|file| file.line_count) {
             let band = line_size_band(line_count);
@@ -6469,6 +6497,27 @@ mod tests {
         assert!(text.contains("COMPLEXITY"));
         assert!(text.contains("MEDIUM"));
         assert!(!text.contains("18.0 MEDIUM"));
+    }
+
+    #[test]
+    fn inspector_keeps_coupling_and_complexity_rows_when_parser_facts_are_missing() {
+        let mut snapshot = test_snapshot();
+        snapshot.report.hotspots[0]
+            .raw_metrics
+            .co_changed_file_count = Some(12);
+        snapshot.coupling.fan_by_file.clear();
+        snapshot.complexity.symbols.clear();
+
+        let text = lines_text(&file_inspector_lines(
+            &snapshot,
+            "src/lib.rs",
+            80,
+            TuiOptions::default(),
+        ));
+
+        assert!(text.contains("COUPLING"));
+        assert!(text.contains("COMPLEXITY"));
+        assert!(text.contains("unavailable"));
     }
 
     #[test]
