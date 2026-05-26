@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::env;
-use std::io::{self, Write};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use hotpath::pipeline::reporter::StdioReporter;
 
 #[derive(Debug, Parser)]
 #[command(name = "hotpath")]
@@ -29,71 +29,20 @@ fn main() -> ExitCode {
 }
 
 fn run_scan() -> ExitCode {
-    let mut renderer = ScanLineRenderer::default();
+    let mut reporter = StdioReporter::stdout();
     let result = env::current_dir()
         .map_err(hotpath::pipeline::enumerator::EnumerationError::CurrentDir)
         .map_err(hotpath::pipeline::analysis_engine::AnalysisEngineError::Enumeration)
         .and_then(|root| {
             let engine = hotpath::pipeline::analysis_engine::AnalysisEngine::new(root);
-            engine.scan(|progress| {
-                renderer.render_progress(&progress);
-            })
+            engine.scan_with_reporter(&mut reporter)
         });
 
     match result {
-        Ok(result) => {
-            renderer.finish_result(&result);
-            ExitCode::SUCCESS
-        }
+        Ok(_) => ExitCode::SUCCESS,
         Err(error) => {
-            renderer.finish_line();
             eprintln!("hotpath: {error}");
             ExitCode::FAILURE
         }
     }
-}
-
-#[derive(Debug, Default)]
-struct ScanLineRenderer {
-    last_width: usize,
-    line_finished: bool,
-}
-
-impl ScanLineRenderer {
-    fn render_progress(&mut self, progress: &hotpath::pipeline::enumerator::EnumerationProgress) {
-        self.render_line(progress.files_detected, progress.files_per_second(), false);
-    }
-
-    fn finish_result(&mut self, result: &hotpath::pipeline::enumerator::EnumerationResult) {
-        if self.last_width == 0 {
-            self.render_line(result.files_detected, result.files_per_second(), false);
-        }
-        self.finish_line();
-    }
-
-    fn finish_line(&mut self) {
-        if self.last_width > 0 && !self.line_finished {
-            println!();
-            self.line_finished = true;
-        }
-    }
-
-    fn render_line(&mut self, files_detected: u64, files_per_second: f64, newline: bool) {
-        let line = render_scan_line(files_detected, files_per_second);
-        let padding = self.last_width.saturating_sub(line.len());
-
-        print!("\r{line}{}", " ".repeat(padding));
-        if newline {
-            println!();
-            self.line_finished = true;
-        } else {
-            self.line_finished = false;
-        }
-        let _ = io::stdout().flush();
-        self.last_width = line.len();
-    }
-}
-
-fn render_scan_line(files_detected: u64, files_per_second: f64) -> String {
-    format!("files detected {files_detected} | speed {files_per_second:.2} files/sec")
 }

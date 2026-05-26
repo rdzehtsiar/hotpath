@@ -4,11 +4,14 @@ use std::collections::VecDeque;
 use std::error::Error as StdError;
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use crate::pipeline::enumerator::EnumeratedFile;
-use crate::pipeline::file_analyzer::{FileAnalysisInput, FileAnalyzer};
+use crate::pipeline::events::PipelineEvent;
+use crate::pipeline::file_analyzer::{FileAnalysisInput, FileAnalyzer, FileAnalyzerOptions};
 
 pub const DEFAULT_QUEUE_CAPACITY: usize = 1_000_000;
 
@@ -16,6 +19,7 @@ pub const DEFAULT_QUEUE_CAPACITY: usize = 1_000_000;
 pub struct SchedulerOptions {
     pub worker_count: usize,
     pub queue_capacity: usize,
+    pub file_analyzer: FileAnalyzerOptions,
 }
 
 impl Default for SchedulerOptions {
@@ -23,6 +27,7 @@ impl Default for SchedulerOptions {
         Self {
             worker_count: default_worker_count(),
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
+            file_analyzer: FileAnalyzerOptions::default(),
         }
     }
 }
@@ -87,15 +92,34 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub fn start(options: SchedulerOptions) -> Self {
+        Self::start_with_events(options, None)
+    }
+
+    pub fn start_with_events(
+        options: SchedulerOptions,
+        event_sender: Option<Sender<PipelineEvent>>,
+    ) -> Self {
         let worker_count = options.worker_count.max(1);
+        let file_analyzer_options = options.file_analyzer.clone();
         let queue = Arc::new(TaskQueue::new(options.queue_capacity));
         let submitted_tasks = Arc::new(AtomicUsize::new(0));
         let processed_tasks = Arc::new(AtomicUsize::new(0));
+        let started = Instant::now();
         let workers = (0..worker_count)
             .map(|_| {
                 let queue = Arc::clone(&queue);
                 let processed_tasks = Arc::clone(&processed_tasks);
-                thread::spawn(move || worker_loop(queue, processed_tasks))
+                let file_analyzer_options = file_analyzer_options.clone();
+                let event_sender = event_sender.clone();
+                thread::spawn(move || {
+                    worker_loop(
+                        queue,
+                        processed_tasks,
+                        file_analyzer_options,
+                        event_sender,
+                        started,
+                    )
+                })
             })
             .collect();
 
@@ -215,14 +239,26 @@ struct TaskQueueState {
     closed: bool,
 }
 
-fn worker_loop(queue: Arc<TaskQueue>, processed_tasks: Arc<AtomicUsize>) {
-    let analyzer = FileAnalyzer::new();
+fn worker_loop(
+    queue: Arc<TaskQueue>,
+    processed_tasks: Arc<AtomicUsize>,
+    file_analyzer_options: FileAnalyzerOptions,
+    event_sender: Option<Sender<PipelineEvent>>,
+    started: Instant,
+) {
+    let analyzer = FileAnalyzer::with_options(file_analyzer_options);
 
     while let Some(task) = queue.pop() {
         match task {
             PipelineTask::AnalyzeFile(file) => {
                 let _result = analyzer.analyze(FileAnalysisInput { path: file.path });
-                processed_tasks.fetch_add(1, Ordering::SeqCst);
+                let analyzed_files = processed_tasks.fetch_add(1, Ordering::SeqCst) + 1;
+                if let Some(event_sender) = &event_sender {
+                    let _ = event_sender.send(PipelineEvent::FileAnalysisCompleted {
+                        analyzed_files: analyzed_files as u64,
+                        elapsed: started.elapsed(),
+                    });
+                }
             }
         }
     }
@@ -248,6 +284,8 @@ mod tests {
         DEFAULT_QUEUE_CAPACITY,
     };
     use crate::pipeline::enumerator::EnumeratedFile;
+    use crate::pipeline::events::PipelineEvent;
+    use crate::pipeline::file_analyzer::FileAnalyzerOptions;
 
     #[test]
     fn default_options_use_large_queue_and_available_workers() {
@@ -273,6 +311,7 @@ mod tests {
         let scheduler = Scheduler::start(SchedulerOptions {
             worker_count: 2,
             queue_capacity: 8,
+            file_analyzer: FileAnalyzerOptions::default(),
         });
 
         for index in 0..5 {
@@ -292,6 +331,7 @@ mod tests {
         let scheduler = Scheduler::start(SchedulerOptions {
             worker_count: 2,
             queue_capacity: 2,
+            file_analyzer: FileAnalyzerOptions::default(),
         });
 
         let stats = scheduler.finish().expect("scheduler should finish");
@@ -337,6 +377,7 @@ mod tests {
         let scheduler = Scheduler::start(SchedulerOptions {
             worker_count: 1,
             queue_capacity: 2,
+            file_analyzer: FileAnalyzerOptions::default(),
         });
 
         scheduler
@@ -346,6 +387,34 @@ mod tests {
 
         assert_eq!(stats.submitted_tasks, 1);
         scheduler.finish().expect("scheduler should finish");
+    }
+
+    #[test]
+    fn workers_emit_analysis_completion_events() {
+        let (event_sender, event_receiver) = mpsc::channel();
+        let scheduler = Scheduler::start_with_events(
+            SchedulerOptions {
+                worker_count: 1,
+                queue_capacity: 2,
+                file_analyzer: FileAnalyzerOptions::default(),
+            },
+            Some(event_sender),
+        );
+
+        scheduler
+            .submit(task(0))
+            .expect("task should submit successfully");
+        let stats = scheduler.finish().expect("scheduler should finish");
+
+        assert_eq!(stats.processed_tasks, 1);
+        let events: Vec<_> = event_receiver.try_iter().collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            PipelineEvent::FileAnalysisCompleted {
+                analyzed_files: 1,
+                ..
+            }
+        )));
     }
 
     fn task(index: usize) -> PipelineTask {
