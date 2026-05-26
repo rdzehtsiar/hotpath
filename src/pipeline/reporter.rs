@@ -6,6 +6,9 @@ use std::time::{Duration, Instant};
 use crate::pipeline::events::PipelineState;
 
 const PROGRESS_BAR_WIDTH: usize = 24;
+const COUNT_VALUE_WIDTH: usize = 9;
+const TOTAL_VALUE_WIDTH: usize = 10;
+const SPEED_VALUE_WIDTH: usize = 10;
 const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(100);
 
 pub trait PipelineReporter {
@@ -71,11 +74,15 @@ impl<W: Write> StdioReporter<W> {
     }
 
     fn render_now(&mut self, state: &PipelineState) {
-        let line = render_report_line_with_style(state, self.bar_style);
+        let [files_line, git_line, store_line] =
+            render_report_lines_with_style(state, self.bar_style);
         if self.rendered_once {
-            let _ = write!(self.writer, "\r\x1b[2K{line}");
+            let _ = write!(
+                self.writer,
+                "\x1b[2A\r\x1b[2K{files_line}\n\r\x1b[2K{git_line}\n\r\x1b[2K{store_line}"
+            );
         } else {
-            let _ = write!(self.writer, "{line}");
+            let _ = write!(self.writer, "{files_line}\n{git_line}\n{store_line}");
             self.rendered_once = true;
         }
         self.last_rendered_at = Some(Instant::now());
@@ -106,45 +113,69 @@ impl<W: Write> PipelineReporter for StdioReporter<W> {
     }
 }
 
-pub fn render_report_line(state: &PipelineState) -> String {
-    render_report_line_with_style(state, ProgressBarStyle::Unicode)
+pub fn render_report_lines(state: &PipelineState) -> [String; 3] {
+    render_report_lines_with_style(state, ProgressBarStyle::Unicode)
 }
 
-fn render_report_line_with_style(state: &PipelineState, style: ProgressBarStyle) -> String {
-    let analysis_total = state.analysis_display_total();
-    let progress_bar = render_progress_bar_with_style(
+fn render_report_lines_with_style(state: &PipelineState, style: ProgressBarStyle) -> [String; 3] {
+    let files_line = render_progress_row(
+        "files",
         state.analyzed_files,
-        analysis_total,
-        PROGRESS_BAR_WIDTH,
+        state.total_files,
+        state.analysis_files_per_second(),
+        "files/sec",
         style,
     );
-    match state.remaining_files() {
-        Some(remaining) => format!(
-            "analyzed files   {progress_bar} {}/{} | remaining {} | speed {:.2} files/sec",
-            state.analyzed_files,
-            analysis_total,
-            remaining,
-            state.analysis_files_per_second()
-        ),
-        None => format!(
-            "analyzed files   {progress_bar} {}/estimating | speed {:.2} files/sec",
-            state.analyzed_files,
-            state.analysis_files_per_second()
-        ),
-    }
+    let git_line = render_progress_row(
+        "git",
+        state.git_commits_processed,
+        state.total_git_commits,
+        state.git_commits_per_second(),
+        "commits/sec",
+        style,
+    );
+    let store_line = render_progress_row(
+        "store",
+        state.stored_records,
+        state.store_planned_records,
+        state.store_records_per_second(),
+        "rows/sec",
+        style,
+    );
+
+    [files_line, git_line, store_line]
+}
+
+fn render_progress_row(
+    label: &str,
+    processed: u64,
+    total: Option<u64>,
+    speed: f64,
+    speed_unit: &str,
+    style: ProgressBarStyle,
+) -> String {
+    let progress_bar = render_progress_bar_with_style(processed, total, PROGRESS_BAR_WIDTH, style);
+    let total_text = total
+        .map(|total| total.to_string())
+        .unwrap_or_else(|| "estimating".to_owned());
+
+    format!(
+        "{label:<5} {progress_bar} {processed:>COUNT_VALUE_WIDTH$}/{total_text:<TOTAL_VALUE_WIDTH$} | speed {speed:>SPEED_VALUE_WIDTH$.2} {speed_unit}"
+    )
 }
 
 pub fn render_progress_bar(done: u64, total: u64, width: usize) -> String {
-    render_progress_bar_with_style(done, total, width, ProgressBarStyle::Unicode)
+    render_progress_bar_with_style(done, Some(total), width, ProgressBarStyle::Unicode)
 }
 
 fn render_progress_bar_with_style(
     done: u64,
-    total: u64,
+    total: Option<u64>,
     width: usize,
     style: ProgressBarStyle,
 ) -> String {
     let width = width.max(1);
+    let total = total.unwrap_or(0);
     let filled = if total == 0 {
         0
     } else {
@@ -205,13 +236,13 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        render_progress_bar, render_report_line, render_report_line_with_style, PipelineReporter,
+        render_progress_bar, render_report_lines, render_report_lines_with_style, PipelineReporter,
         ProgressBarStyle, StdioReporter,
     };
     use crate::pipeline::events::PipelineState;
 
     #[test]
-    fn render_line_shows_estimating_before_total_is_known() {
+    fn render_lines_show_estimating_before_totals_are_known() {
         let state = PipelineState {
             enumerated_files: 5,
             analyzed_files: 2,
@@ -219,28 +250,53 @@ mod tests {
             ..PipelineState::default()
         };
 
-        let line = render_report_line(&state);
+        let lines = render_report_lines(&state);
 
-        assert!(line.starts_with("analyzed files"));
-        assert!(line.contains("│                        │"));
-        assert!(line.contains("2/estimating"));
-        assert!(line.contains("speed 2.00 files/sec"));
+        assert!(lines[0].starts_with("files"));
+        assert!(lines[0].contains("│                        │"));
+        assert!(lines[0].contains("        2/estimating"));
+        assert!(lines[0].contains("speed       2.00 files/sec"));
+        assert!(lines[1].starts_with("git"));
+        assert!(lines[1].contains("        0/estimating"));
+        assert!(lines[2].starts_with("store"));
+        assert!(lines[2].contains("        0/estimating"));
     }
 
     #[test]
-    fn render_line_shows_exact_total_and_remaining_after_total_is_known() {
+    fn render_lines_show_exact_totals_without_remaining_after_totals_are_known() {
         let state = PipelineState {
             enumerated_files: 5,
             total_files: Some(5),
             analyzed_files: 2,
+            total_git_commits: Some(4),
+            total_git_chunks: Some(2),
+            git_commits_processed: 1,
+            stored_records: 3,
+            store_planned_records: Some(7),
             analysis_elapsed: Duration::from_secs(1),
+            git_elapsed: Duration::from_secs(1),
+            store_elapsed: Duration::from_secs(1),
             ..PipelineState::default()
         };
 
-        let line = render_report_line(&state);
+        let lines = render_report_lines(&state);
 
-        assert!(line.contains("2/5"));
-        assert!(line.contains("remaining 3"));
+        assert!(lines[0].contains("        2/5"));
+        assert!(lines[1].contains("        1/4"));
+        assert!(lines[2].contains("        3/7"));
+        assert!(!lines.iter().any(|line| line.contains("remaining")));
+        assert!(lines[1].contains("speed       1.00 commits/sec"));
+        assert!(lines[2].contains("speed       3.00 rows/sec"));
+        let speed_columns: Vec<_> = lines
+            .iter()
+            .map(|line| {
+                line[..line.find("| speed").expect("speed column should exist")]
+                    .chars()
+                    .count()
+            })
+            .collect();
+        assert_eq!(speed_columns[0], speed_columns[1]);
+        assert_eq!(speed_columns[1], speed_columns[2]);
     }
 
     #[test]
@@ -259,13 +315,13 @@ mod tests {
             ..PipelineState::default()
         };
 
-        let line = render_report_line_with_style(&state, ProgressBarStyle::Ascii);
+        let lines = render_report_lines_with_style(&state, ProgressBarStyle::Ascii);
 
-        assert!(line.contains("[############            ]"));
+        assert!(lines[0].contains("[############            ]"));
     }
 
     #[test]
-    fn stdio_reporter_writes_one_line_and_final_newline() {
+    fn stdio_reporter_writes_three_lines_and_final_newline() {
         let mut output = Vec::new();
         let mut reporter = StdioReporter::new(&mut output);
         let state = PipelineState {
@@ -279,7 +335,7 @@ mod tests {
 
         let rendered = String::from_utf8(output).expect("reporter output should be UTF-8");
         assert!(rendered.ends_with('\n'));
-        assert_eq!(rendered.matches('\n').count(), 1);
+        assert_eq!(rendered.matches('\n').count(), 3);
     }
 
     #[test]

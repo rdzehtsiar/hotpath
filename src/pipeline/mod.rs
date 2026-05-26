@@ -12,3 +12,4 @@ pub mod git_history_analyzer;
 pub mod repo_risk_assessor;
 pub mod reporter;
 pub mod scheduler;
+pub mod store_reducer;
