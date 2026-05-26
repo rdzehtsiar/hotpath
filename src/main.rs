@@ -33,7 +33,8 @@ fn run_scan() -> ExitCode {
     let result = env::current_dir()
         .map_err(hotpath::pipeline::enumerator::EnumerationError::CurrentDir)
         .and_then(|root| {
-            hotpath::pipeline::enumerator::enumerate_repository_with_progress(root, |progress| {
+            let engine = hotpath::pipeline::analysis_engine::AnalysisEngine::new(root);
+            engine.scan(|progress| {
                 renderer.render_progress(&progress);
             })
         });
