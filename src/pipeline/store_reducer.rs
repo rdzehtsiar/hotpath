@@ -109,7 +109,7 @@ pub struct StoreReducerHandle {
 
 impl StoreReducerHandle {
     pub fn store_file_analysis(&self, result: FileAnalysisResult) -> Result<(), StoreReducerError> {
-        self.send(StoreMessage::FileAnalysis(result))
+        self.send(StoreMessage::FileAnalysis(Box::new(result)))
     }
 
     pub fn mark_file_reused(&self, path: PathBuf) -> Result<(), StoreReducerError> {
@@ -234,7 +234,7 @@ impl GitHistorySink for StoreReducerHandle {
 
 #[derive(Debug)]
 enum StoreMessage {
-    FileAnalysis(FileAnalysisResult),
+    FileAnalysis(Box<FileAnalysisResult>),
     GitChunkSummary(GitChunkSummary),
     GitFileMetrics(Vec<GitFileMetricDelta>),
     GitFileAuthors(Vec<GitFileAuthorDelta>),
@@ -277,6 +277,7 @@ pub struct StoredScanState {
     pub completed: bool,
     pub last_indexed_head: Option<String>,
     pub git_options_signature: Option<String>,
+    pub file_analysis_signature: Option<String>,
     pub root: Option<String>,
 }
 
@@ -316,6 +317,7 @@ pub fn read_scan_state(root: impl AsRef<Path>) -> Result<StoredScanState, StoreR
             .is_some_and(|value| value == "1"),
         last_indexed_head: read_scan_state_value(&connection, "last_indexed_head")?,
         git_options_signature: read_scan_state_value(&connection, "git_options_signature")?,
+        file_analysis_signature: read_scan_state_value(&connection, "file_analysis_signature")?,
         root: read_scan_state_value(&connection, "root")?,
     })
 }
@@ -357,7 +359,10 @@ pub fn file_analysis_is_current(
     }
 }
 
-pub fn load_file_reuse_index(root: impl AsRef<Path>) -> Result<FileReuseIndex, StoreReducerError> {
+pub fn load_file_reuse_index(
+    root: impl AsRef<Path>,
+    expected_file_analysis_signature: &str,
+) -> Result<FileReuseIndex, StoreReducerError> {
     let db_path = root.as_ref().join(INDEX_DIR).join(INDEX_DB);
     if !db_path.exists() {
         return Ok(FileReuseIndex::default());
@@ -365,6 +370,11 @@ pub fn load_file_reuse_index(root: impl AsRef<Path>) -> Result<FileReuseIndex, S
     let connection = open_database(&db_path)?;
     initialize_database(&connection)?;
     if read_scan_state_value(&connection, "last_scan_completed")?.is_none_or(|value| value != "1") {
+        return Ok(FileReuseIndex::default());
+    }
+    if read_scan_state_value(&connection, "file_analysis_signature")?.as_deref()
+        != Some(expected_file_analysis_signature)
+    {
         return Ok(FileReuseIndex::default());
     }
 
@@ -474,7 +484,7 @@ struct StoreBatch {
 impl StoreBatch {
     fn push(&mut self, message: StoreMessage) {
         match message {
-            StoreMessage::FileAnalysis(result) => self.file_results.push(result),
+            StoreMessage::FileAnalysis(result) => self.file_results.push(*result),
             StoreMessage::GitChunkSummary(summary) => self.git_chunk_summaries.push(summary),
             StoreMessage::GitFileMetrics(metrics) => self.git_file_metrics.extend(metrics),
             StoreMessage::GitFileAuthors(authors) => self.git_file_authors.extend(authors),
@@ -661,6 +671,14 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
                 is_vendor INTEGER NOT NULL,
                 parser_status TEXT NOT NULL,
                 parser_recognition_attempts INTEGER NOT NULL,
+                language_id TEXT,
+                symbol_count INTEGER NOT NULL DEFAULT 0,
+                function_count INTEGER NOT NULL DEFAULT 0,
+                method_count INTEGER NOT NULL DEFAULT 0,
+                type_count INTEGER NOT NULL DEFAULT 0,
+                import_count INTEGER NOT NULL DEFAULT 0,
+                cognitive_complexity INTEGER,
+                max_function_complexity INTEGER,
                 diagnostics TEXT NOT NULL
             );
 
@@ -774,6 +792,14 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
                 is_vendor INTEGER NOT NULL,
                 parser_status TEXT NOT NULL,
                 parser_recognition_attempts INTEGER NOT NULL,
+                language_id TEXT,
+                symbol_count INTEGER NOT NULL DEFAULT 0,
+                function_count INTEGER NOT NULL DEFAULT 0,
+                method_count INTEGER NOT NULL DEFAULT 0,
+                type_count INTEGER NOT NULL DEFAULT 0,
+                import_count INTEGER NOT NULL DEFAULT 0,
+                cognitive_complexity INTEGER,
+                max_function_complexity INTEGER,
                 diagnostics TEXT NOT NULL,
                 commits_per_file INTEGER NOT NULL DEFAULT 0,
                 total_added_lines INTEGER NOT NULL DEFAULT 0,
@@ -790,7 +816,6 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
                 dominant_owner TEXT,
                 dominant_owner_share REAL,
                 co_changed_file_count INTEGER NOT NULL DEFAULT 0,
-                cognitive_complexity INTEGER,
                 source_coupling_in INTEGER,
                 source_coupling_out INTEGER
             );
@@ -819,6 +844,87 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
         "file_analysis",
         "is_active",
         "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    add_column_if_missing(connection, "file_analysis", "language_id", "TEXT")?;
+    add_column_if_missing(
+        connection,
+        "file_analysis",
+        "symbol_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        connection,
+        "file_analysis",
+        "function_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        connection,
+        "file_analysis",
+        "method_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        connection,
+        "file_analysis",
+        "type_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        connection,
+        "file_analysis",
+        "import_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        connection,
+        "file_analysis",
+        "cognitive_complexity",
+        "INTEGER",
+    )?;
+    add_column_if_missing(
+        connection,
+        "file_analysis",
+        "max_function_complexity",
+        "INTEGER",
+    )?;
+    add_column_if_missing(connection, "file_facts", "language_id", "TEXT")?;
+    add_column_if_missing(
+        connection,
+        "file_facts",
+        "symbol_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        connection,
+        "file_facts",
+        "function_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        connection,
+        "file_facts",
+        "method_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        connection,
+        "file_facts",
+        "type_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        connection,
+        "file_facts",
+        "import_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(connection, "file_facts", "cognitive_complexity", "INTEGER")?;
+    add_column_if_missing(
+        connection,
+        "file_facts",
+        "max_function_complexity",
+        "INTEGER",
     )?;
     add_column_if_missing(
         connection,
@@ -974,8 +1080,16 @@ fn flush_batch(
                     is_vendor,
                     parser_status,
                     parser_recognition_attempts,
+                    language_id,
+                    symbol_count,
+                    function_count,
+                    method_count,
+                    type_count,
+                    import_count,
+                    cognitive_complexity,
+                    max_function_complexity,
                     diagnostics
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
                 ",
             )
             .map_err(StoreReducerError::WriteDatabase)?;
@@ -1000,6 +1114,14 @@ fn flush_batch(
                     bool_to_i64(result.is_vendor),
                     parser_status_name(result.parser_status),
                     result.parser_recognition_attempts as i64,
+                    result.language_id.as_deref(),
+                    result.symbol_count as i64,
+                    result.function_count as i64,
+                    result.method_count as i64,
+                    result.type_count as i64,
+                    result.import_count as i64,
+                    result.cognitive_complexity.map(|value| value as i64),
+                    result.max_function_complexity.map(|value| value as i64),
                     diagnostics_json(&result.diagnostics),
                 ])
                 .map_err(StoreReducerError::WriteDatabase)?;
@@ -1455,6 +1577,14 @@ fn materialize_file_facts(
                 is_vendor,
                 parser_status,
                 parser_recognition_attempts,
+                language_id,
+                symbol_count,
+                function_count,
+                method_count,
+                type_count,
+                import_count,
+                cognitive_complexity,
+                max_function_complexity,
                 diagnostics,
                 commits_per_file,
                 total_added_lines,
@@ -1471,7 +1601,6 @@ fn materialize_file_facts(
                 dominant_owner,
                 dominant_owner_share,
                 co_changed_file_count,
-                cognitive_complexity,
                 source_coupling_in,
                 source_coupling_out
             )
@@ -1488,6 +1617,14 @@ fn materialize_file_facts(
                 file_analysis.is_vendor,
                 file_analysis.parser_status,
                 file_analysis.parser_recognition_attempts,
+                file_analysis.language_id,
+                file_analysis.symbol_count,
+                file_analysis.function_count,
+                file_analysis.method_count,
+                file_analysis.type_count,
+                file_analysis.import_count,
+                file_analysis.cognitive_complexity,
+                file_analysis.max_function_complexity,
                 file_analysis.diagnostics,
                 COALESCE(git_file_metrics.commits_per_file, 0),
                 COALESCE(git_file_metrics.total_added_lines, 0),
@@ -1504,7 +1641,6 @@ fn materialize_file_facts(
                 git_file_metrics.dominant_owner,
                 git_file_metrics.dominant_owner_share,
                 COALESCE(git_file_metrics.co_changed_file_count, 0),
-                NULL,
                 NULL,
                 NULL
             FROM file_analysis
@@ -2346,6 +2482,14 @@ mod tests {
             parser_status: FileParserStatus::Unsupported,
             parser_output: None,
             parser_recognition_attempts: 0,
+            language_id: None,
+            symbol_count: 0,
+            function_count: 0,
+            method_count: 0,
+            type_count: 0,
+            import_count: 0,
+            cognitive_complexity: None,
+            max_function_complexity: None,
         }
     }
 

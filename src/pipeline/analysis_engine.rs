@@ -10,7 +10,7 @@ use crate::pipeline::enumerator::{
     enumerate_repository, enumerate_repository_with_callbacks, EnumerationError, EnumerationResult,
 };
 use crate::pipeline::events::{PipelineEvent, PipelineState};
-use crate::pipeline::file_analyzer::FileAnalyzerOptions;
+use crate::pipeline::file_analyzer::{file_analyzer_options_signature, FileAnalyzerOptions};
 use crate::pipeline::git_history_analyzer::{
     collect_git_plan, git_options_signature, is_ancestor, revision_commit_count,
     GitHistoryAnalyzerOptions, GitHistoryScan,
@@ -141,7 +141,9 @@ impl AnalysisEngine {
         store_options.active_scan_id = active_scan_id;
         let store_reducer = StoreReducer::start(&self.root, store_options, event_sender.clone())?;
         let store_handle = store_reducer.handle();
-        let file_reuse_index = load_file_reuse_index(&self.root).unwrap_or_default();
+        let file_analysis_signature = file_analyzer_options_signature(&self.options.file_analyzer);
+        let file_reuse_index =
+            load_file_reuse_index(&self.root, &file_analysis_signature).unwrap_or_default();
         let scheduler = Scheduler::start_with_events(
             scheduler_options,
             Some(event_sender.clone()),
@@ -253,6 +255,7 @@ impl AnalysisEngine {
             "schema_version",
             crate::pipeline::store_reducer::INDEX_SCHEMA_VERSION,
         );
+        let _ = store_handle.store_scan_state("file_analysis_signature", file_analysis_signature);
         let _ = store_handle.store_scan_state("root", self.root.to_string_lossy());
         let _ = store_handle.store_scan_state("last_scan_completed", "1");
 

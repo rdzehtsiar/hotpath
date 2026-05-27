@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::cell::RefCell;
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
@@ -7,7 +8,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::languages::{LanguageParser, ParserOutput, ParserRecognition};
+use crate::languages::{go::GoParser, LanguageParser, ParserOutput, ParserRecognition};
+use crate::pipeline::code_metrics_analyzer::CodeMetricsAnalyzer;
 
 pub const DEFAULT_CONTENT_WINDOW_BYTES: usize = 1024 * 1024;
 
@@ -36,6 +38,7 @@ impl FileAnalyzer {
         let mut diagnostics = window.diagnostics.clone();
         let parser = self.parse(&file);
         let line_count = line_count_from_window(&window, &mut diagnostics);
+        let parser_metrics = parser.output.as_ref().map(parser_metrics);
 
         FileAnalysisResult {
             path: input.path,
@@ -49,6 +52,30 @@ impl FileAnalyzer {
             parser_status: parser.status,
             parser_output: parser.output,
             parser_recognition_attempts: parser.recognition_attempts,
+            language_id: parser_metrics
+                .as_ref()
+                .map(|metrics| metrics.language_id.clone()),
+            symbol_count: parser_metrics
+                .as_ref()
+                .map_or(0, |metrics| metrics.symbol_count),
+            function_count: parser_metrics
+                .as_ref()
+                .map_or(0, |metrics| metrics.function_count),
+            method_count: parser_metrics
+                .as_ref()
+                .map_or(0, |metrics| metrics.method_count),
+            type_count: parser_metrics
+                .as_ref()
+                .map_or(0, |metrics| metrics.type_count),
+            import_count: parser_metrics
+                .as_ref()
+                .map_or(0, |metrics| metrics.import_count),
+            cognitive_complexity: parser_metrics
+                .as_ref()
+                .map(|metrics| metrics.cognitive_complexity),
+            max_function_complexity: parser_metrics
+                .as_ref()
+                .map(|metrics| metrics.max_function_complexity),
         }
     }
 
@@ -108,9 +135,22 @@ impl Default for FileAnalyzerOptions {
     fn default() -> Self {
         Self {
             content_window_bytes: DEFAULT_CONTENT_WINDOW_BYTES,
-            parsers: Vec::new(),
+            parsers: vec![Arc::new(GoParser::new())],
         }
     }
+}
+
+pub fn file_analyzer_options_signature(options: &FileAnalyzerOptions) -> String {
+    format!(
+        "file-local-v2;content-window={};parsers={}",
+        options.content_window_bytes,
+        options
+            .parsers
+            .iter()
+            .map(|parser| parser.language_id())
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +171,14 @@ pub struct FileAnalysisResult {
     pub parser_status: FileParserStatus,
     pub parser_output: Option<ParserOutput>,
     pub parser_recognition_attempts: usize,
+    pub language_id: Option<String>,
+    pub symbol_count: u64,
+    pub function_count: u64,
+    pub method_count: u64,
+    pub type_count: u64,
+    pub import_count: u64,
+    pub cognitive_complexity: Option<u64>,
+    pub max_function_complexity: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +212,7 @@ pub struct AnalyzedFile {
     path: PathBuf,
     options: FileAnalyzerOptions,
     metadata: Option<FileMetadata>,
+    content_window: RefCell<Option<FileContentWindow>>,
 }
 
 impl AnalyzedFile {
@@ -174,6 +223,7 @@ impl AnalyzedFile {
             path,
             options,
             metadata,
+            content_window: RefCell::new(None),
         }
     }
 
@@ -186,6 +236,16 @@ impl AnalyzedFile {
     }
 
     pub fn first_content_window(&self) -> FileContentWindow {
+        if let Some(window) = self.content_window.borrow().as_ref() {
+            return window.clone();
+        }
+
+        let window = self.read_first_content_window();
+        *self.content_window.borrow_mut() = Some(window.clone());
+        window
+    }
+
+    fn read_first_content_window(&self) -> FileContentWindow {
         let mut diagnostics = Vec::new();
         let mut file = match fs::File::open(&self.path) {
             Ok(file) => file,
@@ -232,6 +292,49 @@ impl AnalyzedFile {
             truncated,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParserMetrics {
+    language_id: String,
+    symbol_count: u64,
+    function_count: u64,
+    method_count: u64,
+    type_count: u64,
+    import_count: u64,
+    cognitive_complexity: u64,
+    max_function_complexity: u64,
+}
+
+fn parser_metrics(output: &ParserOutput) -> ParserMetrics {
+    let complexity = CodeMetricsAnalyzer::new().analyze(&output.metrics_input);
+
+    ParserMetrics {
+        language_id: output.language_id.clone(),
+        symbol_count: output.symbols.len() as u64,
+        function_count: count_symbols(output, "function"),
+        method_count: count_symbols(output, "method"),
+        type_count: output
+            .symbols
+            .iter()
+            .filter(|symbol| matches!(symbol.kind.as_str(), "type" | "struct" | "interface"))
+            .count() as u64,
+        import_count: output
+            .references
+            .iter()
+            .filter(|reference| reference.kind == "import")
+            .count() as u64,
+        cognitive_complexity: complexity.cognitive_complexity,
+        max_function_complexity: complexity.max_function_complexity,
+    }
+}
+
+fn count_symbols(output: &ParserOutput, kind: &str) -> u64 {
+    output
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.kind == kind)
+        .count() as u64
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -368,7 +471,8 @@ mod tests {
         FileParserStatus, DEFAULT_CONTENT_WINDOW_BYTES,
     };
     use crate::languages::{
-        LanguageParser, ParserOutput, ParserRecognition, UniversalReference, UniversalSymbol,
+        LanguageParser, ParserOutput, ParserRecognition, UniversalCodeMetricsInput,
+        UniversalReference, UniversalSymbol,
     };
 
     static NEXT_FIXTURE_ID: AtomicUsize = AtomicUsize::new(0);
@@ -556,13 +660,38 @@ mod tests {
     fn empty_parser_registry_reports_unsupported_without_attempts() {
         let fixture = Fixture::new("empty-parser-registry");
         let path = fixture.write("main.go", b"package main\n");
-        let analyzer = FileAnalyzer::new();
+        let analyzer = FileAnalyzer::with_options(FileAnalyzerOptions {
+            content_window_bytes: DEFAULT_CONTENT_WINDOW_BYTES,
+            parsers: Vec::new(),
+        });
 
         let result = analyzer.analyze(FileAnalysisInput { path });
 
         assert_eq!(result.parser_status, FileParserStatus::Unsupported);
         assert_eq!(result.parser_recognition_attempts, 0);
         assert!(result.parser_output.is_none());
+    }
+
+    #[test]
+    fn default_analyzer_parses_go_and_computes_compact_metrics() {
+        let fixture = Fixture::new("default-go-parser");
+        let path = fixture.write(
+            "main.go",
+            b"package main\n\nimport \"fmt\"\n\ntype Service struct{}\n\nfunc main() {\n    if true {\n        fmt.Println(\"x\")\n    }\n}\n",
+        );
+        let analyzer = FileAnalyzer::new();
+
+        let result = analyzer.analyze(FileAnalysisInput { path });
+
+        assert_eq!(result.parser_status, FileParserStatus::Parsed);
+        assert_eq!(result.language_id.as_deref(), Some("go"));
+        assert_eq!(result.function_count, 1);
+        assert_eq!(result.method_count, 0);
+        assert_eq!(result.type_count, 1);
+        assert_eq!(result.import_count, 1);
+        assert!(result.symbol_count >= 2);
+        assert_eq!(result.cognitive_complexity, Some(1));
+        assert_eq!(result.max_function_complexity, Some(1));
     }
 
     #[test]
@@ -624,6 +753,7 @@ mod tests {
                     target: "dep".to_owned(),
                     kind: "import".to_owned(),
                 }],
+                metrics_input: UniversalCodeMetricsInput::default(),
                 diagnostics: Vec::new(),
                 limitations: Vec::new(),
             }

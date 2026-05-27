@@ -23,6 +23,7 @@ pub struct ParserOutput {
     pub language_id: String,
     pub symbols: Vec<UniversalSymbol>,
     pub references: Vec<UniversalReference>,
+    pub metrics_input: UniversalCodeMetricsInput,
     pub diagnostics: Vec<ParserDiagnostic>,
     pub limitations: Vec<ParserLimitation>,
 }
@@ -37,6 +38,41 @@ pub struct UniversalSymbol {
 pub struct UniversalReference {
     pub target: String,
     pub kind: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UniversalCodeMetricsInput {
+    pub functions: Vec<UniversalFunction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UniversalFunction {
+    pub name: String,
+    pub kind: UniversalFunctionKind,
+    pub control_flow: Vec<UniversalControlFlowNode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UniversalFunctionKind {
+    Function,
+    Method,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UniversalControlFlowNode {
+    pub kind: UniversalControlFlowKind,
+    pub children: Vec<UniversalControlFlowNode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UniversalControlFlowKind {
+    Branch,
+    ElseIf,
+    Loop,
+    Switch,
+    Case,
+    BooleanChain,
+    Jump,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,7 +92,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        LanguageParser, ParserOutput, ParserRecognition, UniversalReference, UniversalSymbol,
+        LanguageParser, ParserOutput, ParserRecognition, UniversalCodeMetricsInput,
+        UniversalReference, UniversalSymbol,
     };
     use crate::pipeline::file_analyzer::{AnalyzedFile, FileAnalyzerOptions};
 
@@ -86,6 +123,7 @@ mod tests {
                     target: "fmt".to_owned(),
                     kind: "import".to_owned(),
                 }],
+                metrics_input: UniversalCodeMetricsInput::default(),
                 diagnostics: Vec::new(),
                 limitations: Vec::new(),
             }
