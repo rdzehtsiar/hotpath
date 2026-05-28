@@ -188,6 +188,18 @@ impl StoreReducerHandle {
         })
     }
 
+    pub fn plan_records(&self, records: u64) -> Result<(), StoreReducerError> {
+        self.send(StoreMessage::PlannedRecords(records))
+    }
+
+    pub fn plan_file_records(&self, files: u64) -> Result<(), StoreReducerError> {
+        self.send(StoreMessage::PlannedFileRecords(files))
+    }
+
+    pub fn plan_finalization_records(&self) -> Result<(), StoreReducerError> {
+        self.send(StoreMessage::PlanFinalizationRecords)
+    }
+
     fn finish(&self) -> Result<(), StoreReducerError> {
         self.send(StoreMessage::Finish)
     }
@@ -243,6 +255,9 @@ enum StoreMessage {
     GitRepositorySummary(GitRepositorySummaryInput),
     StageMetadata { key: String, value: String },
     ScanState { key: String, value: String },
+    PlannedRecords(u64),
+    PlannedFileRecords(u64),
+    PlanFinalizationRecords,
     FileReused(PathBuf),
     MarkUnseenFilesInactive,
     ClearGitData,
@@ -252,6 +267,8 @@ enum StoreMessage {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StoreReducerStats {
     pub planned_records: u64,
+    pub planned_file_fact_rows: u64,
+    pub planned_finalization_records: u64,
     pub stored_records: u64,
     pub file_rows: u64,
     pub git_chunk_rows: u64,
@@ -476,6 +493,9 @@ struct StoreBatch {
     git_repository_summary: Option<GitRepositorySummaryInput>,
     metadata: Vec<(String, String)>,
     scan_state: Vec<(String, String)>,
+    planned_records: u64,
+    planned_file_records: u64,
+    plan_finalization_records: bool,
     reused_files: Vec<PathBuf>,
     mark_unseen_files_inactive: bool,
     clear_git_data: bool,
@@ -495,6 +515,11 @@ impl StoreBatch {
             }
             StoreMessage::StageMetadata { key, value } => self.metadata.push((key, value)),
             StoreMessage::ScanState { key, value } => self.scan_state.push((key, value)),
+            StoreMessage::PlannedRecords(records) => self.planned_records += records,
+            StoreMessage::PlannedFileRecords(files) => {
+                self.planned_file_records += files;
+            }
+            StoreMessage::PlanFinalizationRecords => self.plan_finalization_records = true,
             StoreMessage::FileReused(path) => self.reused_files.push(path),
             StoreMessage::MarkUnseenFilesInactive => self.mark_unseen_files_inactive = true,
             StoreMessage::ClearGitData => self.clear_git_data = true,
@@ -513,6 +538,15 @@ impl StoreBatch {
             + self.reused_files.len() as u64
     }
 
+    fn dynamic_planned_record_count(&self) -> u64 {
+        self.git_chunk_summaries.len() as u64
+            + self.git_file_metrics.len() as u64
+            + self.git_file_authors.len() as u64
+            + self.git_cochanges.len() as u64
+            + self.git_repository_deltas.len() as u64
+            + u64::from(self.git_repository_summary.is_some())
+    }
+
     fn total_len(&self) -> usize {
         self.file_results.len()
             + self.git_chunk_summaries.len()
@@ -522,6 +556,9 @@ impl StoreBatch {
             + self.git_repository_deltas.len()
             + self.metadata.len()
             + self.scan_state.len()
+            + usize::from(self.planned_records > 0)
+            + usize::from(self.planned_file_records > 0)
+            + usize::from(self.plan_finalization_records)
             + self.reused_files.len()
             + usize::from(self.git_repository_summary.is_some())
             + usize::from(self.mark_unseen_files_inactive)
@@ -1040,6 +1077,10 @@ fn flush_batch(
     }
 
     let progress_records = batch.progress_record_count();
+    let planned_file_fact_rows = batch.planned_file_records;
+    let planned_records = batch.planned_records
+        + planned_file_fact_rows.saturating_mul(2)
+        + batch.dynamic_planned_record_count();
     let file_rows = batch.file_results.len() as u64;
     let git_chunk_rows = batch.git_chunk_summaries.len() as u64;
     let git_file_metric_rows = batch.git_file_metrics.len() as u64;
@@ -1048,8 +1089,9 @@ fn flush_batch(
     let git_repository_delta_rows = batch.git_repository_deltas.len() as u64;
     let metadata_rows = batch.metadata.len() as u64;
     let reused_file_rows = batch.reused_files.len() as u64;
-    stats.planned_records += progress_records;
-    if progress_records > 0 {
+    stats.planned_records += planned_records;
+    stats.planned_file_fact_rows += planned_file_fact_rows;
+    if planned_records > 0 {
         let _ = event_sender.send(PipelineEvent::StoreRecordsPlanned {
             total_records: stats.planned_records,
         });
@@ -1246,6 +1288,11 @@ fn flush_batch(
     stats.git_repository_delta_rows += git_repository_delta_rows;
     stats.metadata_rows += metadata_rows;
     stats.file_rows += reused_file_rows;
+
+    if batch.plan_finalization_records {
+        plan_finalization_records(connection, stats, event_sender)?;
+    }
+
     *batch = StoreBatch::default();
 
     if progress_records > 0 {
@@ -1502,19 +1549,26 @@ fn finalize_git_tables(
     event_sender: &mpsc::Sender<PipelineEvent>,
     started: Instant,
 ) -> Result<(), StoreReducerError> {
-    let final_records = count_git_file_metric_rows(connection)?
-        + count_git_owner_rows_to_write(connection)?
-        + count_git_summary_rows(connection)?
-        + count_git_broad_metadata_rows(connection)?
-        + count_active_file_analysis_rows(connection)?;
+    let finalization_plan = finalization_record_plan(connection, stats)?;
+    let git_final_records = finalization_plan.git_final_records;
+    let materialized_file_records = finalization_plan.materialized_file_records;
+    let unplanned_materialized_file_records = finalization_plan.unplanned_materialized_file_records;
+    let final_records = git_final_records + materialized_file_records;
+    let final_planned_records = git_final_records
+        .saturating_sub(stats.planned_finalization_records)
+        + unplanned_materialized_file_records;
     if final_records == 0 {
         return Ok(());
     }
 
-    stats.planned_records += final_records;
-    let _ = event_sender.send(PipelineEvent::StoreRecordsPlanned {
-        total_records: stats.planned_records,
-    });
+    stats.planned_records += final_planned_records;
+    stats.planned_finalization_records +=
+        git_final_records.saturating_sub(stats.planned_finalization_records);
+    if final_planned_records > 0 {
+        let _ = event_sender.send(PipelineEvent::StoreRecordsPlanned {
+            total_records: stats.planned_records,
+        });
+    }
 
     let transaction = connection
         .transaction()
@@ -1535,6 +1589,56 @@ fn finalize_git_tables(
         elapsed: started.elapsed(),
     });
 
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FinalizationRecordPlan {
+    git_final_records: u64,
+    materialized_file_records: u64,
+    unplanned_materialized_file_records: u64,
+}
+
+fn finalization_record_plan(
+    connection: &Connection,
+    stats: &StoreReducerStats,
+) -> Result<FinalizationRecordPlan, StoreReducerError> {
+    let git_final_records = count_git_file_metric_rows(connection)?
+        + count_git_owner_rows_to_write(connection)?
+        + count_git_summary_rows(connection)?
+        + count_git_broad_metadata_rows(connection)?;
+    let materialized_file_records = count_active_file_analysis_rows(connection)?;
+    let unplanned_materialized_file_records =
+        materialized_file_records.saturating_sub(stats.planned_file_fact_rows);
+
+    Ok(FinalizationRecordPlan {
+        git_final_records,
+        materialized_file_records,
+        unplanned_materialized_file_records,
+    })
+}
+
+fn plan_finalization_records(
+    connection: &Connection,
+    stats: &mut StoreReducerStats,
+    event_sender: &mpsc::Sender<PipelineEvent>,
+) -> Result<(), StoreReducerError> {
+    let finalization_plan = finalization_record_plan(connection, stats)?;
+    let planned_records = finalization_plan
+        .git_final_records
+        .saturating_sub(stats.planned_finalization_records);
+
+    if planned_records == 0 {
+        return Ok(());
+    }
+
+    stats.planned_records += planned_records;
+    stats.planned_finalization_records += finalization_plan
+        .git_final_records
+        .saturating_sub(stats.planned_finalization_records);
+    let _ = event_sender.send(PipelineEvent::StoreRecordsPlanned {
+        total_records: stats.planned_records,
+    });
     Ok(())
 }
 

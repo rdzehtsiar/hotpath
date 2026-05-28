@@ -74,15 +74,15 @@ impl<W: Write> StdioReporter<W> {
     }
 
     fn render_now(&mut self, state: &PipelineState) {
-        let [files_line, git_line, store_line] =
+        let [files_line, git_line, elapsed_line] =
             render_report_lines_with_style(state, self.bar_style);
         if self.rendered_once {
             let _ = write!(
                 self.writer,
-                "\x1b[2A\r\x1b[2K{files_line}\n\r\x1b[2K{git_line}\n\r\x1b[2K{store_line}"
+                "\x1b[2A\r\x1b[2K{files_line}\n\r\x1b[2K{git_line}\n\r\x1b[2K{elapsed_line}"
             );
         } else {
-            let _ = write!(self.writer, "{files_line}\n{git_line}\n{store_line}");
+            let _ = write!(self.writer, "{files_line}\n{git_line}\n{elapsed_line}");
             self.rendered_once = true;
         }
         self.last_rendered_at = Some(Instant::now());
@@ -126,24 +126,22 @@ fn render_report_lines_with_style(state: &PipelineState, style: ProgressBarStyle
         "files/sec",
         style,
     );
+    let (git_processed, git_total) = if state.git_skipped {
+        (1, Some(1))
+    } else {
+        (state.git_commits_processed, state.total_git_commits)
+    };
     let git_line = render_progress_row(
         "git",
-        state.git_commits_processed,
-        state.total_git_commits,
+        git_processed,
+        git_total,
         state.git_commits_per_second(),
         "commits/sec",
         style,
     );
-    let store_line = render_progress_row(
-        "store",
-        state.stored_records,
-        state.store_planned_records,
-        state.store_records_per_second(),
-        "rows/sec",
-        style,
-    );
+    let elapsed_line = render_elapsed_row(state.total_elapsed);
 
-    [files_line, git_line, store_line]
+    [files_line, git_line, elapsed_line]
 }
 
 fn render_progress_row(
@@ -162,6 +160,24 @@ fn render_progress_row(
     format!(
         "{label:<5} {progress_bar} {processed:>COUNT_VALUE_WIDTH$}/{total_text:<TOTAL_VALUE_WIDTH$} | speed {speed:>SPEED_VALUE_WIDTH$.2} {speed_unit}"
     )
+}
+
+fn render_elapsed_row(elapsed: Duration) -> String {
+    format!("time  elapsed {}", format_elapsed(elapsed))
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    let total_seconds = elapsed.as_secs();
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    let centiseconds = elapsed.subsec_millis() / 10;
+
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{seconds:02}.{centiseconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}.{centiseconds:02}")
+    }
 }
 
 pub fn render_progress_bar(done: u64, total: u64, width: usize) -> String {
@@ -236,8 +252,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        render_progress_bar, render_report_lines, render_report_lines_with_style, PipelineReporter,
-        ProgressBarStyle, StdioReporter,
+        render_progress_bar, render_progress_row, render_report_lines,
+        render_report_lines_with_style, PipelineReporter, ProgressBarStyle, StdioReporter,
     };
     use crate::pipeline::events::PipelineState;
 
@@ -258,8 +274,7 @@ mod tests {
         assert!(lines[0].contains("speed       2.00 files/sec"));
         assert!(lines[1].starts_with("git"));
         assert!(lines[1].contains("        0/estimating"));
-        assert!(lines[2].starts_with("store"));
-        assert!(lines[2].contains("        0/estimating"));
+        assert!(lines[2].starts_with("time"));
     }
 
     #[test]
@@ -271,11 +286,8 @@ mod tests {
             total_git_commits: Some(4),
             total_git_chunks: Some(2),
             git_commits_processed: 1,
-            stored_records: 3,
-            store_planned_records: Some(7),
             analysis_elapsed: Duration::from_secs(1),
             git_elapsed: Duration::from_secs(1),
-            store_elapsed: Duration::from_secs(1),
             ..PipelineState::default()
         };
 
@@ -283,12 +295,12 @@ mod tests {
 
         assert!(lines[0].contains("        2/5"));
         assert!(lines[1].contains("        1/4"));
-        assert!(lines[2].contains("        3/7"));
+        assert!(lines[2].starts_with("time"));
         assert!(!lines.iter().any(|line| line.contains("remaining")));
         assert!(lines[1].contains("speed       1.00 commits/sec"));
-        assert!(lines[2].contains("speed       3.00 rows/sec"));
         let speed_columns: Vec<_> = lines
             .iter()
+            .take(2)
             .map(|line| {
                 line[..line.find("| speed").expect("speed column should exist")]
                     .chars()
@@ -296,7 +308,30 @@ mod tests {
             })
             .collect();
         assert_eq!(speed_columns[0], speed_columns[1]);
-        assert_eq!(speed_columns[1], speed_columns[2]);
+    }
+
+    #[test]
+    fn skipped_git_renders_as_complete() {
+        let state = PipelineState {
+            git_skipped: true,
+            git_completed: true,
+            ..PipelineState::default()
+        };
+
+        let lines = render_report_lines(&state);
+
+        assert!(lines[1].contains("        1/1"));
+        assert_eq!(
+            lines[1],
+            render_progress_row(
+                "git",
+                1,
+                Some(1),
+                0.0,
+                "commits/sec",
+                ProgressBarStyle::Unicode
+            )
+        );
     }
 
     #[test]

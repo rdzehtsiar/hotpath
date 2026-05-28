@@ -63,6 +63,7 @@ pub enum PipelineEvent {
         files_detected: u64,
         analyzed_files: u64,
         git_commits_processed: u64,
+        elapsed: Duration,
     },
 }
 
@@ -82,6 +83,7 @@ pub struct PipelineState {
     pub analysis_elapsed: Duration,
     pub git_elapsed: Duration,
     pub store_elapsed: Duration,
+    pub total_elapsed: Duration,
     pub git_completed: bool,
     pub git_skipped: bool,
     pub store_completed: bool,
@@ -105,6 +107,7 @@ impl Default for PipelineState {
             analysis_elapsed: Duration::ZERO,
             git_elapsed: Duration::ZERO,
             store_elapsed: Duration::ZERO,
+            total_elapsed: Duration::ZERO,
             git_completed: false,
             git_skipped: false,
             store_completed: false,
@@ -127,18 +130,34 @@ impl PipelineState {
                 self.enumerated_files = *files_detected;
                 self.entries_walked = *entries_walked;
                 self.enumeration_elapsed = *elapsed;
+                self.total_elapsed = self.total_elapsed.max(*elapsed);
             }
             PipelineEvent::FileDiscovered { .. } => {
                 self.enumerated_files += 1;
             }
-            PipelineEvent::TotalFilesCounted { files_detected, .. } => {
+            PipelineEvent::TotalFilesCounted {
+                files_detected,
+                elapsed,
+            } => {
                 self.total_files = Some(*files_detected);
+                self.store_planned_records = Some(
+                    self.store_planned_records
+                        .unwrap_or(0)
+                        .max(files_detected.saturating_mul(2)),
+                );
+                self.total_elapsed = self.total_elapsed.max(*elapsed);
             }
             PipelineEvent::EnumerationCompleted { result } => {
                 self.enumerated_files = result.files_detected;
                 self.entries_walked = result.entries_walked;
                 self.enumeration_elapsed = result.elapsed;
                 self.total_files = Some(result.files_detected);
+                self.store_planned_records = Some(
+                    self.store_planned_records
+                        .unwrap_or(0)
+                        .max(result.files_detected.saturating_mul(2)),
+                );
+                self.total_elapsed = self.total_elapsed.max(result.elapsed);
             }
             PipelineEvent::FileAnalysisCompleted {
                 analyzed_files,
@@ -146,6 +165,7 @@ impl PipelineState {
             } => {
                 self.analyzed_files = self.analyzed_files.max(*analyzed_files);
                 self.analysis_elapsed = self.analysis_elapsed.max(*elapsed);
+                self.total_elapsed = self.total_elapsed.max(*elapsed);
             }
             PipelineEvent::GitPlanningStarted => {
                 self.git_completed = false;
@@ -176,16 +196,25 @@ impl PipelineState {
                 self.git_commits_processed += *processed_commits;
                 self.git_file_changes += *file_changes;
                 self.git_elapsed = self.git_elapsed.max(*elapsed);
+                self.total_elapsed = self.total_elapsed.max(*elapsed);
             }
             PipelineEvent::GitHistoryChunkFailed { elapsed, .. } => {
                 self.git_elapsed = self.git_elapsed.max(*elapsed);
+                self.total_elapsed = self.total_elapsed.max(*elapsed);
             }
             PipelineEvent::GitHistoryCompleted {
                 processed_commits,
                 elapsed,
             } => {
                 self.git_commits_processed = self.git_commits_processed.max(*processed_commits);
+                if self
+                    .total_git_commits
+                    .is_some_and(|total| self.git_commits_processed != total)
+                {
+                    self.total_git_commits = Some(self.git_commits_processed);
+                }
                 self.git_elapsed = self.git_elapsed.max(*elapsed);
+                self.total_elapsed = self.total_elapsed.max(*elapsed);
                 self.git_completed = true;
             }
             PipelineEvent::StoreRecordsPlanned { total_records } => {
@@ -198,6 +227,7 @@ impl PipelineState {
             } => {
                 self.stored_records = self.stored_records.max(*stored_records);
                 self.store_elapsed = self.store_elapsed.max(*elapsed);
+                self.total_elapsed = self.total_elapsed.max(*elapsed);
             }
             PipelineEvent::StoreCompleted {
                 stored_records,
@@ -205,20 +235,29 @@ impl PipelineState {
             } => {
                 self.stored_records = self.stored_records.max(*stored_records);
                 self.store_elapsed = self.store_elapsed.max(*elapsed);
+                self.total_elapsed = self.total_elapsed.max(*elapsed);
                 self.store_completed = true;
             }
             PipelineEvent::ScanCompleted {
                 files_detected,
                 analyzed_files,
                 git_commits_processed,
+                elapsed,
             } => {
                 self.total_files = Some(*files_detected);
                 self.enumerated_files = *files_detected;
                 self.analyzed_files = *analyzed_files;
                 self.git_commits_processed = self.git_commits_processed.max(*git_commits_processed);
+                if self
+                    .total_git_commits
+                    .is_some_and(|total| self.git_commits_processed != total)
+                {
+                    self.total_git_commits = Some(self.git_commits_processed);
+                }
                 self.git_completed = true;
                 self.store_completed = true;
                 self.scan_completed = true;
+                self.total_elapsed = self.total_elapsed.max(*elapsed);
             }
         }
     }
@@ -424,20 +463,20 @@ mod tests {
             files_detected: 3,
             elapsed: Duration::from_secs(1),
         });
-        assert_eq!(state.store_remaining_records(), None);
+        assert_eq!(state.store_remaining_records(), Some(6));
 
         state.apply(&PipelineEvent::GitPlanningCompleted {
             total_commits: 5,
             total_chunks: 2,
         });
-        state.apply(&PipelineEvent::StoreRecordsPlanned { total_records: 5 });
+        state.apply(&PipelineEvent::StoreRecordsPlanned { total_records: 8 });
         state.apply(&PipelineEvent::StoreBatchFlushed {
             stored_records: 4,
             elapsed: Duration::from_secs(2),
         });
 
-        assert_eq!(state.store_display_total(), 5);
-        assert_eq!(state.store_remaining_records(), Some(1));
+        assert_eq!(state.store_display_total(), 8);
+        assert_eq!(state.store_remaining_records(), Some(4));
         assert_eq!(state.store_records_per_second(), 2.0);
     }
 

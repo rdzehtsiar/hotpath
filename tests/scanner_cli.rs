@@ -77,11 +77,10 @@ fn scan_prints_file_and_git_progress_summary() {
     assert!(!final_lines[0].contains("remaining"));
     assert!(final_lines[0].ends_with(" files/sec"));
     assert!(final_lines[1].starts_with("git"));
-    assert!(final_lines[1].contains("0/0"));
+    assert!(final_lines[1].contains("1/1"));
     assert!(final_lines[1].contains("commits/sec"));
-    assert!(final_lines[2].starts_with("store"));
-    assert!(!final_lines[2].contains("remaining"));
-    assert!(final_lines[2].contains("rows/sec"));
+    assert!(final_lines[2].starts_with("time"));
+    assert!(final_lines[2].contains("elapsed"));
 
     let connection =
         Connection::open(fixture.path.join(".hotpath").join("index.sqlite")).expect("db opens");
@@ -103,8 +102,7 @@ fn scan_respects_ignore_rules_in_file_count() {
     assert!(final_lines[0].starts_with("files"));
     assert!(final_lines[0].contains("2/2"));
     assert!(final_lines[1].starts_with("git"));
-    assert!(final_lines[2].starts_with("store"));
-    assert!(!final_lines[2].contains("remaining"));
+    assert!(final_lines[2].starts_with("time"));
 }
 
 #[test]
@@ -133,8 +131,7 @@ fn scan_reports_git_progress_for_git_repository() {
     assert!(final_lines[1].starts_with("git"));
     assert!(final_lines[1].contains("2/2"));
     assert!(final_lines[1].contains("commits/sec"));
-    assert!(final_lines[2].starts_with("store"));
-    assert!(!final_lines[2].contains("remaining"));
+    assert!(final_lines[2].starts_with("time"));
 
     let connection =
         Connection::open(fixture.path().join(".hotpath").join("index.sqlite")).expect("db opens");

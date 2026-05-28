@@ -535,7 +535,11 @@ pub fn bounded_commit_count(
     head_timestamp: i64,
     options: &GitHistoryAnalyzerOptions,
 ) -> Result<u64, GitHistoryError> {
-    let mut args = vec!["rev-list".to_owned(), "--count".to_owned()];
+    let mut args = vec![
+        "rev-list".to_owned(),
+        "--count".to_owned(),
+        "--first-parent".to_owned(),
+    ];
     if let Some(max_age_days) = options.max_age_days {
         let cutoff = head_timestamp - max_age_days.max(0) * SECONDS_PER_DAY;
         args.push(format!("--since=@{cutoff}"));
@@ -550,7 +554,7 @@ pub fn bounded_commit_count(
 }
 
 pub fn revision_commit_count(root: &Path, revision: &str) -> Result<u64, GitHistoryError> {
-    let count = git_stdout(root, ["rev-list", "--count", revision])?;
+    let count = git_stdout(root, ["rev-list", "--count", "--first-parent", revision])?;
     Ok(count.trim().parse::<u64>().unwrap_or(0))
 }
 

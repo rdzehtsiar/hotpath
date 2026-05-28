@@ -199,6 +199,7 @@ impl AnalysisEngine {
         .map_err(AnalysisEngineError::Enumeration);
 
         if let Ok(result) = &result {
+            let _ = store_handle.plan_file_records(result.files_detected);
             dispatcher
                 .borrow_mut()
                 .emit(PipelineEvent::EnumerationCompleted {
@@ -258,6 +259,7 @@ impl AnalysisEngine {
         let _ = store_handle.store_scan_state("file_analysis_signature", file_analysis_signature);
         let _ = store_handle.store_scan_state("root", self.root.to_string_lossy());
         let _ = store_handle.store_scan_state("last_scan_completed", "1");
+        let _ = store_handle.plan_finalization_records();
 
         let (store_finish_sender, store_finish_receiver) = mpsc::channel();
         thread::spawn(move || {
@@ -286,6 +288,7 @@ impl AnalysisEngine {
                 files_detected: result.files_detected,
                 analyzed_files: stats.processed_file_tasks as u64 + reused_file_count.get(),
                 git_commits_processed: stats.processed_git_commits as u64,
+                elapsed: scan_started.elapsed(),
             });
         }
 
@@ -311,6 +314,7 @@ fn spawn_git_planner(
                     skip_reason: Some("not a git worktree".to_owned()),
                     ..GitRepositorySummaryInput::default()
                 });
+                let _ = store_handle.plan_finalization_records();
                 let _ = event_sender.send(PipelineEvent::GitHistorySkipped {
                     reason: "not a git worktree".to_owned(),
                 });
@@ -324,6 +328,7 @@ fn spawn_git_planner(
                     is_skipped: true,
                     skip_reason: Some("shallow repository".to_owned()),
                 });
+                let _ = store_handle.plan_finalization_records();
                 let _ = event_sender.send(PipelineEvent::GitHistorySkipped {
                     reason: "shallow repository".to_owned(),
                 });
@@ -428,6 +433,7 @@ fn spawn_git_planner(
                         });
                     }
                 } else {
+                    let _ = store_handle.plan_finalization_records();
                     let _ = event_sender.send(PipelineEvent::GitHistorySkipped {
                         reason: "Git already indexed at current HEAD".to_owned(),
                     });
@@ -443,6 +449,7 @@ fn spawn_git_planner(
                     skip_reason: Some(error.to_string()),
                     ..GitRepositorySummaryInput::default()
                 });
+                let _ = store_handle.plan_finalization_records();
                 let _ = event_sender.send(PipelineEvent::GitHistorySkipped {
                     reason: error.to_string(),
                 });
