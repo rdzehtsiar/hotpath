@@ -251,6 +251,10 @@ impl AnalysisEngine {
             "git_commits_processed",
             stats.processed_git_commits.to_string(),
         );
+        let _ = store_handle.store_metadata(
+            "git_scan_commits_processed",
+            stats.processed_git_commits.to_string(),
+        );
         let _ = store_handle.mark_unseen_files_inactive();
         let _ = store_handle.store_scan_state(
             "schema_version",
@@ -309,17 +313,22 @@ fn spawn_git_planner(
         let options_signature = git_options_signature(&git_history_options);
         match collect_git_plan(&root, &git_history_options) {
             Ok(None) => {
+                let _ = store_handle.clear_git_data();
                 let _ = store_handle.store_git_repository_summary(GitRepositorySummaryInput {
                     is_skipped: true,
                     skip_reason: Some("not a git worktree".to_owned()),
                     ..GitRepositorySummaryInput::default()
                 });
+                let _ = store_handle.store_metadata("git_mode", "skipped_not_git");
+                let _ = store_handle.store_metadata("git_scan_mode", "skipped_not_git");
+                let _ = store_handle.store_metadata("git_collection_mode", "unavailable");
                 let _ = store_handle.plan_finalization_records();
                 let _ = event_sender.send(PipelineEvent::GitHistorySkipped {
                     reason: "not a git worktree".to_owned(),
                 });
             }
             Ok(Some(plan)) if plan.is_shallow => {
+                let _ = store_handle.clear_git_data();
                 let _ = store_handle.store_git_repository_summary(GitRepositorySummaryInput {
                     head_commit: plan.head_commit,
                     head_timestamp: plan.head_timestamp,
@@ -328,6 +337,9 @@ fn spawn_git_planner(
                     is_skipped: true,
                     skip_reason: Some("shallow repository".to_owned()),
                 });
+                let _ = store_handle.store_metadata("git_mode", "skipped_shallow");
+                let _ = store_handle.store_metadata("git_scan_mode", "skipped_shallow");
+                let _ = store_handle.store_metadata("git_collection_mode", "unavailable");
                 let _ = store_handle.plan_finalization_records();
                 let _ = event_sender.send(PipelineEvent::GitHistorySkipped {
                     reason: "shallow repository".to_owned(),
@@ -336,7 +348,7 @@ fn spawn_git_planner(
             Ok(Some(plan)) => {
                 let head_timestamp = plan.head_timestamp.unwrap_or_default();
                 let current_head = plan.head_commit.clone();
-                let mut git_mode = "full".to_owned();
+                let mut git_scan_mode = "full".to_owned();
                 let mut revision = None;
                 let mut planned_git_commits = plan.total_commits;
                 let mut should_run_git = true;
@@ -349,19 +361,19 @@ fn spawn_git_planner(
                         (previous_head, current_head.as_deref())
                     {
                         if previous_head == current_head {
-                            git_mode = "skipped".to_owned();
+                            git_scan_mode = "up_to_date".to_owned();
                             should_run_git = false;
                         } else if is_ancestor(&root, previous_head, current_head).unwrap_or(false) {
-                            git_mode = "incremental".to_owned();
+                            git_scan_mode = "incremental".to_owned();
                             let range = format!("{previous_head}..{current_head}");
                             planned_git_commits = revision_commit_count(&root, &range).ok();
                             revision = Some(range);
                         } else {
-                            git_mode = "fallback_full".to_owned();
+                            git_scan_mode = "fallback_full".to_owned();
                             let _ = store_handle.clear_git_data();
                         }
                     } else {
-                        git_mode = "fallback_full".to_owned();
+                        git_scan_mode = "fallback_full".to_owned();
                         let _ = store_handle.clear_git_data();
                     }
                 } else {
@@ -376,7 +388,8 @@ fn spawn_git_planner(
                     is_skipped: false,
                     skip_reason: None,
                 });
-                let _ = store_handle.store_metadata("git_mode", git_mode.clone());
+                let _ = store_handle.store_metadata("git_mode", git_scan_mode.clone());
+                let _ = store_handle.store_metadata("git_scan_mode", git_scan_mode.clone());
                 let _ = store_handle.store_metadata("git_collection_mode", "bounded_recent_stream");
                 let _ = store_handle.store_metadata(
                     "git_max_commits",
@@ -410,12 +423,12 @@ fn spawn_git_planner(
                         root: root.clone(),
                         revision,
                         head_timestamp,
-                        max_commits: if git_mode == "incremental" {
+                        max_commits: if git_scan_mode == "incremental" {
                             None
                         } else {
                             git_history_options.max_commits
                         },
-                        max_age_days: if git_mode == "incremental" {
+                        max_age_days: if git_scan_mode == "incremental" {
                             None
                         } else {
                             git_history_options.max_age_days
@@ -444,11 +457,15 @@ fn spawn_git_planner(
                 let _ = store_handle.store_scan_state("git_options_signature", options_signature);
             }
             Err(error) => {
+                let _ = store_handle.clear_git_data();
                 let _ = store_handle.store_git_repository_summary(GitRepositorySummaryInput {
                     is_skipped: true,
                     skip_reason: Some(error.to_string()),
                     ..GitRepositorySummaryInput::default()
                 });
+                let _ = store_handle.store_metadata("git_mode", "skipped_error");
+                let _ = store_handle.store_metadata("git_scan_mode", "skipped_error");
+                let _ = store_handle.store_metadata("git_collection_mode", "unavailable");
                 let _ = store_handle.plan_finalization_records();
                 let _ = event_sender.send(PipelineEvent::GitHistorySkipped {
                     reason: error.to_string(),

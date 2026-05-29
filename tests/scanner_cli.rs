@@ -162,7 +162,35 @@ fn second_scan_skips_git_when_head_is_unchanged() {
             &connection,
             "SELECT value FROM stage_metadata WHERE key = 'git_mode'",
         ),
-        "skipped"
+        "up_to_date"
+    );
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_scan_mode'",
+        ),
+        "up_to_date"
+    );
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_scan_commits_processed'",
+        ),
+        "0"
+    );
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_index_status'",
+        ),
+        "available"
+    );
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_indexed_commits'",
+        ),
+        "1"
     );
     assert_eq!(
         scalar_text(

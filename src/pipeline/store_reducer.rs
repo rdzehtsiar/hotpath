@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use rusqlite::{params, Connection};
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::pipeline::events::PipelineEvent;
 use crate::pipeline::file_analyzer::{
@@ -611,7 +611,7 @@ fn reducer_loop(
                     started,
                     options.active_scan_id,
                 )?;
-                finalize_git_tables(&mut connection, &mut stats, &event_sender, started)?;
+                finalize_git_tables(&root, &mut connection, &mut stats, &event_sender, started)?;
                 let _ = event_sender.send(PipelineEvent::StoreCompleted {
                     stored_records: stats.stored_records,
                     elapsed: started.elapsed(),
@@ -653,7 +653,7 @@ fn reducer_loop(
                     started,
                     options.active_scan_id,
                 )?;
-                finalize_git_tables(&mut connection, &mut stats, &event_sender, started)?;
+                finalize_git_tables(&root, &mut connection, &mut stats, &event_sender, started)?;
                 let _ = event_sender.send(PipelineEvent::StoreCompleted {
                     stored_records: stats.stored_records,
                     elapsed: started.elapsed(),
@@ -816,6 +816,49 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
                 value TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS source_dependency_references (
+                source_path TEXT NOT NULL,
+                source_package TEXT NOT NULL,
+                language_id TEXT,
+                reference_index INTEGER NOT NULL,
+                reference_kind TEXT NOT NULL,
+                raw_target TEXT NOT NULL,
+                resolved_package TEXT,
+                is_resolved INTEGER NOT NULL DEFAULT 0,
+                active_scan_id INTEGER NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (source_path, reference_index)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_source_dependency_references_active
+                ON source_dependency_references(active_scan_id, is_active);
+            CREATE INDEX IF NOT EXISTS idx_source_dependency_references_resolved
+                ON source_dependency_references(resolved_package);
+
+            CREATE TABLE IF NOT EXISTS source_file_packages (
+                file_path TEXT PRIMARY KEY NOT NULL,
+                package_path TEXT NOT NULL,
+                language_id TEXT,
+                active_scan_id INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_source_file_packages_package
+                ON source_file_packages(package_path);
+
+            CREATE TABLE IF NOT EXISTS source_dependency_edges (
+                source_path TEXT NOT NULL,
+                source_package TEXT NOT NULL,
+                target_package TEXT NOT NULL,
+                reference_kind TEXT NOT NULL,
+                active_scan_id INTEGER NOT NULL,
+                PRIMARY KEY (source_path, target_package, reference_kind)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_source_dependency_edges_source_path
+                ON source_dependency_edges(source_path);
+            CREATE INDEX IF NOT EXISTS idx_source_dependency_edges_target_package
+                ON source_dependency_edges(target_package);
+
             CREATE TABLE IF NOT EXISTS file_facts (
                 path TEXT PRIMARY KEY NOT NULL,
                 relative_path TEXT,
@@ -963,6 +1006,8 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
         "max_function_complexity",
         "INTEGER",
     )?;
+    add_column_if_missing(connection, "file_facts", "source_coupling_in", "INTEGER")?;
+    add_column_if_missing(connection, "file_facts", "source_coupling_out", "INTEGER")?;
     add_column_if_missing(
         connection,
         "git_chunks",
@@ -1063,6 +1108,29 @@ fn relative_path(root: &Path, path: &Path) -> String {
         .join("/")
 }
 
+fn package_path(relative_path: &str) -> String {
+    Path::new(relative_path)
+        .parent()
+        .map(|parent| {
+            parent
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .filter(|package| !package.is_empty())
+        .unwrap_or_else(|| ".".to_owned())
+}
+
+fn normalize_package_path(value: &str) -> String {
+    let normalized = value.trim().trim_matches('/').replace('\\', "/");
+    if normalized.is_empty() {
+        ".".to_owned()
+    } else {
+        normalized
+    }
+}
+
 fn flush_batch(
     root: &Path,
     connection: &mut Connection,
@@ -1138,10 +1206,11 @@ fn flush_batch(
 
         for result in &batch.file_results {
             let metadata = file_identity(&result.path);
+            let result_relative_path = relative_path(root, &result.path);
             file_statement
                 .execute(params![
                     result.path.to_string_lossy(),
-                    relative_path(root, &result.path),
+                    result_relative_path.as_str(),
                     metadata
                         .as_ref()
                         .map(|identity| identity.byte_size as i64)
@@ -1170,6 +1239,8 @@ fn flush_batch(
         }
     }
 
+    write_source_dependency_references(&transaction, root, &batch.file_results, active_scan_id)?;
+
     {
         let mut reused_statement = transaction
             .prepare(
@@ -1181,8 +1252,19 @@ fn flush_batch(
             )
             .map_err(StoreReducerError::WriteDatabase)?;
         for path in &batch.reused_files {
+            let reused_relative_path = relative_path(root, path);
             reused_statement
                 .execute(params![path.to_string_lossy(), active_scan_id])
+                .map_err(StoreReducerError::WriteDatabase)?;
+            transaction
+                .execute(
+                    "
+                    UPDATE source_dependency_references
+                    SET active_scan_id = ?2, is_active = 1
+                    WHERE source_path = ?1
+                    ",
+                    params![reused_relative_path, active_scan_id],
+                )
                 .map_err(StoreReducerError::WriteDatabase)?;
         }
     }
@@ -1274,6 +1356,16 @@ fn flush_batch(
                 params![active_scan_id],
             )
             .map_err(StoreReducerError::WriteDatabase)?;
+        transaction
+            .execute(
+                "
+                UPDATE source_dependency_references
+                SET is_active = 0
+                WHERE active_scan_id <> ?1
+                ",
+                params![active_scan_id],
+            )
+            .map_err(StoreReducerError::WriteDatabase)?;
     }
 
     transaction
@@ -1300,6 +1392,67 @@ fn flush_batch(
             stored_records: stats.stored_records,
             elapsed: started.elapsed(),
         });
+    }
+
+    Ok(())
+}
+
+fn write_source_dependency_references(
+    transaction: &rusqlite::Transaction<'_>,
+    root: &Path,
+    file_results: &[FileAnalysisResult],
+    active_scan_id: i64,
+) -> Result<(), StoreReducerError> {
+    let mut delete_statement = transaction
+        .prepare(
+            "
+            DELETE FROM source_dependency_references
+            WHERE source_path = ?1
+            ",
+        )
+        .map_err(StoreReducerError::WriteDatabase)?;
+    let mut insert_statement = transaction
+        .prepare(
+            "
+            INSERT INTO source_dependency_references (
+                source_path,
+                source_package,
+                language_id,
+                reference_index,
+                reference_kind,
+                raw_target,
+                resolved_package,
+                is_resolved,
+                active_scan_id,
+                is_active
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 0, ?7, 1)
+            ",
+        )
+        .map_err(StoreReducerError::WriteDatabase)?;
+
+    for result in file_results {
+        let source_path = relative_path(root, &result.path);
+        delete_statement
+            .execute(params![source_path])
+            .map_err(StoreReducerError::WriteDatabase)?;
+
+        let Some(parser_output) = result.parser_output.as_ref() else {
+            continue;
+        };
+        let source_package = package_path(&source_path);
+        for (index, reference) in parser_output.references.iter().enumerate() {
+            insert_statement
+                .execute(params![
+                    source_path,
+                    source_package,
+                    parser_output.language_id.as_str(),
+                    index as i64,
+                    reference.kind.as_str(),
+                    reference.target.as_str(),
+                    active_scan_id,
+                ])
+                .map_err(StoreReducerError::WriteDatabase)?;
+        }
     }
 
     Ok(())
@@ -1544,6 +1697,7 @@ fn write_git_repository_deltas(
 }
 
 fn finalize_git_tables(
+    root: &Path,
     connection: &mut Connection,
     stats: &mut StoreReducerStats,
     event_sender: &mpsc::Sender<PipelineEvent>,
@@ -1578,6 +1732,7 @@ fn finalize_git_tables(
     finalize_git_file_metrics(&transaction)?;
     finalize_git_file_owners(&transaction)?;
     finalize_git_broad_commit_metadata(&transaction)?;
+    finalize_source_dependencies(root, &transaction)?;
     materialize_file_facts(&transaction)?;
     transaction
         .commit()
@@ -1658,6 +1813,226 @@ fn finalize_git_broad_commit_metadata(
         )
         .map(|_| ())
         .map_err(StoreReducerError::WriteDatabase)
+}
+
+fn finalize_source_dependencies(
+    root: &Path,
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), StoreReducerError> {
+    let module_prefix = read_go_module_prefix(root);
+    let mut package_statement = transaction
+        .prepare(
+            "
+            SELECT relative_path, language_id, active_scan_id
+            FROM file_analysis
+            WHERE is_active = 1
+                AND language_id = 'go'
+                AND relative_path IS NOT NULL
+            ",
+        )
+        .map_err(StoreReducerError::WriteDatabase)?;
+    let package_rows = package_statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(StoreReducerError::WriteDatabase)?;
+
+    let mut file_packages = Vec::new();
+    let mut known_packages = BTreeSet::new();
+    for row in package_rows {
+        let (file_path, language_id, active_scan_id) =
+            row.map_err(StoreReducerError::WriteDatabase)?;
+        let package_path = package_path(&file_path);
+        known_packages.insert(package_path.clone());
+        file_packages.push((file_path, package_path, language_id, active_scan_id));
+    }
+
+    transaction
+        .execute_batch(
+            "
+            DELETE FROM source_file_packages;
+            DELETE FROM source_dependency_edges;
+            UPDATE source_dependency_references
+            SET resolved_package = NULL, is_resolved = 0
+            WHERE is_active = 1;
+            ",
+        )
+        .map_err(StoreReducerError::WriteDatabase)?;
+
+    {
+        let mut statement = transaction
+            .prepare(
+                "
+                INSERT INTO source_file_packages (
+                    file_path,
+                    package_path,
+                    language_id,
+                    active_scan_id
+                ) VALUES (?1, ?2, ?3, ?4)
+                ",
+            )
+            .map_err(StoreReducerError::WriteDatabase)?;
+        for (file_path, package_path, language_id, active_scan_id) in &file_packages {
+            statement
+                .execute(params![
+                    file_path,
+                    package_path,
+                    language_id.as_deref(),
+                    active_scan_id,
+                ])
+                .map_err(StoreReducerError::WriteDatabase)?;
+        }
+    }
+
+    let mut reference_statement = transaction
+        .prepare(
+            "
+            SELECT
+                source_path,
+                source_package,
+                reference_index,
+                reference_kind,
+                raw_target,
+                active_scan_id
+            FROM source_dependency_references
+            WHERE is_active = 1
+                AND language_id = 'go'
+                AND reference_kind = 'import'
+            ORDER BY source_path, reference_index
+            ",
+        )
+        .map_err(StoreReducerError::WriteDatabase)?;
+    let references = reference_statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(StoreReducerError::WriteDatabase)?;
+
+    let mut resolved_references = Vec::new();
+    for reference in references {
+        let (source_path, source_package, reference_index, reference_kind, raw_target, scan_id) =
+            reference.map_err(StoreReducerError::WriteDatabase)?;
+        if let Some(target_package) =
+            resolve_go_import(&raw_target, module_prefix.as_deref(), &known_packages)
+        {
+            resolved_references.push((
+                source_path,
+                source_package,
+                reference_index,
+                reference_kind,
+                target_package,
+                scan_id,
+            ));
+        }
+    }
+
+    {
+        let mut update_statement = transaction
+            .prepare(
+                "
+                UPDATE source_dependency_references
+                SET resolved_package = ?3, is_resolved = 1
+                WHERE source_path = ?1 AND reference_index = ?2
+                ",
+            )
+            .map_err(StoreReducerError::WriteDatabase)?;
+        let mut edge_statement = transaction
+            .prepare(
+                "
+                INSERT OR IGNORE INTO source_dependency_edges (
+                    source_path,
+                    source_package,
+                    target_package,
+                    reference_kind,
+                    active_scan_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                ",
+            )
+            .map_err(StoreReducerError::WriteDatabase)?;
+
+        for (
+            source_path,
+            source_package,
+            reference_index,
+            reference_kind,
+            target_package,
+            scan_id,
+        ) in resolved_references
+        {
+            update_statement
+                .execute(params![source_path, reference_index, target_package])
+                .map_err(StoreReducerError::WriteDatabase)?;
+            edge_statement
+                .execute(params![
+                    source_path,
+                    source_package,
+                    target_package,
+                    reference_kind,
+                    scan_id,
+                ])
+                .map_err(StoreReducerError::WriteDatabase)?;
+        }
+    }
+
+    transaction
+        .execute(
+            "
+            INSERT OR REPLACE INTO stage_metadata (key, value)
+            VALUES
+                ('source_dependency_edges_materialized', CAST((SELECT COUNT(*) FROM source_dependency_edges) AS TEXT)),
+                ('source_dependency_resolver_version', '1')
+            ",
+            [],
+        )
+        .map(|_| ())
+        .map_err(StoreReducerError::WriteDatabase)
+}
+
+fn read_go_module_prefix(root: &Path) -> Option<String> {
+    let contents = fs::read_to_string(root.join("go.mod")).ok()?;
+    contents.lines().find_map(|line| {
+        let line = line.trim();
+        line.strip_prefix("module ")
+            .map(str::trim)
+            .filter(|module| !module.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn resolve_go_import(
+    raw_target: &str,
+    module_prefix: Option<&str>,
+    known_packages: &BTreeSet<String>,
+) -> Option<String> {
+    let mut candidates = Vec::new();
+    let raw_target = raw_target.trim();
+
+    if let Some(module_prefix) = module_prefix {
+        if raw_target == module_prefix {
+            candidates.push(".".to_owned());
+        } else if let Some(stripped) = raw_target
+            .strip_prefix(module_prefix)
+            .and_then(|value| value.strip_prefix('/'))
+        {
+            candidates.push(normalize_package_path(stripped));
+        }
+    }
+
+    candidates.push(normalize_package_path(raw_target));
+    candidates
+        .into_iter()
+        .find(|candidate| known_packages.contains(candidate))
 }
 
 fn materialize_file_facts(
@@ -1745,11 +2120,29 @@ fn materialize_file_facts(
                 git_file_metrics.dominant_owner,
                 git_file_metrics.dominant_owner_share,
                 COALESCE(git_file_metrics.co_changed_file_count, 0),
-                NULL,
-                NULL
+                COALESCE(source_in.source_coupling_in, 0),
+                COALESCE(source_out.source_coupling_out, 0)
             FROM file_analysis
             LEFT JOIN git_file_metrics
                 ON file_analysis.relative_path = git_file_metrics.path
+            LEFT JOIN source_file_packages
+                ON file_analysis.relative_path = source_file_packages.file_path
+            LEFT JOIN (
+                SELECT
+                    target_package,
+                    COUNT(DISTINCT source_path) AS source_coupling_in
+                FROM source_dependency_edges
+                GROUP BY target_package
+            ) source_in
+                ON source_file_packages.package_path = source_in.target_package
+            LEFT JOIN (
+                SELECT
+                    source_path,
+                    COUNT(DISTINCT target_package) AS source_coupling_out
+                FROM source_dependency_edges
+                GROUP BY source_path
+            ) source_out
+                ON file_analysis.relative_path = source_out.source_path
             WHERE file_analysis.is_active = 1;
 
             INSERT OR REPLACE INTO stage_metadata (key, value)
@@ -1765,7 +2158,7 @@ fn finalize_git_repository_summary(
     transaction: &rusqlite::Transaction<'_>,
 ) -> Result<(), StoreReducerError> {
     transaction
-        .execute(
+        .execute_batch(
             "
             UPDATE git_repository_summary
             SET
@@ -1775,9 +2168,32 @@ fn finalize_git_repository_summary(
                     THEN max((head_timestamp - first_commit_timestamp) / 86400, 0)
                     ELSE NULL
                 END
-            WHERE id = 1
+            WHERE id = 1;
+
+            INSERT OR REPLACE INTO stage_metadata (key, value)
+            SELECT 'git_index_status',
+                CASE
+                    WHEN is_skipped = 1 THEN 'unavailable'
+                    ELSE 'available'
+                END
+            FROM git_repository_summary
+            WHERE id = 1;
+
+            INSERT OR REPLACE INTO stage_metadata (key, value)
+            SELECT 'git_indexed_commits', CAST(total_commits AS TEXT)
+            FROM git_repository_summary
+            WHERE id = 1;
+
+            INSERT OR REPLACE INTO stage_metadata (key, value)
+            SELECT 'git_index_head', COALESCE(head_commit, '')
+            FROM git_repository_summary
+            WHERE id = 1;
+
+            INSERT OR REPLACE INTO stage_metadata (key, value)
+            SELECT 'git_index_skip_reason', COALESCE(skip_reason, '')
+            FROM git_repository_summary
+            WHERE id = 1;
             ",
-            [],
         )
         .map(|_| ())
         .map_err(StoreReducerError::WriteDatabase)
@@ -2143,6 +2559,7 @@ mod tests {
     use super::{
         GitRepositorySummaryInput, StoreReducer, StoreReducerOptions, DEFAULT_STORE_QUEUE_CAPACITY,
     };
+    use crate::languages::{ParserOutput, UniversalCodeMetricsInput, UniversalReference};
     use crate::pipeline::events::PipelineEvent;
     use crate::pipeline::file_analyzer::{ContentKind, FileAnalysisResult, FileParserStatus};
     use crate::pipeline::git_history_analyzer::{
@@ -2205,6 +2622,9 @@ mod tests {
         assert_eq!(table_count(&connection, "file_analysis"), 1);
         assert_eq!(table_count(&connection, "git_chunks"), 1);
         assert_eq!(table_count(&connection, "stage_metadata"), 1);
+        assert_eq!(table_count(&connection, "source_dependency_references"), 1);
+        assert_eq!(table_count(&connection, "source_dependency_edges"), 1);
+        assert_eq!(table_count(&connection, "source_file_packages"), 1);
         assert_eq!(table_count(&connection, "file_facts"), 1);
     }
 
@@ -2498,6 +2918,162 @@ mod tests {
     }
 
     #[test]
+    fn resolves_local_go_imports_and_materializes_source_coupling() {
+        let fixture = Fixture::new("source-coupling");
+        fs::write(fixture.path.join("go.mod"), "module example.com/app\n")
+            .expect("go.mod should be written");
+        write_fixture_file(&fixture.path, "src/a.go");
+        write_fixture_file(&fixture.path, "pkg/service/service.go");
+        write_fixture_file(&fixture.path, "pkg/direct/direct.go");
+
+        let (event_sender, _event_receiver) = mpsc::channel();
+        let reducer =
+            StoreReducer::start(&fixture.path, StoreReducerOptions::default(), event_sender)
+                .expect("reducer should start");
+        let handle = reducer.handle();
+
+        handle
+            .store_file_analysis(file_result_with_imports(
+                fixture.path.join("src/a.go"),
+                &["example.com/app/pkg/service", "pkg/direct", "fmt"],
+            ))
+            .expect("source file should enqueue");
+        handle
+            .store_file_analysis(file_result_with_imports(
+                fixture.path.join("pkg/service/service.go"),
+                &[],
+            ))
+            .expect("service file should enqueue");
+        handle
+            .store_file_analysis(file_result_with_imports(
+                fixture.path.join("pkg/direct/direct.go"),
+                &[],
+            ))
+            .expect("direct file should enqueue");
+
+        reducer.finish().expect("reducer should finish");
+
+        let connection = Connection::open(fixture.db_path()).expect("db should open");
+        assert_eq!(row_count(&connection, "source_dependency_references"), 3);
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT COUNT(*) FROM source_dependency_references WHERE is_resolved = 1",
+            ),
+            2
+        );
+        assert_eq!(row_count(&connection, "source_dependency_edges"), 2);
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT source_coupling_out FROM file_facts WHERE relative_path = 'src/a.go'",
+            ),
+            2
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT source_coupling_in FROM file_facts WHERE relative_path = 'pkg/service/service.go'",
+            ),
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT source_coupling_in FROM file_facts WHERE relative_path = 'pkg/direct/direct.go'",
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn reanalyzed_files_replace_previous_source_references() {
+        let fixture = Fixture::new("source-reference-replace");
+        write_fixture_file(&fixture.path, "src/a.go");
+        write_fixture_file(&fixture.path, "pkg/old/old.go");
+        write_fixture_file(&fixture.path, "pkg/new/new.go");
+
+        let (first_event_sender, _first_event_receiver) = mpsc::channel();
+        let first_reducer = StoreReducer::start(
+            &fixture.path,
+            StoreReducerOptions {
+                active_scan_id: 1,
+                ..StoreReducerOptions::default()
+            },
+            first_event_sender,
+        )
+        .expect("first reducer should start");
+        first_reducer
+            .handle()
+            .store_file_analysis(file_result_with_imports(
+                fixture.path.join("src/a.go"),
+                &["pkg/old"],
+            ))
+            .expect("first source should enqueue");
+        first_reducer
+            .handle()
+            .store_file_analysis(file_result_with_imports(
+                fixture.path.join("pkg/old/old.go"),
+                &[],
+            ))
+            .expect("old package should enqueue");
+        first_reducer.finish().expect("first reducer should finish");
+
+        let (second_event_sender, _second_event_receiver) = mpsc::channel();
+        let second_reducer = StoreReducer::start(
+            &fixture.path,
+            StoreReducerOptions {
+                active_scan_id: 2,
+                ..StoreReducerOptions::default()
+            },
+            second_event_sender,
+        )
+        .expect("second reducer should start");
+        let second_handle = second_reducer.handle();
+        second_handle
+            .store_file_analysis(file_result_with_imports(
+                fixture.path.join("src/a.go"),
+                &["pkg/new"],
+            ))
+            .expect("second source should enqueue");
+        second_handle
+            .store_file_analysis(file_result_with_imports(
+                fixture.path.join("pkg/new/new.go"),
+                &[],
+            ))
+            .expect("new package should enqueue");
+        second_handle
+            .mark_unseen_files_inactive()
+            .expect("inactive marker should enqueue");
+        second_reducer
+            .finish()
+            .expect("second reducer should finish");
+
+        let connection = Connection::open(fixture.db_path()).expect("db should open");
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT COUNT(*) FROM source_dependency_references WHERE raw_target = 'pkg/old'",
+            ),
+            0
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT COUNT(*) FROM source_dependency_edges WHERE target_package = 'pkg/new'",
+            ),
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT source_coupling_out FROM file_facts WHERE relative_path = 'src/a.go'",
+            ),
+            1
+        );
+    }
+
+    #[test]
     fn materialized_file_facts_exclude_inactive_files() {
         let fixture = Fixture::new("file-facts-active");
         fs::write(fixture.path.join("active.go"), "package main\n")
@@ -2595,6 +3171,36 @@ mod tests {
             cognitive_complexity: None,
             max_function_complexity: None,
         }
+    }
+
+    fn file_result_with_imports(path: impl AsRef<Path>, imports: &[&str]) -> FileAnalysisResult {
+        let mut result = file_result(path);
+        result.parser_status = FileParserStatus::Parsed;
+        result.language_id = Some("go".to_owned());
+        result.import_count = imports.len() as u64;
+        result.parser_output = Some(ParserOutput {
+            language_id: "go".to_owned(),
+            symbols: Vec::new(),
+            references: imports
+                .iter()
+                .map(|target| UniversalReference {
+                    target: (*target).to_owned(),
+                    kind: "import".to_owned(),
+                })
+                .collect(),
+            metrics_input: UniversalCodeMetricsInput::default(),
+            diagnostics: Vec::new(),
+            limitations: Vec::new(),
+        });
+        result
+    }
+
+    fn write_fixture_file(root: &Path, relative_path: &str) {
+        let path = root.join(relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("fixture parent should be created");
+        }
+        fs::write(path, "package fixture\n").expect("fixture file should be written");
     }
 
     fn table_count(connection: &Connection, table: &str) -> i64 {

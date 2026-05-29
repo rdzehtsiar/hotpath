@@ -142,7 +142,7 @@ impl Default for FileAnalyzerOptions {
 
 pub fn file_analyzer_options_signature(options: &FileAnalyzerOptions) -> String {
     format!(
-        "file-local-v2;content-window={};parsers={}",
+        "file-local-v3-source-refs;content-window={};parsers={}",
         options.content_window_bytes,
         options
             .parsers
