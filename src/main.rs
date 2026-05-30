@@ -18,6 +18,8 @@ struct Cli {
 enum Commands {
     /// Enumerate repository files and print scan throughput.
     Scan,
+    /// Open the read-only Hotpath terminal UI for the current index.
+    Tui,
 }
 
 fn main() -> ExitCode {
@@ -25,6 +27,17 @@ fn main() -> ExitCode {
 
     match cli.command {
         Commands::Scan => run_scan(),
+        Commands::Tui => run_tui(),
+    }
+}
+
+fn run_tui() -> ExitCode {
+    match hotpath::tui::run_tui() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("hotpath: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 

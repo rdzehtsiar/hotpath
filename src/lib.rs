@@ -2,3 +2,4 @@
 
 pub mod languages;
 pub mod pipeline;
+pub mod tui;

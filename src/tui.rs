@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::env;
-use std::error::Error as StdError;
-use std::fmt;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -20,973 +15,11 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
-use serde::Deserialize;
-use serde_json::json;
+use rusqlite::{Connection, OpenFlags};
 
-use crate::complexity::{self, ComplexityReport, ComplexitySummary, ComplexitySymbolRecord};
-use crate::dependency::{self, FileDependencyFan, ResolvedDependencyEdge};
-use crate::git;
-use crate::operation_log;
-use crate::ownership::OperationalOwnershipSnapshot;
-use crate::report::{self, Report, ReportFinding, ReportHotspot};
-use crate::scoring::{
-    FormulaVersion, NormalizedMetric, NormalizedScoreMetrics, RawScoreMetrics, ScoreLimitation,
-    WeightedTerm,
-};
-use crate::storage;
-use crate::{
-    estimate_context, parse, ranked_hotspot_scores_from_scan_and_git, ContextBudgetStatus,
-    ContextOptions, ContextSkippedReason, FileRecord, ParseImportRecord, ParseReport, ParseSummary,
-    ParseSymbolRecord, ScanError, ScanReport, ScanSummary,
-};
-
-type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
-#[cfg(test)]
-const TUI_PROGRESS_THROTTLE: Duration = Duration::from_millis(750);
-#[cfg(test)]
-const TUI_PROGRESS_PERCENT_STEP: u64 = 2;
-const TUI_HOTSPOT_PAGE_SIZE: u64 = 200;
-const TUI_INSPECTOR_LOADING_DELAY: Duration = Duration::from_millis(150);
-const TUI_INSPECTOR_TIMEOUT: Duration = Duration::from_millis(1_500);
-const TUI_PAGE_TIMEOUT: Duration = Duration::from_millis(2_000);
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TuiOptions {
-    pub context: ContextOptions,
-    pub include_generated_hotspots: bool,
-    pub ascii: bool,
-    pub no_color: bool,
-}
-
-pub fn run_tui() -> io::Result<()> {
-    run_tui_with_options(TuiOptions::default())
-}
-
-pub fn run_tui_with_options(options: TuiOptions) -> io::Result<()> {
-    let snapshot = TuiSnapshot::loading_with_options(options);
-    let initial_index = open_initial_index_mode(options);
-    let mut terminal = TerminalSession::enter()?;
-    run_app(terminal.terminal_mut(), snapshot, initial_index, options)
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-enum TuiWorkerMessage {
-    Progress(TuiProgressUpdate),
-}
-
-#[derive(Debug)]
-struct TuiDataClient {
-    sender: mpsc::Sender<TuiDataRequest>,
-    receiver: mpsc::Receiver<TuiDataResponse>,
-    next_request_id: u64,
-}
-
-#[derive(Debug)]
-enum TuiDataRequest {
-    LoadPage {
-        request_id: u64,
-        offset: u64,
-        limit: u64,
-        include_generated_hotspots: bool,
-        query: Option<String>,
-    },
-    LoadInspector {
-        request_id: u64,
-        path: String,
-        include_generated_hotspots: bool,
-    },
-}
-
-#[derive(Debug)]
-enum TuiDataResponse {
-    Page {
-        request_id: u64,
-        result: Result<TuiHotspotPage, String>,
-    },
-    Inspector {
-        request_id: u64,
-        path: String,
-        result: Box<Result<Option<TuiIndexInspector>, String>>,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TuiPendingKind {
-    Page,
-    Inspector,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TuiPendingRequest {
-    request_id: u64,
-    started_at: Instant,
-    kind: TuiPendingKind,
-    detail: String,
-}
-
-impl TuiDataClient {
-    fn start(worktree_root: PathBuf) -> Self {
-        let (request_sender, request_receiver) = mpsc::channel();
-        let (response_sender, response_receiver) = mpsc::channel();
-        thread::spawn(move || {
-            run_tui_data_worker(worktree_root, request_receiver, response_sender)
-        });
-
-        Self {
-            sender: request_sender,
-            receiver: response_receiver,
-            next_request_id: 1,
-        }
-    }
-
-    fn next_request_id(&mut self) -> u64 {
-        let request_id = self.next_request_id;
-        self.next_request_id = self.next_request_id.saturating_add(1);
-        request_id
-    }
-}
-
-fn run_tui_data_worker(
-    worktree_root: PathBuf,
-    receiver: mpsc::Receiver<TuiDataRequest>,
-    sender: mpsc::Sender<TuiDataResponse>,
-) {
-    let store = storage::index::IndexStore::open_read_only_fast(&worktree_root);
-    for request in receiver {
-        match request {
-            TuiDataRequest::LoadPage {
-                request_id,
-                offset,
-                limit,
-                include_generated_hotspots,
-                query,
-            } => {
-                let result = store
-                    .as_ref()
-                    .map_err(ToString::to_string)
-                    .and_then(|store| {
-                        load_index_hotspot_page_from_store(
-                            store,
-                            offset,
-                            limit,
-                            include_generated_hotspots,
-                            query.as_deref(),
-                        )
-                        .map_err(|error| error.to_string())
-                    });
-                let _ = sender.send(TuiDataResponse::Page { request_id, result });
-            }
-            TuiDataRequest::LoadInspector {
-                request_id,
-                path,
-                include_generated_hotspots,
-            } => {
-                let result = store
-                    .as_ref()
-                    .map_err(ToString::to_string)
-                    .and_then(|store| {
-                        load_index_inspector_from_store(store, &path, include_generated_hotspots)
-                            .map_err(|error| error.to_string())
-                    });
-                let _ = sender.send(TuiDataResponse::Inspector {
-                    request_id,
-                    path,
-                    result: Box::new(result),
-                });
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TuiProgressUpdate {
-    phase: &'static str,
-    detail: String,
-    completed: Option<u64>,
-    total: Option<u64>,
-    unit: &'static str,
-    rate: Option<TuiProgressRate>,
-    started_at: Option<Instant>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TuiProgressRate {
-    completed_at_start: u64,
-    started_at: Instant,
-}
-
-impl TuiProgressUpdate {
-    fn indeterminate(phase: &'static str, detail: impl Into<String>) -> Self {
-        Self {
-            phase,
-            detail: detail.into(),
-            completed: None,
-            total: None,
-            unit: "",
-            rate: None,
-            started_at: None,
-        }
-    }
-
-    fn measured(
-        phase: &'static str,
-        detail: impl Into<String>,
-        completed: u64,
-        total: u64,
-        unit: &'static str,
-    ) -> Self {
-        Self {
-            phase,
-            detail: detail.into(),
-            completed: Some(completed),
-            total: Some(total),
-            unit,
-            rate: None,
-            started_at: None,
-        }
-    }
-}
-
-#[cfg(test)]
-struct TuiProgressEmitter {
-    sender: mpsc::Sender<TuiWorkerMessage>,
-    last_emit: Option<Instant>,
-    last_phase: Option<&'static str>,
-    last_percent: Option<u64>,
-    phase_started_at: Option<Instant>,
-    phase_started_completed: Option<u64>,
-}
-
-#[cfg(test)]
-impl TuiProgressEmitter {
-    fn new(sender: mpsc::Sender<TuiWorkerMessage>) -> Self {
-        Self {
-            sender,
-            last_emit: None,
-            last_phase: None,
-            last_percent: None,
-            phase_started_at: None,
-            phase_started_completed: None,
-        }
-    }
-
-    fn emit(&mut self, mut update: TuiProgressUpdate) {
-        if !self.should_emit(&update) {
-            return;
-        }
-
-        let now = Instant::now();
-        if self.last_phase != Some(update.phase) {
-            self.phase_started_at = None;
-            self.phase_started_completed = None;
-        }
-        if let Some(completed) = update.completed {
-            if self.phase_started_at.is_none() || self.phase_started_completed.is_none() {
-                self.phase_started_at = Some(now);
-                self.phase_started_completed = Some(completed);
-            }
-            if let (Some(started_at), Some(started_completed)) =
-                (self.phase_started_at, self.phase_started_completed)
-            {
-                update.rate = Some(TuiProgressRate {
-                    completed_at_start: started_completed.min(completed),
-                    started_at,
-                });
-            }
-        } else if self.phase_started_at.is_none() {
-            self.phase_started_at = Some(now);
-        }
-        update.started_at = self.phase_started_at;
-
-        self.last_emit = Some(now);
-        self.last_phase = Some(update.phase);
-        self.last_percent = progress_percent(&update);
-        let _ = self.sender.send(TuiWorkerMessage::Progress(update));
-    }
-
-    fn should_emit(&self, update: &TuiProgressUpdate) -> bool {
-        if self.last_phase != Some(update.phase) {
-            return true;
-        }
-
-        if progress_percent(update) == Some(100) {
-            return true;
-        }
-
-        if let (Some(current), Some(previous)) = (progress_percent(update), self.last_percent) {
-            if current.saturating_sub(previous) >= TUI_PROGRESS_PERCENT_STEP {
-                return true;
-            }
-        }
-
-        self.last_emit
-            .is_none_or(|last| last.elapsed() >= TUI_PROGRESS_THROTTLE)
-    }
-}
-
-fn progress_percent(update: &TuiProgressUpdate) -> Option<u64> {
-    let completed = update.completed?;
-    let total = update.total?;
-    completed
-        .saturating_mul(100)
-        .checked_div(total)
-        .map(|percent| percent.min(100))
-}
-
-fn scan_progress_update(progress: crate::ScanProgress) -> TuiProgressUpdate {
-    match progress.total {
-        Some(total) => TuiProgressUpdate::measured(
-            "Scanning repository",
-            progress.detail,
-            progress.completed,
-            total,
-            progress.unit,
-        ),
-        None => TuiProgressUpdate::indeterminate(
-            "Scanning repository",
-            format!(
-                "{}{}{} {}",
-                progress.detail, HOTSPOT_TAG_SEPARATOR, progress.completed, progress.unit
-            ),
-        ),
-    }
-}
-
-fn persist_progress_update(progress: storage::index::PersistProgress) -> TuiProgressUpdate {
-    TuiProgressUpdate::measured(
-        "Writing index",
-        progress.detail,
-        progress.completed,
-        progress.total,
-        progress.unit,
-    )
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct TuiSnapshot {
-    pub report: Report,
-    pub scan: TuiScanSnapshot,
-    pub symbols: TuiSymbolSnapshot,
-    pub complexity: TuiComplexitySnapshot,
-    pub coupling: TuiCouplingSnapshot,
-    pub ownership: TuiOwnershipSnapshot,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TuiScanSnapshot {
-    pub summary: ScanSummary,
-    pub files: Vec<FileRecord>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TuiSymbolSnapshot {
-    pub summary: ParseSummary,
-    pub symbols: Vec<ParseSymbolRecord>,
-    pub imports: Vec<ParseImportRecord>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TuiComplexitySnapshot {
-    pub summary: ComplexitySummary,
-    pub symbols: Vec<ComplexitySymbolRecord>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TuiCouplingSnapshot {
-    pub edges: Vec<ResolvedDependencyEdge>,
-    pub fan_by_file: Vec<TuiFileFan>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TuiFileFan {
-    pub path: String,
-    pub fan_in: u64,
-    pub fan_out: u64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct TuiOwnershipSnapshot {
-    pub by_file: Vec<TuiFileOwnership>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct TuiFileOwnership {
-    pub path: String,
-    pub owners: Vec<TuiOwnerShare>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct TuiOwnerShare {
-    pub author: String,
-    pub touch_count: u64,
-    pub share: f64,
-}
-
-#[derive(Debug)]
-pub enum TuiSnapshotError {
-    CurrentDir(io::Error),
-    Git(git::GitHistoryError),
-    Scan(ScanError),
-    PersistGitAnalysis(storage::index::IndexError),
-    PersistHotspots(storage::index::IndexError),
-    PersistScan(storage::index::IndexError),
-    PersistSymbols(storage::index::IndexError),
-}
-
-impl TuiSnapshot {
-    pub fn loading_with_options(options: TuiOptions) -> Self {
-        let scan = ScanReport {
-            status: "loading",
-            file_walking: "pending",
-            classification: "pending",
-            warnings: Vec::new(),
-            files: Vec::new(),
-        };
-        let parse = parse::scaffold_report_from_scan(&scan);
-        let complexity = complexity::report_from_parse(&parse);
-        let context = estimate_context(&scan.files, options.context);
-        let report = report::report_from_scan_analysis(
-            &scan,
-            &git::GitAnalysis {
-                worktree_root: env::current_dir().unwrap_or_else(|_| ".".into()),
-                head_commit_id: "loading".to_owned(),
-                head_commit_time: 0,
-                recent_window_days: git::RECENT_CHURN_WINDOW_DAYS,
-                changes: Vec::new(),
-                file_metrics: Vec::new(),
-                co_changes: Vec::new(),
-                ownership: OperationalOwnershipSnapshot::default(),
-            },
-            context,
-            Vec::new(),
-            vec![ReportFinding {
-                code: "hotpath.tui.loading",
-                level: report::ReportFindingLevel::Info,
-                path: None,
-                message: "Opening the local Hotpath index".to_owned(),
-                rank: None,
-                score: None,
-            }],
-        );
-
-        Self::from_parts(report, scan, parse, complexity)
-    }
-
-    pub fn load_current_dir() -> Result<Self, TuiSnapshotError> {
-        Self::load_current_dir_with_options(TuiOptions::default())
-    }
-
-    pub fn load_current_dir_with_options(options: TuiOptions) -> Result<Self, TuiSnapshotError> {
-        Self::load_current_dir_with_progress(options, |_| {})
-    }
-
-    fn load_current_dir_with_progress<F>(
-        options: TuiOptions,
-        mut progress: F,
-    ) -> Result<Self, TuiSnapshotError>
-    where
-        F: FnMut(TuiProgressUpdate),
-    {
-        let current_dir = env::current_dir().map_err(TuiSnapshotError::CurrentDir)?;
-        progress(TuiProgressUpdate::indeterminate(
-            "Opening repository",
-            "discovering Git worktree",
-        ));
-        let worktree_root = git::worktree_root_at(&current_dir)?;
-        progress(TuiProgressUpdate::indeterminate(
-            "Opening repository",
-            "opening local analysis index",
-        ));
-        let read_git_cache = RefCell::new(
-            storage::index::IndexStore::open(&worktree_root)
-                .map_err(TuiSnapshotError::PersistScan)?,
-        );
-        let (cache_write_sender, cache_write_receiver) =
-            crossbeam_channel::bounded::<Vec<(String, Vec<git::GitFileChange>)>>(8);
-        let cache_write_root = worktree_root.clone();
-        progress(TuiProgressUpdate::indeterminate(
-            "Opening repository",
-            "starting Git cache writer",
-        ));
-        let cache_writer = thread::spawn(move || {
-            let Ok(mut write_cache) = storage::index::IndexStore::open(&cache_write_root) else {
-                return;
-            };
-            for commits in cache_write_receiver {
-                let _ = write_cache
-                    .persist_git_commit_changes_batch(git::GIT_HISTORY_CACHE_VERSION, &commits);
-            }
-        });
-        progress(TuiProgressUpdate::indeterminate(
-            "Git history",
-            "counting reachable commits",
-        ));
-        let analyzer_version = git::GIT_HISTORY_CACHE_VERSION;
-        let analysis = git::analyze_from_head_at_with_progress_and_cache_batches(
-            &worktree_root,
-            |git_progress| {
-                progress(TuiProgressUpdate::measured(
-                    "Git history",
-                    "diffing reachable commits",
-                    git_progress.completed_commits as u64,
-                    git_progress.total_commits as u64,
-                    "commits",
-                ));
-            },
-            |commit_ids| {
-                read_git_cache
-                    .borrow()
-                    .cached_git_commit_changes_batch(commit_ids, analyzer_version)
-                    .ok()
-                    .unwrap_or_default()
-            },
-            |commits| {
-                if !commits.is_empty() {
-                    let _ = cache_write_sender.send(commits.to_vec());
-                }
-            },
-        );
-        drop(cache_write_sender);
-        let _ = cache_writer.join();
-        let analysis = analysis?;
-        progress(TuiProgressUpdate::measured(
-            "Git history",
-            "diffing reachable commits",
-            analysis.changes.len() as u64,
-            analysis.changes.len() as u64,
-            "changes",
-        ));
-        progress(TuiProgressUpdate::indeterminate(
-            "Scanning repository",
-            "walking files and classifying content",
-        ));
-        let scan =
-            crate::scan_repository_with_progress(&analysis.worktree_root, |scan_progress| {
-                progress(scan_progress_update(scan_progress));
-            })?;
-        progress(TuiProgressUpdate::measured(
-            "Scanning repository",
-            "walking files and classifying content",
-            scan.files.len() as u64,
-            scan.files.len() as u64,
-            "files",
-        ));
-        progress(TuiProgressUpdate::indeterminate(
-            "Parsing symbols",
-            "preparing parser candidates",
-        ));
-        let parse = parse::report_from_scan_with_progress(
-            &analysis.worktree_root,
-            &scan,
-            |parse_progress| {
-                progress(TuiProgressUpdate::measured(
-                    "Parsing symbols",
-                    parse_progress.path,
-                    parse_progress.completed_files as u64,
-                    parse_progress.total_files as u64,
-                    "files",
-                ));
-            },
-        );
-        progress(TuiProgressUpdate::indeterminate(
-            "Complexity",
-            "building symbol, complexity, and coupling facts",
-        ));
-        let complexity = complexity::report_from_parse(&parse);
-        progress(TuiProgressUpdate::indeterminate(
-            "Scoring hotspots",
-            "ranking files by advisory risk",
-        ));
-        let ranked = ranked_hotspot_scores_from_scan_and_git(&scan.files, &analysis);
-        let context = estimate_context(&scan.files, options.context);
-        let hotspots = ranked.iter().map(ReportHotspot::from).collect::<Vec<_>>();
-        let findings = hotspots.iter().map(ReportFinding::from).collect::<Vec<_>>();
-        progress(TuiProgressUpdate::indeterminate(
-            "Writing index",
-            "persisting scan, parser, Git, and hotspot facts",
-        ));
-        let mut index = storage::index::IndexStore::open(&analysis.worktree_root)
-            .map_err(TuiSnapshotError::PersistScan)?;
-        let scan_run = index
-            .persist_scan_with_progress(&scan, |persist_progress| {
-                progress(persist_progress_update(persist_progress));
-            })
-            .map_err(TuiSnapshotError::PersistScan)?;
-        index
-            .persist_symbols_with_progress(&parse, |persist_progress| {
-                progress(persist_progress_update(persist_progress));
-            })
-            .map_err(TuiSnapshotError::PersistSymbols)?;
-        index
-            .persist_git_analysis_with_progress(
-                &analysis.head_commit_id,
-                analysis.head_commit_time,
-                analysis.recent_window_days as u64,
-                &analysis.file_metrics,
-                &analysis.co_changes,
-                |persist_progress| {
-                    progress(persist_progress_update(persist_progress));
-                },
-            )
-            .map_err(TuiSnapshotError::PersistGitAnalysis)?;
-        index
-            .persist_hotspots_with_progress(scan_run.id, &ranked, |persist_progress| {
-                progress(persist_progress_update(persist_progress));
-            })
-            .map_err(TuiSnapshotError::PersistHotspots)?;
-        let mut report =
-            report::report_from_scan_analysis(&scan, &analysis, context, hotspots, findings);
-        if !options.include_generated_hotspots {
-            suppress_generated_hotspots(&scan.files, &mut report);
-        }
-
-        let mut snapshot = Self::from_parts(report, scan, parse, complexity);
-        snapshot.ownership = TuiOwnershipSnapshot::from_operational_ownership(&analysis.ownership);
-        progress(TuiProgressUpdate::indeterminate(
-            "Ready",
-            "repository analysis complete",
-        ));
-
-        Ok(snapshot)
-    }
-
-    pub fn from_parts(
-        report: Report,
-        scan: ScanReport,
-        parse: ParseReport,
-        complexity: ComplexityReport,
-    ) -> Self {
-        let edges = dependency::resolve_dependencies(&parse);
-        let fan = dependency::fan_metrics(&parse.files, &edges);
-
-        Self {
-            report: sorted_report(report),
-            scan: TuiScanSnapshot::from_scan(scan),
-            symbols: TuiSymbolSnapshot::from_parse(parse),
-            complexity: TuiComplexitySnapshot::from_complexity(complexity),
-            coupling: TuiCouplingSnapshot::from_dependency_facts(edges, fan.by_path),
-            ownership: TuiOwnershipSnapshot::default(),
-        }
-    }
-}
-
-impl TuiOwnershipSnapshot {
-    fn from_operational_ownership(ownership: &OperationalOwnershipSnapshot) -> Self {
-        let by_file = ownership
-            .by_file
-            .iter()
-            .map(|file| {
-                let mut owners = file
-                    .owners
-                    .iter()
-                    .map(|owner| TuiOwnerShare {
-                        author: owner.author.clone(),
-                        touch_count: owner.meaningful_commits,
-                        share: owner.share,
-                    })
-                    .collect::<Vec<_>>();
-                if file.others_share > 0.0 {
-                    owners.push(TuiOwnerShare {
-                        author: "others".to_owned(),
-                        touch_count: 1,
-                        share: file.others_share,
-                    });
-                }
-
-                TuiFileOwnership {
-                    path: file.path.clone(),
-                    owners,
-                }
-            })
-            .collect();
-
-        Self { by_file }
-    }
-}
-
-impl TuiScanSnapshot {
-    fn from_scan(scan: ScanReport) -> Self {
-        let mut files = scan.files;
-        files.sort_by(|left, right| left.path.cmp(&right.path));
-        let summary = ScanReport {
-            status: scan.status,
-            file_walking: scan.file_walking,
-            classification: scan.classification,
-            warnings: scan.warnings,
-            files: files.clone(),
-        }
-        .summary();
-
-        Self { summary, files }
-    }
-}
-
-impl TuiSymbolSnapshot {
-    fn from_parse(parse: ParseReport) -> Self {
-        let mut symbols = parse.symbols;
-        let mut imports = parse.imports;
-        parse::sort_symbol_records(&mut symbols);
-        parse::sort_import_records(&mut imports);
-        let summary = ParseReport {
-            warnings: parse.warnings,
-            files: parse.files,
-            symbols: symbols.clone(),
-            imports: imports.clone(),
-        }
-        .summary();
-
-        Self {
-            summary,
-            symbols,
-            imports,
-        }
-    }
-}
-
-impl TuiComplexitySnapshot {
-    fn from_complexity(complexity: ComplexityReport) -> Self {
-        let mut symbols = complexity.symbols;
-        complexity::sort_symbol_records(&mut symbols);
-
-        Self {
-            summary: complexity.summary,
-            symbols,
-        }
-    }
-}
-
-impl TuiCouplingSnapshot {
-    fn from_dependency_facts(
-        mut edges: Vec<ResolvedDependencyEdge>,
-        fan_by_path: BTreeMap<String, FileDependencyFan>,
-    ) -> Self {
-        edges.sort();
-        let fan_by_file = fan_by_path
-            .into_iter()
-            .map(|(path, fan)| TuiFileFan {
-                path,
-                fan_in: fan.fan_in,
-                fan_out: fan.fan_out,
-            })
-            .collect();
-
-        Self { edges, fan_by_file }
-    }
-}
-
-fn sorted_report(mut report: Report) -> Report {
-    report.hotspots.sort_by(|left, right| {
-        left.rank
-            .cmp(&right.rank)
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    report.context.groups.sort_by(|left, right| {
-        right
-            .estimated_tokens
-            .cmp(&left.estimated_tokens)
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    report
-        .context
-        .skipped
-        .sort_by(|left, right| left.path.cmp(&right.path));
-    report.findings.sort_by(|left, right| {
-        (&left.path, left.code, left.rank).cmp(&(&right.path, right.code, right.rank))
-    });
-
-    report
-}
-
-fn suppress_generated_hotspots(files: &[FileRecord], report: &mut Report) {
-    report.hotspots.retain(|hotspot| {
-        files
-            .iter()
-            .find(|file| file.path == hotspot.path)
-            .is_none_or(|file| !is_suppressed_hotspot_file(file))
-    });
-    for (index, hotspot) in report.hotspots.iter_mut().enumerate() {
-        hotspot.rank = index as u64 + 1;
-    }
-    report.summary.hotspot_count = report.hotspots.len() as u64;
-    report.findings = report.hotspots.iter().map(ReportFinding::from).collect();
-}
-
-fn is_suppressed_hotspot_file(file: &FileRecord) -> bool {
-    file.is_generated
-        || file.is_vendor
-        || is_lockfile_path(&file.path)
-        || is_minified_path(&file.path)
-}
-
-fn is_lockfile_path(path: &str) -> bool {
-    matches!(
-        path.rsplit('/').next().unwrap_or(path),
-        "Cargo.lock"
-            | "package-lock.json"
-            | "yarn.lock"
-            | "pnpm-lock.yaml"
-            | "bun.lockb"
-            | "Gemfile.lock"
-            | "poetry.lock"
-            | "Pipfile.lock"
-            | "composer.lock"
-            | "go.sum"
-            | "flake.lock"
-    )
-}
-
-fn is_minified_path(path: &str) -> bool {
-    path.rsplit('/').next().unwrap_or(path).contains(".min.")
-}
-
-impl fmt::Display for TuiSnapshotError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::CurrentDir(source) => {
-                write!(f, "failed to determine the current directory: {source}")
-            }
-            Self::Git(source) => write!(f, "{source}"),
-            Self::Scan(source) => write!(f, "{source}"),
-            Self::PersistGitAnalysis(source) => {
-                write!(f, "failed to persist TUI Git analysis: {source}")
-            }
-            Self::PersistHotspots(source) => {
-                write!(f, "failed to persist TUI hotspot scores: {source}")
-            }
-            Self::PersistScan(source) => {
-                write!(f, "failed to persist TUI scan results: {source}")
-            }
-            Self::PersistSymbols(source) => {
-                write!(f, "failed to persist TUI parser symbols: {source}")
-            }
-        }
-    }
-}
-
-impl StdError for TuiSnapshotError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match self {
-            Self::CurrentDir(source) => Some(source),
-            Self::Git(source) => Some(source),
-            Self::Scan(source) => Some(source),
-            Self::PersistGitAnalysis(source)
-            | Self::PersistHotspots(source)
-            | Self::PersistScan(source)
-            | Self::PersistSymbols(source) => Some(source),
-        }
-    }
-}
-
-impl From<git::GitHistoryError> for TuiSnapshotError {
-    fn from(source: git::GitHistoryError) -> Self {
-        Self::Git(source)
-    }
-}
-
-impl From<ScanError> for TuiSnapshotError {
-    fn from(source: ScanError) -> Self {
-        Self::Scan(source)
-    }
-}
-
-fn run_app(
-    terminal: &mut TuiTerminal,
-    snapshot: TuiSnapshot,
-    initial_index: Result<TuiIndexMode, String>,
-    options: TuiOptions,
-) -> io::Result<()> {
-    let mut data_client = initial_index
-        .as_ref()
-        .ok()
-        .map(|index_mode| TuiDataClient::start(index_mode.worktree_root.clone()));
-    let mut state = match initial_index {
-        Ok(index_mode) => TuiAppState {
-            status: Some("Opening local analysis index".to_owned()),
-            current_path: index_mode
-                .hotspots
-                .rows
-                .first()
-                .map(|hotspot| hotspot.path.clone()),
-            index_mode: Some(index_mode),
-            analysis_running: false,
-            background_status: Some(TuiProgressUpdate::indeterminate(
-                "Ready",
-                "showing local analysis index",
-            )),
-            ..TuiAppState::default()
-        },
-        Err(error) => TuiAppState {
-            status: Some(error),
-            analysis_running: false,
-            background_status: Some(TuiProgressUpdate::indeterminate(
-                "No index",
-                "run `hotpath analyze` before opening the TUI",
-            )),
-            ..TuiAppState::default()
-        },
-    };
-    if let Some(client) = &mut data_client {
-        request_index_page(&mut state, client, None, 0);
-    }
-    loop {
-        if let Some(client) = &mut data_client {
-            drain_tui_data_responses(&mut state, client, options);
-            update_tui_pending_status(&mut state);
-        }
-        terminal.draw(|frame| render_with_options(frame, &snapshot, &state, options))?;
-        if event::poll(Duration::from_millis(250))? {
-            if let Event::Key(key) = event::read()? {
-                reduce_key_with_editor_and_data(
-                    &mut state,
-                    &snapshot,
-                    key,
-                    |name| env::var_os(name),
-                    data_client.as_mut(),
-                );
-                if state.should_exit {
-                    return Ok(());
-                }
-            }
-        }
-    }
-}
-
-fn open_initial_index_mode(options: TuiOptions) -> Result<TuiIndexMode, String> {
-    let current_dir = env::current_dir()
-        .map_err(|source| format!("Could not read current directory: {source}"))?;
-    let index_root = find_existing_index_root(&current_dir)
-        .ok_or_else(|| "No Hotpath index found. Run `hotpath analyze` first.".to_owned())?;
-    Ok(open_index_mode(index_root, options))
-}
-
-fn find_existing_index_root(current_dir: &Path) -> Option<PathBuf> {
-    current_dir
-        .ancestors()
-        .find(|candidate| storage::index::default_index_path(candidate).is_file())
-        .map(Path::to_path_buf)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum TuiView {
-    Hotspots,
-    RepoTree,
-    FileDetail,
-    SymbolDetail,
-    GitDetail,
-    CouplingGraph,
-    ContextBudgeting,
-    ExplainScore,
-}
-
-const PRIMARY_VIEWS: [TuiView; 4] = [
-    TuiView::Hotspots,
-    TuiView::RepoTree,
-    TuiView::CouplingGraph,
-    TuiView::ContextBudgeting,
-];
+const INDEX_DB: &str = ".hotpath/index.sqlite";
 const METRIC_BAR_WIDTH: usize = 14;
 const METRIC_LABEL_WIDTH: usize = 12;
 const HOTSPOT_SELECTOR_WIDTH: usize = 2;
@@ -997,2355 +30,166 @@ const HOTSPOT_MIN_PATH_WIDTH: usize = 8;
 const HOTSPOT_TAG_SEPARATOR: &str = " \u{00B7} ";
 const OWNER_NAME_WIDTH: usize = 24;
 
-impl TuiView {
-    fn title(self) -> &'static str {
-        match self {
-            Self::Hotspots => "Hotspots",
-            Self::RepoTree => "Repo Tree",
-            Self::FileDetail => "File Detail",
-            Self::SymbolDetail => "Symbol Detail",
-            Self::GitDetail => "Git Detail",
-            Self::CouplingGraph => "Coupling Graph",
-            Self::ContextBudgeting => "Context Budgeting",
-            Self::ExplainScore => "Explain Score",
-        }
-    }
-}
+type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum TuiPaneFocus {
-    Nav,
-    #[default]
-    Main,
-    Inspector,
-}
-
-impl TuiPaneFocus {
-    fn next(self) -> Self {
-        match self {
-            Self::Nav => Self::Main,
-            Self::Main => Self::Inspector,
-            Self::Inspector => Self::Nav,
-        }
-    }
-
-    fn previous(self) -> Self {
-        match self {
-            Self::Nav => Self::Inspector,
-            Self::Main => Self::Nav,
-            Self::Inspector => Self::Main,
-        }
-    }
-
-    fn title(self) -> &'static str {
-        match self {
-            Self::Nav => "Nav",
-            Self::Main => "Main",
-            Self::Inspector => "Inspector",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SymbolKey {
-    path: String,
-    start_line: u64,
-    end_line: u64,
-    kind: String,
-    name: String,
-}
-
-impl SymbolKey {
-    fn from_parse(symbol: &ParseSymbolRecord) -> Self {
-        Self {
-            path: symbol.path.clone(),
-            start_line: symbol.start_line,
-            end_line: symbol.end_line,
-            kind: symbol.kind.clone(),
-            name: symbol.name.clone(),
-        }
-    }
-
-    fn from_complexity(symbol: &ComplexitySymbolRecord) -> Self {
-        Self {
-            path: symbol.path.clone(),
-            start_line: symbol.start_line,
-            end_line: symbol.end_line,
-            kind: symbol.kind.clone(),
-            name: symbol.name.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TuiAction {
-    DrillDown {
-        from: TuiView,
-        to: TuiView,
-        path: String,
-    },
-    ExplainScore {
-        view: TuiView,
-        path: String,
-    },
-    OpenEditor {
-        command: String,
-        row_text: String,
-    },
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ListSelection {
-    selected: usize,
-}
-
-impl ListSelection {
-    pub fn selected(&self) -> usize {
-        self.selected
-    }
-
-    fn move_next(&mut self, row_count: usize) {
-        if row_count == 0 {
-            self.selected = 0;
-            return;
-        }
-
-        self.selected = (self.selected + 1).min(row_count - 1);
-    }
-
-    fn move_previous(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
-    }
-
-    fn clamp(&mut self, row_count: usize) {
-        if row_count == 0 {
-            self.selected = 0;
-        } else {
-            self.selected = self.selected.min(row_count - 1);
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SearchState {
-    query: String,
-}
-
-impl SearchState {
-    pub fn query(&self) -> &str {
-        &self.query
-    }
+pub fn run_tui() -> io::Result<()> {
+    let root = env::current_dir()?;
+    let snapshot = TuiDatabaseSnapshot::load_from_dir(root);
+    let mut terminal = TerminalSession::enter()?;
+    run_app(terminal.terminal_mut(), snapshot)
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct TuiAppState {
-    current_view: TuiView,
-    current_path: Option<String>,
-    current_symbol: Option<SymbolKey>,
-    back_stack: Vec<TuiView>,
-    path_stack: Vec<Option<String>>,
-    symbol_stack: Vec<Option<SymbolKey>>,
-    selections: BTreeMap<TuiView, ListSelection>,
-    search: Option<SearchState>,
-    search_editing: bool,
-    pane_focus: TuiPaneFocus,
-    show_help: bool,
-    command_palette: bool,
-    status: Option<String>,
-    background_status: Option<TuiProgressUpdate>,
-    analysis_running: bool,
-    index_mode: Option<TuiIndexMode>,
-    last_action: Option<TuiAction>,
-    should_exit: bool,
+pub struct TuiDatabaseSnapshot {
+    pub index_root: Option<PathBuf>,
+    pub status: Option<String>,
+    pub project: Option<ProjectRiskSummary>,
+    pub rows: Vec<RiskRow>,
 }
 
-impl Default for TuiAppState {
-    fn default() -> Self {
-        let mut selections = BTreeMap::new();
-        selections.insert(TuiView::Hotspots, ListSelection::default());
-        selections.insert(TuiView::RepoTree, ListSelection::default());
-        selections.insert(TuiView::FileDetail, ListSelection::default());
-        selections.insert(TuiView::SymbolDetail, ListSelection::default());
-        selections.insert(TuiView::GitDetail, ListSelection::default());
-        selections.insert(TuiView::CouplingGraph, ListSelection::default());
-        selections.insert(TuiView::ContextBudgeting, ListSelection::default());
-        selections.insert(TuiView::ExplainScore, ListSelection::default());
+impl TuiDatabaseSnapshot {
+    pub fn load_from_dir(root: impl AsRef<Path>) -> Self {
+        let Some(index_root) = find_index_root(root.as_ref()) else {
+            return Self {
+                index_root: None,
+                status: Some("No Hotpath index found. Run hotpath scan first.".to_owned()),
+                project: None,
+                rows: Vec::new(),
+            };
+        };
+        match Self::load_from_index_root(&index_root) {
+            Ok(mut snapshot) => {
+                if snapshot.rows.is_empty() && snapshot.status.is_none() {
+                    snapshot.status = Some(
+                        "No scored Go files found. Run hotpath scan after Go files are present."
+                            .to_owned(),
+                    );
+                }
+                snapshot
+            }
+            Err(error) => Self {
+                index_root: Some(index_root),
+                status: Some(format!("Could not read Hotpath index: {error}")),
+                project: None,
+                rows: Vec::new(),
+            },
+        }
+    }
 
-        Self {
-            current_view: TuiView::Hotspots,
-            current_path: None,
-            current_symbol: None,
-            back_stack: Vec::new(),
-            path_stack: Vec::new(),
-            symbol_stack: Vec::new(),
-            selections,
-            search: None,
-            search_editing: false,
-            pane_focus: TuiPaneFocus::Main,
-            show_help: false,
-            command_palette: false,
+    fn load_from_index_root(index_root: &Path) -> rusqlite::Result<Self> {
+        let connection = Connection::open_with_flags(
+            index_root.join(INDEX_DB),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let project = load_project_summary(&connection)?;
+        let mut rows = load_risk_rows(&connection)?;
+        let terms = load_terms(&connection)?;
+        let facts = load_facts(&connection)?;
+        let limitations = load_limitations(&connection)?;
+        let owners = load_owners(&connection)?;
+
+        for row in &mut rows {
+            row.terms = terms.get(&row.relative_path).cloned().unwrap_or_default();
+            row.facts = facts.get(&row.relative_path).cloned().unwrap_or_default();
+            row.limitations = limitations
+                .get(&row.relative_path)
+                .cloned()
+                .unwrap_or_default();
+            row.owners = owners.get(&row.relative_path).cloned().unwrap_or_default();
+            row.tags = tags_for_row(row);
+        }
+
+        Ok(Self {
+            index_root: Some(index_root.to_path_buf()),
             status: None,
-            background_status: None,
-            analysis_running: false,
-            index_mode: None,
-            last_action: None,
-            should_exit: false,
-        }
+            project,
+            rows,
+        })
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct TuiIndexMode {
-    worktree_root: PathBuf,
-    include_generated_hotspots: bool,
-    hotspots: TuiHotspotPage,
-    presentation: TuiSnapshot,
-    inspector: Option<TuiIndexInspector>,
-    pending_page: Option<TuiPendingRequest>,
-    pending_inspector: Option<TuiPendingRequest>,
-    last_query_error: Option<String>,
+pub struct ProjectRiskSummary {
+    pub formula_id: String,
+    pub score: f64,
+    pub risk_10: f64,
+    pub risk_band: String,
+    pub confidence: String,
+    pub active_file_count: u64,
+    pub active_go_file_count: u64,
+    pub scored_file_count: u64,
+    pub scoring_coverage: f64,
+    pub go_score_coverage: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct TuiHotspotPage {
-    rows: Vec<storage::index::PersistedHotspot>,
-    total: u64,
-    offset: u64,
-    limit: u64,
-    query: Option<String>,
+pub struct RiskRow {
+    pub rank: u64,
+    pub relative_path: String,
+    pub absolute_path: String,
+    pub formula_id: String,
+    pub score: f64,
+    pub risk_10: f64,
+    pub risk_band: String,
+    pub is_generated: bool,
+    pub is_vendor: bool,
+    pub line_count: Option<u64>,
+    pub byte_size: Option<u64>,
+    pub language_id: Option<String>,
+    pub cognitive_complexity: Option<u64>,
+    pub max_function_complexity: Option<u64>,
+    pub source_coupling_in: Option<u64>,
+    pub source_coupling_out: Option<u64>,
+    pub co_changed_file_count: u64,
+    pub total_churn_lines: u64,
+    pub recent_churn_lines: u64,
+    pub commits_per_file: u64,
+    pub dominant_owner: Option<String>,
+    pub dominant_owner_share: Option<f64>,
+    pub owner_count: Option<u64>,
+    pub author_count: u64,
+    pub terms: Vec<RiskTerm>,
+    pub facts: Vec<RiskFact>,
+    pub limitations: Vec<RiskLimitation>,
+    pub owners: Vec<RiskOwner>,
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct TuiIndexInspector {
-    hotspot: storage::index::PersistedHotspot,
-    file: Option<storage::index::PersistedFileRecord>,
-    owners: Vec<storage::index::PersistedOwnerShare>,
-    max_cyclomatic_complexity: Option<u64>,
-    fan_in: u64,
-    fan_out: u64,
-    raw_metrics: Option<RawScoreMetrics>,
-    normalized_metrics: Option<NormalizedScoreMetrics>,
-    weighted_terms: Vec<WeightedTerm>,
-    limitations: Vec<ScoreLimitation>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TuiHotspotExplanationPayload {
-    normalized_metrics: NormalizedScoreMetrics,
-    weighted_terms: Vec<WeightedTerm>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TuiHotspotLimitationsPayload {
-    limitations: Vec<ScoreLimitation>,
-}
-
-impl TuiAppState {
-    pub fn current_view(&self) -> TuiView {
-        self.current_view
-    }
-
-    pub fn current_path(&self) -> Option<&str> {
-        self.current_path.as_deref()
-    }
-
-    pub fn selected_index(&self) -> usize {
-        self.selection_for_current_view().selected()
-    }
-
-    pub fn search_query(&self) -> Option<&str> {
-        self.search.as_ref().map(SearchState::query)
-    }
-
-    pub fn is_search_editing(&self) -> bool {
-        self.search_editing
-    }
-
-    pub fn status(&self) -> Option<&str> {
-        self.status.as_deref()
-    }
-
-    pub fn pane_focus(&self) -> TuiPaneFocus {
-        self.pane_focus
-    }
-
-    pub fn show_help(&self) -> bool {
-        self.show_help
-    }
-
-    pub fn command_palette(&self) -> bool {
-        self.command_palette
-    }
-
-    pub fn last_action(&self) -> Option<&TuiAction> {
-        self.last_action.as_ref()
-    }
-
-    pub fn should_exit(&self) -> bool {
-        self.should_exit
-    }
-
-    fn selection_for_current_view(&self) -> &ListSelection {
-        self.selections
-            .get(&self.current_view)
-            .expect("all TUI views have selection state")
-    }
-
-    fn selection_for_current_view_mut(&mut self) -> &mut ListSelection {
-        self.selections
-            .get_mut(&self.current_view)
-            .expect("all TUI views have selection state")
-    }
+pub struct RiskTerm {
+    pub name: String,
+    pub raw_value: Option<f64>,
+    pub normalized_value: Option<f64>,
+    pub weight: f64,
+    pub contribution: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EditorResolution {
-    Command(String),
-    Missing,
-}
-
-pub fn resolve_editor_from_env<F>(mut get_env: F) -> EditorResolution
-where
-    F: FnMut(&str) -> Option<String>,
-{
-    get_env("VISUAL")
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| get_env("EDITOR").filter(|value| !value.trim().is_empty()))
-        .map(EditorResolution::Command)
-        .unwrap_or(EditorResolution::Missing)
-}
-
-#[cfg(test)]
-fn reduce_key_with_editor<F>(
-    state: &mut TuiAppState,
-    snapshot: &TuiSnapshot,
-    key: KeyEvent,
-    get_env: F,
-) where
-    F: FnMut(&str) -> Option<std::ffi::OsString>,
-{
-    reduce_key_with_editor_and_data(state, snapshot, key, get_env, None);
-}
-
-fn reduce_key_with_editor_and_data<F>(
-    state: &mut TuiAppState,
-    snapshot: &TuiSnapshot,
-    key: KeyEvent,
-    mut get_env: F,
-    data_client: Option<&mut TuiDataClient>,
-) where
-    F: FnMut(&str) -> Option<std::ffi::OsString>,
-{
-    if key.kind != KeyEventKind::Press {
-        return;
-    }
-
-    if state.show_help {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('?') => state.show_help = false,
-            _ => {}
-        }
-        return;
-    }
-
-    if state.command_palette {
-        match key.code {
-            KeyCode::Esc => state.command_palette = false,
-            KeyCode::Char('1') => {
-                state.command_palette = false;
-                open_hotspots(state);
-            }
-            KeyCode::Char('2') => {
-                state.command_palette = false;
-                if state.index_mode.is_some() {
-                    unavailable_index_view(state);
-                    return;
-                }
-                open_repo_tree(state);
-            }
-            KeyCode::Char('3') => {
-                state.command_palette = false;
-                if state.index_mode.is_some() {
-                    unavailable_index_view(state);
-                    return;
-                }
-                let rows = filtered_visible_rows(snapshot, state);
-                open_coupling_graph(state, snapshot, &rows);
-            }
-            KeyCode::Char('4') => {
-                state.command_palette = false;
-                if state.index_mode.is_some() {
-                    unavailable_index_view(state);
-                    return;
-                }
-                open_context_budgeting(state);
-            }
-            KeyCode::Char('/') => {
-                state.command_palette = false;
-                state.search = Some(SearchState::default());
-                state.search_editing = true;
-                state.status = Some("Search active".to_owned());
-            }
-            _ => {}
-        }
-        return;
-    }
-
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
-        state.command_palette = true;
-        state.status = Some("Command palette".to_owned());
-        return;
-    }
-
-    if state.index_mode.is_some() {
-        if let Some(client) = data_client {
-            reduce_index_key_async(state, key, client);
-        } else {
-            reduce_index_key(state, key);
-        }
-        return;
-    }
-
-    let rows = filtered_visible_rows(snapshot, state);
-
-    if state.search_editing {
-        match key.code {
-            KeyCode::Esc => clear_search(state),
-            KeyCode::Enter => confirm_search(state, snapshot),
-            KeyCode::Backspace => {
-                if let Some(search) = &mut state.search {
-                    search.query.pop();
-                }
-                clamp_current_selection(state, snapshot);
-            }
-            KeyCode::Char(character) => {
-                if let Some(search) = &mut state.search {
-                    search.query.push(character);
-                }
-                clamp_current_selection(state, snapshot);
-            }
-            _ => {}
-        }
-        return;
-    }
-
-    match key.code {
-        KeyCode::Char('q') => state.should_exit = true,
-        KeyCode::Char('?') => state.show_help = true,
-        KeyCode::Char('/') => {
-            state.search = Some(SearchState::default());
-            state.search_editing = true;
-            state.status = Some("Search active".to_owned());
-            clamp_current_selection(state, snapshot);
-        }
-        KeyCode::Esc => reduce_escape(state),
-        KeyCode::Tab => {
-            state.pane_focus = state.pane_focus.next();
-            state.status = Some(format!("Focus: {}", state.pane_focus.title()));
-        }
-        KeyCode::BackTab => {
-            state.pane_focus = state.pane_focus.previous();
-            state.status = Some(format!("Focus: {}", state.pane_focus.title()));
-        }
-        KeyCode::Left | KeyCode::Char('h') => reduce_escape(state),
-        KeyCode::Right | KeyCode::Char('l') => drill_down(state, snapshot, &rows),
-        KeyCode::Down | KeyCode::Char('j') => {
-            state.selection_for_current_view_mut().move_next(rows.len());
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            state.selection_for_current_view_mut().move_previous();
-        }
-        KeyCode::Enter => drill_down(state, snapshot, &rows),
-        KeyCode::Char('1') => open_hotspots(state),
-        KeyCode::Char('2') => open_repo_tree(state),
-        KeyCode::Char('3') => open_coupling_graph(state, snapshot, &rows),
-        KeyCode::Char('4') => open_context_budgeting(state),
-        KeyCode::Char('t') => open_repo_tree(state),
-        KeyCode::Char('g') => open_coupling_graph(state, snapshot, &rows),
-        KeyCode::Char('c') => open_context_budgeting(state),
-        KeyCode::Char('x') => explain_score(state, snapshot, &rows),
-        KeyCode::Char('e') => {
-            let resolution = resolve_editor_from_env(|name| {
-                get_env(name).and_then(|value| value.into_string().ok())
-            });
-            resolve_editor_action(state, &rows, resolution);
-        }
-        _ => {}
-    }
-}
-
-fn reduce_index_key(state: &mut TuiAppState, key: KeyEvent) {
-    if state.search_editing {
-        match key.code {
-            KeyCode::Esc => {
-                state.search = None;
-                state.search_editing = false;
-                reload_index_hotspots(state, None, 0);
-            }
-            KeyCode::Enter => {
-                state.search_editing = false;
-                let query = state.search_query().map(str::to_owned);
-                reload_index_hotspots(state, query.as_deref(), 0);
-            }
-            KeyCode::Backspace => {
-                if let Some(search) = &mut state.search {
-                    search.query.pop();
-                }
-            }
-            KeyCode::Char(character) => {
-                if let Some(search) = &mut state.search {
-                    search.query.push(character);
-                }
-            }
-            _ => {}
-        }
-        return;
-    }
-
-    match key.code {
-        KeyCode::Char('q') => state.should_exit = true,
-        KeyCode::Char('?') => state.show_help = true,
-        KeyCode::Char('/') => {
-            state.search = Some(SearchState::default());
-            state.search_editing = true;
-            state.status = Some("Search active".to_owned());
-        }
-        KeyCode::Esc => {
-            if state.search.take().is_some() {
-                state.search_editing = false;
-                reload_index_hotspots(state, None, 0);
-            } else {
-                state.should_exit = true;
-            }
-        }
-        KeyCode::Tab => {
-            state.pane_focus = state.pane_focus.next();
-            state.status = Some(format!("Focus: {}", state.pane_focus.title()));
-        }
-        KeyCode::BackTab => {
-            state.pane_focus = state.pane_focus.previous();
-            state.status = Some(format!("Focus: {}", state.pane_focus.title()));
-        }
-        KeyCode::Down | KeyCode::Char('j') => move_index_selection(state, 1),
-        KeyCode::Up | KeyCode::Char('k') => move_index_selection(state, -1),
-        KeyCode::Char('1') => open_hotspots(state),
-        KeyCode::Char('2')
-        | KeyCode::Char('3')
-        | KeyCode::Char('4')
-        | KeyCode::Char('t')
-        | KeyCode::Char('g')
-        | KeyCode::Char('c')
-        | KeyCode::Char('x')
-        | KeyCode::Right
-        | KeyCode::Char('l')
-        | KeyCode::Enter => unavailable_index_view(state),
-        _ => {}
-    }
-}
-
-fn reduce_index_key_async(state: &mut TuiAppState, key: KeyEvent, client: &mut TuiDataClient) {
-    if state.search_editing {
-        match key.code {
-            KeyCode::Esc => {
-                state.search = None;
-                state.search_editing = false;
-                request_index_page(state, client, None, 0);
-            }
-            KeyCode::Enter => {
-                state.search_editing = false;
-                let query = state.search_query().map(str::to_owned);
-                request_index_page(state, client, query.as_deref(), 0);
-            }
-            KeyCode::Backspace => {
-                if let Some(search) = &mut state.search {
-                    search.query.pop();
-                }
-            }
-            KeyCode::Char(character) => {
-                if let Some(search) = &mut state.search {
-                    search.query.push(character);
-                }
-            }
-            _ => {}
-        }
-        return;
-    }
-
-    match key.code {
-        KeyCode::Char('q') => state.should_exit = true,
-        KeyCode::Char('?') => state.show_help = true,
-        KeyCode::Char('/') => {
-            state.search = Some(SearchState::default());
-            state.search_editing = true;
-            state.status = Some("Search active".to_owned());
-        }
-        KeyCode::Esc => {
-            if state.search.take().is_some() {
-                state.search_editing = false;
-                request_index_page(state, client, None, 0);
-            } else {
-                state.should_exit = true;
-            }
-        }
-        KeyCode::Tab => {
-            state.pane_focus = state.pane_focus.next();
-            state.status = Some(format!("Focus: {}", state.pane_focus.title()));
-        }
-        KeyCode::BackTab => {
-            state.pane_focus = state.pane_focus.previous();
-            state.status = Some(format!("Focus: {}", state.pane_focus.title()));
-        }
-        KeyCode::Down | KeyCode::Char('j') => move_index_selection_async(state, 1, client),
-        KeyCode::Up | KeyCode::Char('k') => move_index_selection_async(state, -1, client),
-        KeyCode::Char('1') => open_hotspots(state),
-        KeyCode::Char('2')
-        | KeyCode::Char('3')
-        | KeyCode::Char('4')
-        | KeyCode::Char('t')
-        | KeyCode::Char('g')
-        | KeyCode::Char('c')
-        | KeyCode::Char('x')
-        | KeyCode::Right
-        | KeyCode::Char('l')
-        | KeyCode::Enter => unavailable_index_view(state),
-        _ => {}
-    }
-}
-
-fn move_index_selection_async(state: &mut TuiAppState, delta: isize, client: &mut TuiDataClient) {
-    let Some(index_mode) = state.index_mode.as_ref() else {
-        return;
-    };
-    let row_count = index_mode.hotspots.rows.len();
-    if row_count == 0 {
-        state.selection_for_current_view_mut().selected = 0;
-        return;
-    }
-
-    let selected = state.selected_index();
-    if delta > 0 && selected + 1 >= row_count {
-        let next_offset = index_mode.hotspots.offset + index_mode.hotspots.rows.len() as u64;
-        if next_offset < index_mode.hotspots.total {
-            let query = index_mode.hotspots.query.clone();
-            request_index_page(state, client, query.as_deref(), next_offset);
-            state.selection_for_current_view_mut().selected = 0;
-            return;
-        }
-    } else if delta < 0 && selected == 0 {
-        if index_mode.hotspots.offset > 0 {
-            let next_offset = index_mode
-                .hotspots
-                .offset
-                .saturating_sub(index_mode.hotspots.limit);
-            let query = index_mode.hotspots.query.clone();
-            request_index_page(state, client, query.as_deref(), next_offset);
-            return;
-        }
-    } else if delta > 0 {
-        state.selection_for_current_view_mut().move_next(row_count);
-    } else {
-        state.selection_for_current_view_mut().move_previous();
-    }
-
-    request_selected_index_inspector(state, client);
-}
-
-fn move_index_selection(state: &mut TuiAppState, delta: isize) {
-    let Some(index_mode) = state.index_mode.as_ref() else {
-        return;
-    };
-    let row_count = index_mode.hotspots.rows.len();
-    if row_count == 0 {
-        state.selection_for_current_view_mut().selected = 0;
-        return;
-    }
-
-    let selected = state.selected_index();
-    if delta > 0 && selected + 1 >= row_count {
-        let next_offset = index_mode.hotspots.offset + index_mode.hotspots.rows.len() as u64;
-        if next_offset < index_mode.hotspots.total {
-            let query = index_mode.hotspots.query.clone();
-            reload_index_hotspots(state, query.as_deref(), next_offset);
-            state.selection_for_current_view_mut().selected = 0;
-        }
-    } else if delta < 0 && selected == 0 {
-        if index_mode.hotspots.offset > 0 {
-            let next_offset = index_mode
-                .hotspots
-                .offset
-                .saturating_sub(index_mode.hotspots.limit);
-            let query = index_mode.hotspots.query.clone();
-            reload_index_hotspots(state, query.as_deref(), next_offset);
-            let last = state
-                .index_mode
-                .as_ref()
-                .map(|index_mode| index_mode.hotspots.rows.len().saturating_sub(1))
-                .unwrap_or(0);
-            state.selection_for_current_view_mut().selected = last;
-        }
-    } else if delta > 0 {
-        state.selection_for_current_view_mut().move_next(row_count);
-    } else {
-        state.selection_for_current_view_mut().move_previous();
-    }
-
-    refresh_index_inspector(state, TuiOptions::default());
-}
-
-fn reload_index_hotspots(state: &mut TuiAppState, query: Option<&str>, offset: u64) {
-    let Some(index_mode) = state.index_mode.as_ref() else {
-        return;
-    };
-    let result = load_index_hotspot_page(
-        &index_mode.worktree_root,
-        offset,
-        index_mode.hotspots.limit,
-        index_mode.include_generated_hotspots,
-        query,
-    );
-    match result {
-        Ok(page) => {
-            let row_count = page.rows.len();
-            if let Some(index_mode) = &mut state.index_mode {
-                index_mode.hotspots = page;
-                index_mode.last_query_error = None;
-            }
-            state.selection_for_current_view_mut().clamp(row_count);
-            state.status = Some(
-                match query.map(str::trim).filter(|query| !query.is_empty()) {
-                    Some(query) => format!("Filter active: {query} ({row_count} visible rows)"),
-                    None => "Filter cleared".to_owned(),
-                },
-            );
-            refresh_index_inspector(state, TuiOptions::default());
-        }
-        Err(error) => {
-            if let Some(index_mode) = &mut state.index_mode {
-                index_mode.last_query_error = Some(error.to_string());
-            }
-            state.status = Some(format!("Hotspot page read failed: {error}"));
-        }
-    }
-}
-
-fn request_index_page(
-    state: &mut TuiAppState,
-    client: &mut TuiDataClient,
-    query: Option<&str>,
-    offset: u64,
-) {
-    let Some(index_mode) = &mut state.index_mode else {
-        return;
-    };
-    let request_id = client.next_request_id();
-    let query = query
-        .map(str::trim)
-        .filter(|query| !query.is_empty())
-        .map(str::to_owned);
-    index_mode.pending_page = Some(TuiPendingRequest {
-        request_id,
-        started_at: Instant::now(),
-        kind: TuiPendingKind::Page,
-        detail: query.as_ref().map_or_else(
-            || format!("page offset {offset}"),
-            |query| format!("filter {query}"),
-        ),
-    });
-    index_mode.last_query_error = None;
-    state.status = Some("Loading hotspots from index".to_owned());
-    let _ = client.sender.send(TuiDataRequest::LoadPage {
-        request_id,
-        offset,
-        limit: index_mode.hotspots.limit,
-        include_generated_hotspots: index_mode.include_generated_hotspots,
-        query,
-    });
-}
-
-fn request_selected_index_inspector(state: &mut TuiAppState, client: &mut TuiDataClient) {
-    let Some(path) = selected_index_hotspot_path(state) else {
-        if let Some(index_mode) = &mut state.index_mode {
-            index_mode.inspector = None;
-            index_mode.pending_inspector = None;
-        }
-        return;
-    };
-    let Some(index_mode) = &mut state.index_mode else {
-        return;
-    };
-    let request_id = client.next_request_id();
-    index_mode.pending_inspector = Some(TuiPendingRequest {
-        request_id,
-        started_at: Instant::now(),
-        kind: TuiPendingKind::Inspector,
-        detail: path.clone(),
-    });
-    index_mode.last_query_error = None;
-    state.current_path = Some(path.clone());
-    let _ = client.sender.send(TuiDataRequest::LoadInspector {
-        request_id,
-        path,
-        include_generated_hotspots: index_mode.include_generated_hotspots,
-    });
-}
-
-fn drain_tui_data_responses(
-    state: &mut TuiAppState,
-    client: &mut TuiDataClient,
-    options: TuiOptions,
-) {
-    while let Ok(response) = client.receiver.try_recv() {
-        match response {
-            TuiDataResponse::Page { request_id, result } => {
-                let Some(index_mode) = &state.index_mode else {
-                    continue;
-                };
-                if index_mode
-                    .pending_page
-                    .as_ref()
-                    .is_none_or(|pending| pending.request_id != request_id)
-                {
-                    continue;
-                }
-                match result {
-                    Ok(page) => {
-                        let row_count = page.rows.len();
-                        if let Some(index_mode) = &mut state.index_mode {
-                            index_mode.hotspots = page;
-                            index_mode.presentation =
-                                index_presentation_from_page(&index_mode.hotspots, options.context);
-                            index_mode.pending_page = None;
-                            index_mode.last_query_error = None;
-                            index_mode.inspector = None;
-                        }
-                        state.selection_for_current_view_mut().clamp(row_count);
-                        state.status = Some(format!("{row_count} hotspot rows loaded"));
-                        request_selected_index_inspector(state, client);
-                    }
-                    Err(error) => {
-                        if let Some(index_mode) = &mut state.index_mode {
-                            index_mode.pending_page = None;
-                            index_mode.last_query_error = Some(error.clone());
-                        }
-                        state.status = Some(format!("Hotspot page read failed: {error}"));
-                    }
-                }
-            }
-            TuiDataResponse::Inspector {
-                request_id,
-                path,
-                result,
-            } => {
-                let Some(index_mode) = &state.index_mode else {
-                    continue;
-                };
-                if index_mode
-                    .pending_inspector
-                    .as_ref()
-                    .is_none_or(|pending| pending.request_id != request_id)
-                {
-                    continue;
-                }
-                if selected_index_hotspot_path(state).as_deref() != Some(path.as_str()) {
-                    continue;
-                }
-                match *result {
-                    Ok(inspector) => {
-                        if let Some(index_mode) = &mut state.index_mode {
-                            index_mode.inspector = inspector;
-                            index_mode.pending_inspector = None;
-                            index_mode.last_query_error = None;
-                        }
-                        refresh_index_presentation(state, options);
-                    }
-                    Err(error) => {
-                        if let Some(index_mode) = &mut state.index_mode {
-                            index_mode.pending_inspector = None;
-                            index_mode.last_query_error = Some(error.clone());
-                        }
-                        state.status = Some(format!("Inspector read failed: {error}"));
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn update_tui_pending_status(state: &mut TuiAppState) {
-    let Some(index_mode) = &mut state.index_mode else {
-        return;
-    };
-    let now = Instant::now();
-    if let Some(pending) = &index_mode.pending_page {
-        let elapsed = now.duration_since(pending.started_at);
-        if elapsed >= TUI_PAGE_TIMEOUT {
-            let detail = pending.detail.clone();
-            index_mode.pending_page = None;
-            index_mode.last_query_error = Some(format!(
-                "Index page read timed out after {}",
-                human_duration(elapsed)
-            ));
-            state.status = Some(format!("Index page read timed out: {detail}"));
-        } else if elapsed >= TUI_INSPECTOR_LOADING_DELAY {
-            state.status = Some(format!("Loading hotspots: {}", pending.detail));
-        }
-    }
-    if let Some(pending) = &index_mode.pending_inspector {
-        let elapsed = now.duration_since(pending.started_at);
-        if elapsed >= TUI_INSPECTOR_TIMEOUT {
-            let detail = pending.detail.clone();
-            index_mode.pending_inspector = None;
-            index_mode.last_query_error = Some(format!(
-                "Inspector read timed out after {}",
-                human_duration(elapsed)
-            ));
-            state.status = Some(format!("Inspector read timed out: {detail}"));
-        } else if elapsed >= TUI_INSPECTOR_LOADING_DELAY {
-            state.status = Some(format!("Loading inspector: {}", pending.detail));
-        }
-    }
-}
-
-fn unavailable_index_view(state: &mut TuiAppState) {
-    state.status = Some("Only hotspot view is loaded for this repository size".to_owned());
-    state.current_view = TuiView::Hotspots;
-}
-
-fn reduce_escape(state: &mut TuiAppState) {
-    if state.search.take().is_some() {
-        state.search_editing = false;
-        state.status = Some("Filter cleared".to_owned());
-        return;
-    }
-
-    if let Some(previous) = state.back_stack.pop() {
-        state.current_path = state.path_stack.pop().flatten();
-        state.current_symbol = state.symbol_stack.pop().flatten();
-        state.current_view = previous;
-        state.status = Some(format!("Back to {}", previous.title()));
-    } else {
-        state.should_exit = true;
-    }
-}
-
-fn clear_search(state: &mut TuiAppState) {
-    state.search = None;
-    state.search_editing = false;
-    state.status = Some("Filter cleared".to_owned());
-}
-
-fn confirm_search(state: &mut TuiAppState, snapshot: &TuiSnapshot) {
-    state.search_editing = false;
-    let row_count = filtered_visible_rows(snapshot, state).len();
-    state.status = Some(match state.search_query() {
-        Some(query) if !query.trim().is_empty() => {
-            format!("Filter active: {query} ({row_count} rows)")
-        }
-        _ => "Filter active: all rows".to_owned(),
-    });
-    clamp_current_selection(state, snapshot);
-}
-
-fn drill_down(state: &mut TuiAppState, snapshot: &TuiSnapshot, rows: &[String]) {
-    let Some(row_text) = selected_row_text(state, rows) else {
-        state.status = Some("No row selected".to_owned());
-        return;
-    };
-
-    let from = state.current_view;
-    let next = match from {
-        TuiView::Hotspots => {
-            hotspot_path_from_row(snapshot, &row_text).map(|path| (TuiView::FileDetail, path))
-        }
-        TuiView::RepoTree => repo_tree_path_from_row(snapshot, &row_text)
-            .filter(|path| file_for_path(snapshot, path).is_some())
-            .map(|path| (TuiView::FileDetail, path)),
-        TuiView::FileDetail => state
-            .current_path
-            .as_ref()
-            .filter(|path| {
-                is_git_detail_row(&row_text) && hotspot_for_path(snapshot, path).is_some()
-            })
-            .cloned()
-            .map(|path| (TuiView::GitDetail, path))
-            .or_else(|| {
-                let symbol = state
-                    .current_path
-                    .as_deref()
-                    .and_then(|path| symbol_from_file_detail_row(snapshot, path, &row_text));
-                symbol.map(|symbol| {
-                    let path = symbol.path.clone();
-                    push_symbol_view(state, symbol);
-                    (TuiView::SymbolDetail, path)
-                })
-            }),
-        TuiView::CouplingGraph => {
-            coupling_graph_path_from_row(snapshot, state.current_path.as_deref(), &row_text)
-                .map(|path| (TuiView::FileDetail, path))
-        }
-        TuiView::SymbolDetail
-        | TuiView::GitDetail
-        | TuiView::ContextBudgeting
-        | TuiView::ExplainScore => None,
-    };
-
-    let Some((to, path)) = next else {
-        state.status = Some("No drilldown available for this row".to_owned());
-        return;
-    };
-
-    if to != TuiView::SymbolDetail {
-        push_view(state, to, Some(path.clone()));
-    }
-    state.last_action = Some(TuiAction::DrillDown {
-        from,
-        to,
-        path: path.clone(),
-    });
-    state.status = Some(format!("Opened {row_text}"));
-}
-
-fn explain_score(state: &mut TuiAppState, snapshot: &TuiSnapshot, rows: &[String]) {
-    let Some(row_text) = selected_row_text(state, rows) else {
-        state.status = Some("No row selected".to_owned());
-        return;
-    };
-
-    let path = match state.current_view {
-        TuiView::Hotspots => hotspot_path_from_row(snapshot, &row_text),
-        TuiView::RepoTree => repo_tree_path_from_row(snapshot, &row_text),
-        TuiView::FileDetail
-        | TuiView::SymbolDetail
-        | TuiView::GitDetail
-        | TuiView::CouplingGraph
-        | TuiView::ContextBudgeting
-        | TuiView::ExplainScore => state.current_path.clone(),
-    };
-    let Some(path) = path.filter(|path| hotspot_for_path(snapshot, path).is_some()) else {
-        state.status = Some("No hotspot score available for this file".to_owned());
-        return;
-    };
-
-    let from = state.current_view;
-    if from != TuiView::ExplainScore {
-        push_view(state, TuiView::ExplainScore, Some(path.clone()));
-    }
-    state.last_action = Some(TuiAction::ExplainScore {
-        view: from,
-        path: path.clone(),
-    });
-    state.status = Some(format!("Explain score: {path}"));
-}
-
-fn open_hotspots(state: &mut TuiAppState) {
-    if state.current_view != TuiView::Hotspots {
-        push_view(state, TuiView::Hotspots, None);
-    }
-    state.status = Some("Hotspots".to_owned());
-}
-
-fn open_repo_tree(state: &mut TuiAppState) {
-    if state.current_view != TuiView::RepoTree {
-        push_view(state, TuiView::RepoTree, None);
-    }
-    state.status = Some("Repo tree".to_owned());
-}
-
-fn open_coupling_graph(state: &mut TuiAppState, snapshot: &TuiSnapshot, rows: &[String]) {
-    let selected_path = selected_path_for_view(state, snapshot, rows);
-    if state.current_view != TuiView::CouplingGraph || state.current_path != selected_path {
-        push_view(state, TuiView::CouplingGraph, selected_path.clone());
-    }
-    state.status = Some(match selected_path {
-        Some(path) => format!("Coupling graph: {path}"),
-        None => "Coupling graph".to_owned(),
-    });
-}
-
-fn open_context_budgeting(state: &mut TuiAppState) {
-    if state.current_view != TuiView::ContextBudgeting {
-        push_view(state, TuiView::ContextBudgeting, None);
-    }
-    state.status = Some("Context budgeting".to_owned());
-}
-
-fn selected_path_for_view(
-    state: &TuiAppState,
-    snapshot: &TuiSnapshot,
-    rows: &[String],
-) -> Option<String> {
-    let row_text = selected_row_text(state, rows);
-    match state.current_view {
-        TuiView::Hotspots => row_text.and_then(|row| hotspot_path_from_row(snapshot, &row)),
-        TuiView::RepoTree => row_text.and_then(|row| repo_tree_path_from_row(snapshot, &row)),
-        TuiView::CouplingGraph => row_text.and_then(|row| {
-            coupling_graph_path_from_row(snapshot, state.current_path.as_deref(), &row)
-        }),
-        TuiView::FileDetail
-        | TuiView::SymbolDetail
-        | TuiView::GitDetail
-        | TuiView::ExplainScore => state.current_path.clone(),
-        TuiView::ContextBudgeting => None,
-    }
-}
-
-fn push_view(state: &mut TuiAppState, next_view: TuiView, next_path: Option<String>) {
-    if state.current_view == next_view && state.current_path == next_path {
-        return;
-    }
-
-    state.back_stack.push(state.current_view);
-    state.path_stack.push(state.current_path.clone());
-    state.symbol_stack.push(state.current_symbol.clone());
-    state.current_view = next_view;
-    state.current_path = next_path;
-    state.current_symbol = None;
-    state.selection_for_current_view_mut().selected = 0;
-    state.search = None;
-    state.search_editing = false;
-}
-
-fn push_symbol_view(state: &mut TuiAppState, symbol: &ParseSymbolRecord) {
-    state.back_stack.push(state.current_view);
-    state.path_stack.push(state.current_path.clone());
-    state.symbol_stack.push(state.current_symbol.clone());
-    state.current_view = TuiView::SymbolDetail;
-    state.current_path = Some(symbol.path.clone());
-    state.current_symbol = Some(SymbolKey::from_parse(symbol));
-    state.selection_for_current_view_mut().selected = 0;
-    state.search = None;
-    state.search_editing = false;
-}
-
-fn resolve_editor_action(state: &mut TuiAppState, rows: &[String], resolution: EditorResolution) {
-    let Some(row_text) = selected_row_text(state, rows) else {
-        state.status = Some("No row selected".to_owned());
-        return;
-    };
-
-    match resolution {
-        EditorResolution::Command(command) => {
-            state.last_action = Some(TuiAction::OpenEditor {
-                command: command.clone(),
-                row_text: row_text.clone(),
-            });
-            state.status = Some(format!("Editor action: {command} {row_text}"));
-        }
-        EditorResolution::Missing => {
-            state.status = Some("Set VISUAL or EDITOR to open a row in an editor".to_owned());
-        }
-    }
-}
-
-fn selected_row_text(state: &TuiAppState, rows: &[String]) -> Option<String> {
-    rows.get(state.selected_index()).cloned()
-}
-
-fn clamp_current_selection(state: &mut TuiAppState, snapshot: &TuiSnapshot) {
-    let row_count = if state.index_mode.is_some() && state.current_view == TuiView::Hotspots {
-        index_visible_rows(state).len()
-    } else {
-        filtered_visible_rows(snapshot, state).len()
-    };
-    state.selection_for_current_view_mut().clamp(row_count);
-}
-
-fn open_index_mode(worktree_root: PathBuf, options: TuiOptions) -> TuiIndexMode {
-    let hotspots = TuiHotspotPage {
-        rows: Vec::new(),
-        total: 0,
-        offset: 0,
-        limit: TUI_HOTSPOT_PAGE_SIZE,
-        query: None,
-    };
-    let presentation = index_presentation_from_page(&hotspots, options.context);
-    TuiIndexMode {
-        worktree_root,
-        include_generated_hotspots: options.include_generated_hotspots,
-        hotspots,
-        presentation,
-        inspector: None,
-        pending_page: None,
-        pending_inspector: None,
-        last_query_error: None,
-    }
-}
-
-fn load_index_hotspot_page(
-    worktree_root: &PathBuf,
-    offset: u64,
-    limit: u64,
-    include_generated_hotspots: bool,
-    query: Option<&str>,
-) -> Result<TuiHotspotPage, TuiSnapshotError> {
-    let started = Instant::now();
-    let store = storage::index::IndexStore::open_read_only(worktree_root)
-        .map_err(TuiSnapshotError::PersistScan)?;
-    load_index_hotspot_page_from_store(&store, offset, limit, include_generated_hotspots, query)
-        .inspect(|page| {
-            let elapsed = started.elapsed();
-            operation_log::event(
-                "hotpath.tui_hotspot_page_query_completed",
-                json!({
-                    "elapsed_ms": elapsed.as_millis(),
-                    "offset": offset,
-                    "limit": limit,
-                    "rows": page.rows.len(),
-                    "total": page.total,
-                }),
-            );
-            log_tui_perf(
-                "hotpath.tui_hotspot_page_query",
-                elapsed,
-                json!({
-                    "offset": offset,
-                    "limit": limit,
-                    "rows": page.rows.len(),
-                    "total": page.total,
-                    "filtered": query.map(str::trim).is_some_and(|query| !query.is_empty()),
-                }),
-            );
-        })
-}
-
-fn load_index_hotspot_page_from_store(
-    store: &storage::index::IndexStore,
-    offset: u64,
-    limit: u64,
-    include_generated_hotspots: bool,
-    query: Option<&str>,
-) -> Result<TuiHotspotPage, TuiSnapshotError> {
-    let page = store
-        .latest_hotspot_page(offset, limit, include_generated_hotspots, query)
-        .map_err(TuiSnapshotError::PersistScan)?;
-    Ok(TuiHotspotPage {
-        rows: page.rows,
-        total: page.total,
-        offset: page.offset,
-        limit: page.limit,
-        query: query
-            .map(str::trim)
-            .filter(|query| !query.is_empty())
-            .map(str::to_owned),
-    })
-}
-
-fn index_presentation_from_page(
-    page: &TuiHotspotPage,
-    context_options: ContextOptions,
-) -> TuiSnapshot {
-    let hotspots = page
-        .rows
-        .iter()
-        .cloned()
-        .filter_map(report_hotspot_from_persisted)
-        .collect::<Vec<_>>();
-    index_presentation_from_parts(hotspots, Vec::new(), context_options)
-}
-
-fn index_presentation_from_parts(
-    hotspots: Vec<ReportHotspot>,
-    files: Vec<FileRecord>,
-    context_options: ContextOptions,
-) -> TuiSnapshot {
-    let context = estimate_context(&files, context_options);
-    let context_estimated_tokens = context.summary.estimated_tokens;
-    let findings = hotspots.iter().map(ReportFinding::from).collect::<Vec<_>>();
-    let scan_report = ScanReport {
-        status: "completed",
-        file_walking: "completed",
-        classification: "completed",
-        warnings: Vec::new(),
-        files,
-    };
-    let report = Report {
-        schema_version: report::REPORT_SCHEMA_VERSION,
-        summary: report::ReportSummary {
-            scan: scan_report.summary(),
-            git: report::ReportGitSummary {
-                head_commit_id: "index".to_owned(),
-                recent_window_days: git::RECENT_CHURN_WINDOW_DAYS as u64,
-                file_metric_count: 0,
-                co_change_count: 0,
-            },
-            hotspot_count: hotspots.len() as u64,
-            context_estimated_tokens,
-        },
-        hotspots,
-        context: report::ReportContext {
-            options: context.options,
-            summary: context.summary,
-            groups: context.groups,
-            skipped: context.skipped,
-            budget: context.budget,
-        },
-        findings,
-    };
-    let parse = parse::scaffold_report_from_scan(&scan_report);
-    let complexity = complexity::report_from_parse(&parse);
-
-    TuiSnapshot::from_parts(report, scan_report, parse, complexity)
-}
-
-fn refresh_index_presentation(state: &mut TuiAppState, options: TuiOptions) {
-    let Some(index_mode) = &mut state.index_mode else {
-        return;
-    };
-    let mut hotspots = index_mode
-        .hotspots
-        .rows
-        .iter()
-        .cloned()
-        .filter_map(report_hotspot_from_persisted)
-        .collect::<Vec<_>>();
-    let mut files = Vec::new();
-    let mut ownership = TuiOwnershipSnapshot::default();
-    let mut fan_by_file = Vec::new();
-    let mut complexity_symbols = Vec::new();
-    if let Some(inspector) = &index_mode.inspector {
-        if hotspots
-            .iter()
-            .all(|hotspot| hotspot.path != inspector.hotspot.path)
-        {
-            if let Some(hotspot) = report_hotspot_from_persisted(inspector.hotspot.clone()) {
-                hotspots.push(hotspot);
-                hotspots.sort_by(|left, right| {
-                    left.rank
-                        .cmp(&right.rank)
-                        .then_with(|| left.path.cmp(&right.path))
-                });
-            }
-        }
-        if let Some(file) = inspector.file.clone() {
-            files.push(file_record_from_persisted(file));
-        }
-        if !inspector.owners.is_empty() {
-            ownership.by_file.push(TuiFileOwnership {
-                path: inspector.hotspot.path.clone(),
-                owners: inspector
-                    .owners
-                    .iter()
-                    .map(|owner| TuiOwnerShare {
-                        author: owner.author.clone(),
-                        touch_count: owner.touch_count,
-                        share: owner.share,
-                    })
-                    .collect(),
-            });
-        }
-        fan_by_file.push(TuiFileFan {
-            path: inspector.hotspot.path.clone(),
-            fan_in: inspector.fan_in,
-            fan_out: inspector.fan_out,
-        });
-        if let Some(max_complexity) = inspector.max_cyclomatic_complexity {
-            complexity_symbols.push(ComplexitySymbolRecord {
-                path: inspector.hotspot.path.clone(),
-                name: "file".to_owned(),
-                kind: "file".to_owned(),
-                start_line: 1,
-                end_line: 1,
-                length_lines: 1,
-                function_length_lines: None,
-                nesting_depth: 0,
-                cyclomatic_complexity: Some(max_complexity),
-                max_control_flow_nesting: None,
-                is_large_symbol: false,
-            });
-        }
-    }
-    let mut presentation = index_presentation_from_parts(hotspots, files, options.context);
-    presentation.ownership = ownership;
-    presentation.coupling.fan_by_file = fan_by_file;
-    presentation.complexity.symbols = complexity_symbols;
-    index_mode.presentation = presentation;
-}
-
-fn report_hotspot_from_persisted(
-    hotspot: storage::index::PersistedHotspot,
-) -> Option<ReportHotspot> {
-    let raw_metrics = hotspot
-        .raw_metrics_json
-        .as_deref()
-        .and_then(|json| serde_json::from_str::<RawScoreMetrics>(json).ok())?;
-    let (normalized_metrics, weighted_terms) = hotspot
-        .explanation
-        .as_deref()
-        .and_then(|json| serde_json::from_str::<TuiHotspotExplanationPayload>(json).ok())
-        .map(|payload| (payload.normalized_metrics, payload.weighted_terms))
-        .unwrap_or((
-            NormalizedScoreMetrics {
-                size: None,
-                churn: None,
-                recent_churn: None,
-                ownership: None,
-                coupling: None,
-            },
-            Vec::new(),
-        ));
-    let limitations = hotspot
-        .limitation
-        .as_deref()
-        .and_then(|json| serde_json::from_str::<TuiHotspotLimitationsPayload>(json).ok())
-        .map(|payload| payload.limitations)
-        .unwrap_or_default();
-
-    Some(ReportHotspot {
-        rank: hotspot.rank,
-        path: hotspot.path,
-        score: hotspot.score,
-        formula_version: formula_version_from_index(&hotspot.formula_version),
-        raw_metrics,
-        normalized_metrics,
-        weighted_terms,
-        limitations,
-    })
-}
-
-fn formula_version_from_index(id: &str) -> FormulaVersion {
-    if id == crate::scoring::CURRENT_SCORE_FORMULA_ID {
-        FormulaVersion::current()
-    } else {
-        FormulaVersion {
-            id: id.to_owned(),
-            major: 0,
-            minor: 0,
-        }
-    }
-}
-
-fn file_record_from_persisted(file: storage::index::PersistedFileRecord) -> FileRecord {
-    FileRecord {
-        path: file.path,
-        byte_size: file.byte_size,
-        extension: file.extension,
-        language: static_language(file.language.as_deref()),
-        line_count: file.line_count,
-        is_vendor: file.is_vendor,
-        is_generated: file.is_generated,
-        content: file.content,
-        is_symlink: file.is_symlink,
-        classification: static_classification(file.classification.as_deref()),
-        warnings: Vec::new(),
-    }
-}
-
-fn static_language(language: Option<&str>) -> Option<&'static str> {
-    match language {
-        Some("Go") => Some("Go"),
-        Some("JavaScript") => Some("JavaScript"),
-        Some("JavaScript JSX") => Some("JavaScript JSX"),
-        Some("Python") => Some("Python"),
-        Some("Rust") => Some("Rust"),
-        Some("TypeScript") => Some("TypeScript"),
-        Some("TypeScript JSX") => Some("TypeScript JSX"),
-        _ => None,
-    }
-}
-
-fn static_classification(classification: Option<&str>) -> &'static str {
-    match classification {
-        Some("implemented") => "implemented",
-        Some("generated") => "generated",
-        Some("vendor") => "vendor",
-        Some("lockfile") => "lockfile",
-        Some("minified") => "minified",
-        _ => "implemented",
-    }
-}
-
-fn refresh_index_inspector(state: &mut TuiAppState, options: TuiOptions) {
-    let Some(path) = selected_index_hotspot_path(state) else {
-        if let Some(index_mode) = &mut state.index_mode {
-            index_mode.inspector = None;
-        }
-        return;
-    };
-    let Some(index_mode) = &mut state.index_mode else {
-        return;
-    };
-    let started = Instant::now();
-    let result = load_index_inspector(
-        &index_mode.worktree_root,
-        &path,
-        index_mode.include_generated_hotspots,
-    );
-    let elapsed = started.elapsed();
-    operation_log::event(
-        "hotpath.tui_inspector_query_completed",
-        json!({
-            "elapsed_ms": elapsed.as_millis(),
-            "path": path,
-        }),
-    );
-    log_tui_perf(
-        "hotpath.tui_inspector_query",
-        elapsed,
-        json!({ "path": path }),
-    );
-    match result {
-        Ok(inspector) => {
-            index_mode.inspector = inspector;
-            index_mode.last_query_error = None;
-            state.current_path = Some(path);
-            refresh_index_presentation(state, options);
-        }
-        Err(error) => {
-            index_mode.last_query_error = Some(error.to_string());
-            state.status = Some(format!("Inspector read failed: {error}"));
-        }
-    }
-}
-
-fn load_index_inspector(
-    worktree_root: &PathBuf,
-    path: &str,
-    include_generated_hotspots: bool,
-) -> Result<Option<TuiIndexInspector>, TuiSnapshotError> {
-    let store = storage::index::IndexStore::open_read_only(worktree_root)
-        .map_err(TuiSnapshotError::PersistScan)?;
-    load_index_inspector_from_store(&store, path, include_generated_hotspots)
-}
-
-fn load_index_inspector_from_store(
-    store: &storage::index::IndexStore,
-    path: &str,
-    include_generated_hotspots: bool,
-) -> Result<Option<TuiIndexInspector>, TuiSnapshotError> {
-    let Some(facts) = store
-        .latest_inspector_facts_by_path(path, include_generated_hotspots)
-        .map_err(TuiSnapshotError::PersistScan)?
-    else {
-        return Ok(None);
-    };
-    let raw_metrics = facts
-        .hotspot
-        .raw_metrics_json
-        .as_deref()
-        .and_then(|json| serde_json::from_str::<RawScoreMetrics>(json).ok());
-    let (normalized_metrics, weighted_terms) = facts
-        .hotspot
-        .explanation
-        .as_deref()
-        .and_then(|json| serde_json::from_str::<TuiHotspotExplanationPayload>(json).ok())
-        .map(|payload| (Some(payload.normalized_metrics), payload.weighted_terms))
-        .unwrap_or((None, Vec::new()));
-    let limitations = facts
-        .hotspot
-        .limitation
-        .as_deref()
-        .and_then(|json| serde_json::from_str::<TuiHotspotLimitationsPayload>(json).ok())
-        .map(|payload| payload.limitations)
-        .unwrap_or_default();
-
-    Ok(Some(TuiIndexInspector {
-        hotspot: facts.hotspot,
-        file: facts.file,
-        owners: facts.owners,
-        max_cyclomatic_complexity: facts.max_cyclomatic_complexity,
-        fan_in: facts.fan_in,
-        fan_out: facts.fan_out,
-        raw_metrics,
-        normalized_metrics,
-        weighted_terms,
-        limitations,
-    }))
-}
-
-fn selected_index_hotspot_path(state: &TuiAppState) -> Option<String> {
-    state
-        .index_mode
-        .as_ref()
-        .and_then(|index_mode| index_mode.hotspots.rows.get(state.selected_index()))
-        .map(|hotspot| hotspot.path.clone())
-}
-
-fn log_tui_perf(event: &'static str, elapsed: Duration, fields: serde_json::Value) {
-    if !tui_perf_enabled() {
-        return;
-    }
-    operation_log::event(
-        event,
-        json!({
-            "elapsed_ms": elapsed.as_millis(),
-            "fields": fields,
-        }),
-    );
-}
-
-fn tui_perf_enabled() -> bool {
-    env::var_os("HOTPATH_PERF").is_some_and(|value| {
-        let value = value.to_string_lossy();
-        !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
-    })
-}
-
-fn filtered_visible_rows(snapshot: &TuiSnapshot, state: &TuiAppState) -> Vec<String> {
-    if state.index_mode.is_some() && state.current_view == TuiView::Hotspots {
-        return index_visible_rows(state);
-    }
-    let rows = visible_rows(snapshot, state);
-    let Some(search) = &state.search else {
-        return rows;
-    };
-    let query = search.query.trim().to_lowercase();
-    if query.is_empty() {
-        return rows;
-    }
-
-    rows.into_iter()
-        .filter(|row| row.to_lowercase().contains(&query))
-        .collect()
-}
-
-fn index_visible_rows(state: &TuiAppState) -> Vec<String> {
-    let Some(index_mode) = &state.index_mode else {
-        return Vec::new();
-    };
-    if index_mode.hotspots.rows.is_empty() && index_mode.pending_page.is_some() {
-        return vec!["Loading hotspots from index...".to_owned()];
-    }
-    if index_mode.hotspots.rows.is_empty() {
-        return vec!["No current files were ranked as hotspots.".to_owned()];
-    }
-    index_mode
-        .hotspots
-        .rows
-        .iter()
-        .map(|hotspot| {
-            format!(
-                "#{rank} {path} score {score:.3}",
-                rank = hotspot.rank,
-                path = hotspot.path,
-                score = hotspot.score
-            )
-        })
-        .collect()
-}
-
-fn visible_rows(snapshot: &TuiSnapshot, state: &TuiAppState) -> Vec<String> {
-    match state.current_view {
-        TuiView::Hotspots => hotspot_rows(snapshot),
-        TuiView::RepoTree => repo_tree_rows(snapshot)
-            .into_iter()
-            .map(|row| row.text)
-            .collect(),
-        TuiView::FileDetail => state
-            .current_path
-            .as_deref()
-            .map(|path| file_detail_rows(snapshot, path))
-            .unwrap_or_else(|| vec!["No file selected.".to_owned()]),
-        TuiView::SymbolDetail => state
-            .current_symbol
-            .as_ref()
-            .map(|symbol| symbol_detail_rows(snapshot, symbol))
-            .unwrap_or_else(|| vec!["No symbol selected.".to_owned()]),
-        TuiView::GitDetail => state
-            .current_path
-            .as_deref()
-            .map(|path| git_detail_rows(snapshot, path))
-            .unwrap_or_else(|| vec!["No file selected.".to_owned()]),
-        TuiView::CouplingGraph => coupling_graph_rows(snapshot, state.current_path.as_deref()),
-        TuiView::ContextBudgeting => context_budgeting_rows(snapshot),
-        TuiView::ExplainScore => state
-            .current_path
-            .as_deref()
-            .map(|path| explain_score_rows(snapshot, path))
-            .unwrap_or_else(|| vec!["No file selected.".to_owned()]),
-    }
-}
-
-fn hotspot_rows(snapshot: &TuiSnapshot) -> Vec<String> {
-    if snapshot.report.hotspots.is_empty() {
-        return vec!["No current files were ranked as hotspots.".to_owned()];
-    }
-
-    snapshot
-        .report
-        .hotspots
-        .iter()
-        .map(|hotspot| {
-            format!(
-                "#{rank} {path} score {score:.3}",
-                rank = hotspot.rank,
-                path = hotspot.path,
-                score = hotspot.score
-            )
-        })
-        .collect()
-}
-
-fn file_detail_rows(snapshot: &TuiSnapshot, path: &str) -> Vec<String> {
-    let mut rows = vec![format!("File: {path}")];
-    rows.push("Repo tree: press t".to_owned());
-    rows.push("Coupling graph: press g".to_owned());
-
-    if let Some(file) = file_for_path(snapshot, path) {
-        rows.extend([
-            format!("Language: {}", file.language.unwrap_or("unknown")),
-            format!("Classification: {}", file.classification),
-            format!("Content: {:?}", file.content),
-            format!("Bytes: {}", optional_u64(file.byte_size)),
-            format!("Lines: {}", optional_u64(file.line_count)),
-            format!("Generated: {}", file.is_generated),
-            format!("Vendor: {}", file.is_vendor),
-            format!("Symlink: {}", file.is_symlink),
-        ]);
-        if !file.warnings.is_empty() {
-            rows.push(format!("Warnings: {:?}", file.warnings));
-        }
-    } else {
-        rows.push("Scan facts: file not present in current scan snapshot".to_owned());
-    }
-
-    if let Some(hotspot) = hotspot_for_path(snapshot, path) {
-        rows.extend([
-            format!("Hotspot score: {:.3}", hotspot.score),
-            format!("Rank: #{}", hotspot.rank),
-            "Git detail: press Enter".to_owned(),
-        ]);
-        rows.extend(
-            raw_metric_rows(hotspot)
-                .into_iter()
-                .map(|row| format!("Metric: {row}")),
-        );
-        rows.extend(limitation_rows(hotspot));
-    } else {
-        rows.push("Hotspot score: not ranked".to_owned());
-        rows.push("Limitations: no score explanation is available for this file".to_owned());
-    }
-
-    let symbols = symbols_for_path(snapshot, path);
-    if symbols.is_empty() {
-        rows.push("Related symbols: none".to_owned());
-    } else {
-        rows.push(format!("Related symbols: {}", symbols.len()));
-        rows.extend(symbols.into_iter().take(8).map(symbol_row_text));
-    }
-
-    rows
-}
-
-fn coupling_graph_rows(snapshot: &TuiSnapshot, path: Option<&str>) -> Vec<String> {
-    match path {
-        Some(path) => coupling_graph_file_rows(snapshot, path),
-        None => coupling_graph_overview_rows(snapshot),
-    }
-}
-
-fn coupling_graph_file_rows(snapshot: &TuiSnapshot, path: &str) -> Vec<String> {
-    let fan = fan_for_path(snapshot, path);
-    let incoming = incoming_edges_for_path(snapshot, path);
-    let outgoing = outgoing_edges_for_path(snapshot, path);
-    let mut rows = vec![
-        format!("File: {path}"),
-        format!(
-            "Matched current file: {}",
-            file_for_path(snapshot, path).is_some()
-        ),
-        format!(
-            "Coupling: {} dependencies, {} dependents",
-            fan.map_or(0, |fan| fan.fan_out),
-            fan.map_or(0, |fan| fan.fan_in)
-        ),
-    ];
-
-    rows.push("Incoming edges:".to_owned());
-    if incoming.is_empty() {
-        rows.push("Incoming: none".to_owned());
-    } else {
-        rows.extend(incoming.into_iter().map(|edge| {
-            format!(
-                "Incoming: {} -> {} ({})",
-                edge.source_path, edge.target_path, edge.kind
-            )
-        }));
-    }
-
-    rows.push("Outgoing edges:".to_owned());
-    if outgoing.is_empty() {
-        rows.push("Outgoing: none".to_owned());
-    } else {
-        rows.extend(outgoing.into_iter().map(|edge| {
-            format!(
-                "Outgoing: {} -> {} ({})",
-                edge.source_path, edge.target_path, edge.kind
-            )
-        }));
-    }
-
-    rows
-}
-
-fn coupling_graph_overview_rows(snapshot: &TuiSnapshot) -> Vec<String> {
-    let mut rows = vec![format!(
-        "Coupling graph: {} resolved dependency edges",
-        snapshot.coupling.edges.len()
-    )];
-
-    if snapshot.coupling.fan_by_file.is_empty() {
-        rows.push("Coupling graph: no parsed current files".to_owned());
-        return rows;
-    }
-
-    rows.push("Files by coupling:".to_owned());
-    rows.extend(snapshot.coupling.fan_by_file.iter().map(|fan| {
-        format!(
-            "File: {} dependencies {} dependents {}",
-            fan.path, fan.fan_out, fan.fan_in
-        )
-    }));
-
-    if snapshot.coupling.edges.is_empty() {
-        rows.push("Edges: none resolved from parser imports".to_owned());
-    }
-
-    rows
-}
-
-fn context_budgeting_rows(snapshot: &TuiSnapshot) -> Vec<String> {
-    let context = &snapshot.report.context;
-    let summary = &context.summary;
-    let mut rows = vec![
-        format!("Total estimated tokens: {}", summary.estimated_tokens),
-        format!("Included files: {}", summary.included_files),
-        format!("Skipped files: {}", summary.skipped_files),
-        format!("Included bytes: {}", summary.included_bytes),
-    ];
-
-    if let Some(budget) = &context.budget {
-        rows.push(format!("Budget: {}", context_budget_status_text(budget)));
-    } else {
-        rows.push("Budget: none configured".to_owned());
-    }
-
-    rows.push("Top groups:".to_owned());
-    if context.groups.is_empty() {
-        rows.push("Group: none".to_owned());
-    } else {
-        rows.extend(context.groups.iter().map(|group| {
-            format!(
-                "Group: {} tokens {} bytes {} files {}",
-                group.path, group.estimated_tokens, group.byte_size, group.file_count
-            )
-        }));
-    }
-
-    rows.push("Skipped files:".to_owned());
-    if context.skipped.is_empty() {
-        rows.push("Skipped: none".to_owned());
-    } else {
-        rows.extend(context.skipped.iter().map(|skipped| {
-            format!(
-                "Skipped: {} ({})",
-                skipped.path,
-                context_skipped_reason_label(skipped.reason)
-            )
-        }));
-    }
-
-    rows.extend([
-        "Approximation: estimated tokens = ceil(byte_size / 4) for UTF-8 text files".to_owned(),
-        "Approximation: tokenizer-specific counts vary by model and language".to_owned(),
-    ]);
-
-    rows
+pub struct RiskFact {
+    pub kind: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RepoTreeRow {
-    path: String,
-    text: String,
-    is_file: bool,
+pub struct RiskLimitation {
+    pub code: String,
+    pub message: String,
 }
 
-#[derive(Debug, Default)]
-struct RepoTreeNode {
-    children: BTreeMap<String, RepoTreeNode>,
-    file_path: Option<String>,
+#[derive(Debug, Clone, PartialEq)]
+pub struct RiskOwner {
+    pub author: String,
+    pub ownership_share: f64,
+    pub touch_count: u64,
 }
 
-impl Drop for RepoTreeNode {
-    fn drop(&mut self) {
-        let mut children = std::mem::take(&mut self.children)
-            .into_values()
-            .collect::<Vec<_>>();
-
-        while let Some(mut child) = children.pop() {
-            children.extend(std::mem::take(&mut child.children).into_values());
-        }
-    }
-}
-
-fn repo_tree_rows(snapshot: &TuiSnapshot) -> Vec<RepoTreeRow> {
-    let mut root = RepoTreeNode::default();
-    for file in &snapshot.scan.files {
-        insert_repo_tree_path(&mut root, &file.path);
-    }
-
-    let mut rows = Vec::new();
-    append_repo_tree_rows(&root, 0, &mut rows);
-    if rows.is_empty() {
-        rows.push(RepoTreeRow {
-            path: String::new(),
-            text: "Repository tree: no scanned files".to_owned(),
-            is_file: false,
-        });
-    }
-    rows
-}
-
-fn insert_repo_tree_path(root: &mut RepoTreeNode, path: &str) {
-    let mut node = root;
-    for part in path.split('/').filter(|part| !part.is_empty()) {
-        node = node.children.entry(part.to_owned()).or_default();
-    }
-    node.file_path = Some(path.to_owned());
-}
-
-enum RepoTreeFrame<'a> {
-    Children(&'a RepoTreeNode, usize),
-    Directory(&'a str, &'a RepoTreeNode, usize),
-    File(&'a RepoTreeNode, usize),
-}
-
-fn append_repo_tree_rows(root: &RepoTreeNode, depth: usize, rows: &mut Vec<RepoTreeRow>) {
-    let mut stack = vec![RepoTreeFrame::Children(root, depth)];
-
-    while let Some(frame) = stack.pop() {
-        match frame {
-            RepoTreeFrame::Children(node, depth) => {
-                let (dirs, files): (Vec<_>, Vec<_>) = node
-                    .children
-                    .iter()
-                    .partition(|(_, child)| child.file_path.is_none());
-
-                for (_name, child) in files.into_iter().rev() {
-                    stack.push(RepoTreeFrame::File(child, depth));
-                }
-
-                for (name, child) in dirs.into_iter().rev() {
-                    stack.push(RepoTreeFrame::Directory(name, child, depth));
-                }
-            }
-            RepoTreeFrame::Directory(name, child, depth) => {
-                let path = repo_tree_display_path(child);
-                rows.push(RepoTreeRow {
-                    path,
-                    text: format!("{}[dir] {name}/", "  ".repeat(depth)),
-                    is_file: false,
-                });
-                stack.push(RepoTreeFrame::Children(child, depth + 1));
-            }
-            RepoTreeFrame::File(child, depth) => {
-                if let Some(path) = &child.file_path {
-                    rows.push(RepoTreeRow {
-                        path: path.clone(),
-                        text: format!("{}[file] {path}", "  ".repeat(depth)),
-                        is_file: true,
-                    });
-                }
-            }
-        }
-    }
-}
-
-fn repo_tree_display_path(node: &RepoTreeNode) -> String {
-    node.file_path.clone().unwrap_or_default()
-}
-
-fn symbol_detail_rows(snapshot: &TuiSnapshot, key: &SymbolKey) -> Vec<String> {
-    let parse_symbol = parse_symbol_for_key(snapshot, key);
-    let complexity_symbol = complexity_symbol_for_key(snapshot, key);
-    let Some(symbol) = parse_symbol else {
-        return vec![
-            format!("File: {}", key.path),
-            format!("Symbol: {} {}", key.kind, key.name),
-            "Parser facts: symbol not present in current snapshot".to_owned(),
-        ];
-    };
-    let length_lines = complexity_symbol
-        .map(|symbol| symbol.length_lines)
-        .unwrap_or(symbol.end_line - symbol.start_line + 1);
-    let function_length_lines = complexity_symbol.and_then(|symbol| symbol.function_length_lines);
-    let is_large_symbol = complexity_symbol.map(|symbol| symbol.is_large_symbol);
-
-    vec![
-        format!("File: {}", symbol.path),
-        format!("Symbol: {} {}", symbol.kind, symbol.name),
-        format!("Kind: {}", symbol.kind),
-        format!("Range: lines {}-{}", symbol.start_line, symbol.end_line),
-        format!("Parent: {}", optional_string(symbol.parent.as_deref())),
-        format!("Nesting depth: {}", symbol.nesting_depth),
-        format!("Length lines: {length_lines}"),
-        format!(
-            "Function length lines: {}",
-            optional_u64(function_length_lines)
-        ),
-        format!(
-            "Cyclomatic complexity: {}",
-            optional_u64(symbol.cyclomatic_complexity)
-        ),
-        format!(
-            "Max control flow nesting: {}",
-            optional_u64(symbol.max_control_flow_nesting)
-        ),
-        format!("Large symbol: {}", optional_bool(is_large_symbol)),
-    ]
-}
-
-fn git_detail_rows(snapshot: &TuiSnapshot, path: &str) -> Vec<String> {
-    let Some(hotspot) = hotspot_for_path(snapshot, path) else {
-        return vec![
-            format!("File: {path}"),
-            "Git metrics: no hotspot score raw metrics available".to_owned(),
-        ];
-    };
-
-    let raw = &hotspot.raw_metrics;
-    vec![
-        format!("File: {path}"),
-        format!("Commits: {}", optional_u64(raw.commits_per_file)),
-        format!("Total churn lines: {}", optional_u64(raw.total_churn_lines)),
-        format!("Contributors: {}", optional_u64(raw.author_count)),
-        format!("Owners: {}", optional_u64(raw.owner_count)),
-        format!(
-            "Dominant ownership: {}",
-            optional_percent(raw.dominant_owner_share)
-        ),
-        format!(
-            "Co-changed file count: {}",
-            optional_u64(raw.co_changed_file_count)
-        ),
-    ]
-}
-
-fn explain_score_rows(snapshot: &TuiSnapshot, path: &str) -> Vec<String> {
-    let Some(hotspot) = hotspot_for_path(snapshot, path) else {
-        return vec![
-            format!("File: {path}"),
-            "Score explanation: no hotspot score available".to_owned(),
-        ];
-    };
-
-    let mut rows = vec![
-        format!("File: {path}"),
-        format!("Score: {:.3}", hotspot.score),
-        format!("Formula: {}", hotspot.formula_version.id),
-        format!(
-            "Formula version: {}.{}",
-            hotspot.formula_version.major, hotspot.formula_version.minor
-        ),
-    ];
-    rows.extend(hotspot.weighted_terms.iter().map(|term| {
-        format!(
-            "Term: {} weight {:.2} input {} contribution {:.3}",
-            term.name,
-            term.weight,
-            optional_f64(term.normalized_input),
-            term.weighted_contribution
-        )
-    }));
-    rows.extend(limitation_rows(hotspot));
-
-    rows
-}
-
-fn raw_metric_rows(hotspot: &ReportHotspot) -> Vec<String> {
-    let raw = &hotspot.raw_metrics;
-    vec![
-        format!("bytes {}", optional_u64(raw.byte_size)),
-        format!("lines {}", optional_u64(raw.line_count)),
-        format!("commits {}", optional_u64(raw.commits_per_file)),
-        format!("total churn lines {}", optional_u64(raw.total_churn_lines)),
-        format!(
-            "authors {}  owners {}",
-            optional_u64(raw.author_count),
-            optional_u64(raw.owner_count)
-        ),
-        format!(
-            "dominant ownership {}",
-            optional_percent(raw.dominant_owner_share)
-        ),
-        format!(
-            "co-changed files {}",
-            optional_u64(raw.co_changed_file_count)
-        ),
-    ]
-}
-
-fn limitation_rows(hotspot: &ReportHotspot) -> Vec<String> {
-    if hotspot.limitations.is_empty() {
-        return vec!["Limitations: none recorded".to_owned()];
-    }
-
-    hotspot
-        .limitations
-        .iter()
-        .map(|limitation| format!("Limitation: {} - {}", limitation.code, limitation.message))
-        .collect()
-}
-
-fn hotspot_path_from_row(snapshot: &TuiSnapshot, row_text: &str) -> Option<String> {
-    snapshot
-        .report
-        .hotspots
-        .iter()
-        .find(|hotspot| {
-            row_text.starts_with(&format!("#{} {}", hotspot.rank, hotspot.path))
-                || row_text == hotspot.path
-        })
-        .map(|hotspot| hotspot.path.clone())
-}
-
-fn repo_tree_path_from_row(snapshot: &TuiSnapshot, row_text: &str) -> Option<String> {
-    repo_tree_rows(snapshot)
-        .into_iter()
-        .find(|row| row.is_file && row.text == row_text)
-        .map(|row| row.path)
-}
-
-fn coupling_graph_path_from_row(
-    snapshot: &TuiSnapshot,
-    current_path: Option<&str>,
-    row_text: &str,
-) -> Option<String> {
-    if let Some(path) = row_text
-        .strip_prefix("File: ")
-        .and_then(|rest| {
-            rest.split_once(" fan-in ")
-                .map(|(path, _)| path)
-                .or(Some(rest))
-        })
-        .filter(|path| file_for_path(snapshot, path).is_some())
-    {
-        return Some(path.to_owned());
-    }
-
-    if let Some((source, target)) = parse_coupling_edge_row(row_text, "Incoming: ") {
-        return coupling_edge_drilldown_target(snapshot, current_path, source, target);
-    }
-
-    if let Some((source, target)) = parse_coupling_edge_row(row_text, "Outgoing: ") {
-        return coupling_edge_drilldown_target(snapshot, current_path, source, target);
-    }
-
-    None
-}
-
-fn parse_coupling_edge_row<'a>(row_text: &'a str, prefix: &str) -> Option<(&'a str, &'a str)> {
-    let rest = row_text.strip_prefix(prefix)?;
-    let (source, rest) = rest.split_once(" -> ")?;
-    let (target, _) = rest.rsplit_once(" (")?;
-
-    Some((source, target))
-}
-
-fn coupling_edge_drilldown_target(
-    snapshot: &TuiSnapshot,
-    current_path: Option<&str>,
-    source: &str,
-    target: &str,
-) -> Option<String> {
-    let next = match current_path {
-        Some(current) if current == source => target,
-        Some(current) if current == target => source,
-        _ => target,
-    };
-
-    file_for_path(snapshot, next).map(|_| next.to_owned())
-}
-
-fn hotspot_for_path<'a>(snapshot: &'a TuiSnapshot, path: &str) -> Option<&'a ReportHotspot> {
-    snapshot
-        .report
-        .hotspots
-        .iter()
-        .find(|hotspot| hotspot.path == path)
-}
-
-fn file_for_path<'a>(snapshot: &'a TuiSnapshot, path: &str) -> Option<&'a FileRecord> {
-    snapshot.scan.files.iter().find(|file| file.path == path)
-}
-
-fn symbols_for_path<'a>(snapshot: &'a TuiSnapshot, path: &str) -> Vec<&'a ParseSymbolRecord> {
-    snapshot
-        .symbols
-        .symbols
-        .iter()
-        .filter(|symbol| symbol.path == path)
-        .collect()
-}
-
-fn fan_for_path<'a>(snapshot: &'a TuiSnapshot, path: &str) -> Option<&'a TuiFileFan> {
-    snapshot
-        .coupling
-        .fan_by_file
-        .iter()
-        .find(|fan| fan.path == path)
-}
-
-fn ownership_for_path<'a>(snapshot: &'a TuiSnapshot, path: &str) -> Option<&'a TuiFileOwnership> {
-    snapshot
-        .ownership
-        .by_file
-        .iter()
-        .find(|ownership| ownership.path == path)
-}
-
-fn incoming_edges_for_path<'a>(
-    snapshot: &'a TuiSnapshot,
-    path: &str,
-) -> Vec<&'a ResolvedDependencyEdge> {
-    snapshot
-        .coupling
-        .edges
-        .iter()
-        .filter(|edge| edge.target_path == path)
-        .collect()
-}
-
-fn outgoing_edges_for_path<'a>(
-    snapshot: &'a TuiSnapshot,
-    path: &str,
-) -> Vec<&'a ResolvedDependencyEdge> {
-    snapshot
-        .coupling
-        .edges
-        .iter()
-        .filter(|edge| edge.source_path == path)
-        .collect()
-}
-
-fn symbol_from_file_detail_row<'a>(
-    snapshot: &'a TuiSnapshot,
-    path: &str,
-    row_text: &str,
-) -> Option<&'a ParseSymbolRecord> {
-    symbols_for_path(snapshot, path)
-        .into_iter()
-        .find(|symbol| symbol_row_text(symbol) == row_text)
-}
-
-fn parse_symbol_for_key<'a>(
-    snapshot: &'a TuiSnapshot,
-    key: &SymbolKey,
-) -> Option<&'a ParseSymbolRecord> {
-    snapshot
-        .symbols
-        .symbols
-        .iter()
-        .find(|symbol| SymbolKey::from_parse(symbol) == *key)
-}
-
-fn complexity_symbol_for_key<'a>(
-    snapshot: &'a TuiSnapshot,
-    key: &SymbolKey,
-) -> Option<&'a ComplexitySymbolRecord> {
-    snapshot
-        .complexity
-        .symbols
-        .iter()
-        .find(|symbol| SymbolKey::from_complexity(symbol) == *key)
-}
-
-fn symbol_row_text(symbol: &ParseSymbolRecord) -> String {
-    format!(
-        "Symbol: {} {} lines {}-{}",
-        symbol.kind, symbol.name, symbol.start_line, symbol.end_line
-    )
-}
-
-fn is_git_detail_row(row_text: &str) -> bool {
-    row_text == "Git detail: press Enter"
-}
-
-fn context_budget_status_text(budget: &ContextBudgetStatus) -> String {
-    match (budget.remaining_tokens, budget.over_budget_tokens) {
-        (Some(remaining), _) => format!(
-            "within budget by {remaining} tokens (budget {}, estimated {})",
-            budget.budget_tokens, budget.estimated_tokens
-        ),
-        (_, Some(over)) => format!(
-            "over budget by {over} tokens (budget {}, estimated {})",
-            budget.budget_tokens, budget.estimated_tokens
-        ),
-        (None, None) => format!(
-            "within budget by 0 tokens (budget {}, estimated {})",
-            budget.budget_tokens, budget.estimated_tokens
-        ),
-    }
-}
-
-fn context_skipped_reason_label(reason: ContextSkippedReason) -> &'static str {
-    match reason {
-        ContextSkippedReason::Binary => "binary",
-        ContextSkippedReason::UnknownContent => "unknown content",
-        ContextSkippedReason::MissingByteSize => "missing byte size",
-        ContextSkippedReason::Unreadable => "unreadable",
-        ContextSkippedReason::ExcludedGenerated => "excluded generated",
-        ContextSkippedReason::ExcludedVendor => "excluded vendor",
-    }
-}
-
-fn optional_u64(value: Option<u64>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "unknown".to_owned())
-}
-
-fn optional_f64(value: Option<f64>) -> String {
-    value
-        .map(|value| format!("{value:.3}"))
-        .unwrap_or_else(|| "unknown".to_owned())
-}
-
-fn optional_percent(value: Option<f64>) -> String {
-    value
-        .map(|value| format!("{:.1}%", value * 100.0))
-        .unwrap_or_else(|| "unknown".to_owned())
-}
-
-fn optional_string(value: Option<&str>) -> String {
-    value
-        .map(str::to_owned)
-        .unwrap_or_else(|| "none".to_owned())
-}
-
-fn optional_bool(value: Option<bool>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "unknown".to_owned())
-}
-
-#[cfg(test)]
-fn visible_row_window(
-    rows: &[String],
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TuiState {
     selected: usize,
-    limit: usize,
-) -> impl Iterator<Item = (usize, &String)> {
-    let start = selected
-        .saturating_add(1)
-        .saturating_sub(limit)
-        .min(rows.len());
-
-    rows.iter().enumerate().skip(start).take(limit)
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct DisplayRow {
-    text: String,
-    label: String,
-    meta: String,
-    severity: TuiSeverity,
-    hotspot: Option<DisplayHotspotRow>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct DisplayHotspotRow {
-    path: String,
-    score: f64,
-    tags: Vec<String>,
+    search_query: String,
+    search_editing: bool,
+    show_help: bool,
+    should_exit: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -3401,403 +245,180 @@ impl TuiSizeBand {
     }
 }
 
-fn layout_mode(area: Rect) -> TuiLayoutMode {
-    if area.width >= 120 && area.height >= 30 {
-        TuiLayoutMode::Wide
-    } else if area.width >= 90 {
-        TuiLayoutMode::Medium
-    } else {
-        TuiLayoutMode::Narrow
-    }
-}
-
-fn display_rows(snapshot: &TuiSnapshot, state: &TuiAppState) -> Vec<DisplayRow> {
-    if let (Some(index_mode), TuiView::Hotspots) = (&state.index_mode, state.current_view) {
-        return index_display_rows(index_mode);
-    }
-    filtered_visible_rows(snapshot, state)
-        .into_iter()
-        .map(|text| display_row_from_text(snapshot, state.current_view, text))
-        .collect()
-}
-
-fn index_display_rows(index_mode: &TuiIndexMode) -> Vec<DisplayRow> {
-    if index_mode.hotspots.rows.is_empty() {
-        if index_mode.pending_page.is_some() {
-            return vec![DisplayRow {
-                text: "Loading hotspots from index...".to_owned(),
-                label: String::new(),
-                meta: String::new(),
-                severity: TuiSeverity::Muted,
-                hotspot: None,
-            }];
+impl TuiState {
+    fn new() -> Self {
+        Self {
+            selected: 0,
+            search_query: String::new(),
+            search_editing: false,
+            show_help: false,
+            should_exit: false,
         }
-        return vec![DisplayRow {
-            text: "No current files were ranked as hotspots.".to_owned(),
-            label: String::new(),
-            meta: String::new(),
-            severity: TuiSeverity::Muted,
-            hotspot: None,
-        }];
     }
 
-    index_mode
-        .hotspots
-        .rows
-        .iter()
-        .map(|hotspot| {
-            let text = format!(
-                "#{rank} {path} score {score:.3}",
-                rank = hotspot.rank,
-                path = hotspot.path,
-                score = hotspot.score
-            );
-            hotspot_display_row(&index_mode.presentation, text)
-        })
-        .collect()
-}
+    fn filtered_indices(&self, snapshot: &TuiDatabaseSnapshot) -> Vec<usize> {
+        if self.search_query.is_empty() {
+            return (0..snapshot.rows.len()).collect();
+        }
+        let query = self.search_query.to_ascii_lowercase();
+        snapshot
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_index, row)| row.relative_path.to_ascii_lowercase().contains(&query))
+            .map(|(index, _row)| index)
+            .collect()
+    }
 
-fn display_row_from_text(snapshot: &TuiSnapshot, view: TuiView, text: String) -> DisplayRow {
-    match view {
-        TuiView::Hotspots => hotspot_display_row(snapshot, text),
-        TuiView::RepoTree => repo_tree_display_row(snapshot, text),
-        TuiView::CouplingGraph => coupling_display_row(text),
-        TuiView::ContextBudgeting => context_display_row(text),
-        TuiView::ExplainScore => explain_display_row(text),
-        TuiView::FileDetail | TuiView::SymbolDetail | TuiView::GitDetail => {
-            detail_display_row(text)
+    fn clamp(&mut self, row_count: usize) {
+        if row_count == 0 {
+            self.selected = 0;
+        } else {
+            self.selected = self.selected.min(row_count - 1);
         }
     }
 }
 
-fn hotspot_display_row(snapshot: &TuiSnapshot, text: String) -> DisplayRow {
-    let hotspot =
-        hotspot_path_from_row(snapshot, &text).and_then(|path| hotspot_for_path(snapshot, &path));
-    let severity = hotspot
-        .map(|hotspot| severity_for_score(hotspot.score))
-        .unwrap_or(TuiSeverity::Neutral);
-    let meta = hotspot
-        .map(|hotspot| {
-            let risk = (hotspot.score * 10.0).round() as u64;
-            format!(
-                "risk {risk}/10  churn {}  authors {}",
-                optional_u64(hotspot.raw_metrics.total_churn_lines),
-                optional_u64(hotspot.raw_metrics.author_count)
-            )
-        })
-        .unwrap_or_default();
-
-    DisplayRow {
-        hotspot: hotspot.map(|hotspot| DisplayHotspotRow {
-            path: hotspot.path.clone(),
-            score: hotspot.score,
-            tags: hotspot_driver_tags(snapshot, hotspot),
-        }),
-        label: String::new(),
-        text,
-        meta,
-        severity,
+fn run_app(terminal: &mut TuiTerminal, snapshot: TuiDatabaseSnapshot) -> io::Result<()> {
+    let mut state = TuiState::new();
+    loop {
+        terminal.draw(|frame| render(frame, &snapshot, &state))?;
+        if event::poll(Duration::from_millis(200))? {
+            if let Event::Key(key) = event::read()? {
+                reduce_key(&mut state, &snapshot, key);
+                if state.should_exit {
+                    return Ok(());
+                }
+            }
+        }
     }
 }
 
-fn repo_tree_display_row(snapshot: &TuiSnapshot, text: String) -> DisplayRow {
-    let severity = repo_tree_path_from_row(snapshot, &text)
-        .and_then(|path| {
-            hotspot_for_path(snapshot, &path).map(|hotspot| severity_for_score(hotspot.score))
-        })
-        .unwrap_or(TuiSeverity::Muted);
-    let label = if text.contains("[dir]") {
-        "dir"
-    } else {
-        "file"
+fn reduce_key(state: &mut TuiState, snapshot: &TuiDatabaseSnapshot, key: KeyEvent) {
+    if key.kind != KeyEventKind::Press {
+        return;
     }
-    .to_owned();
-
-    DisplayRow {
-        text,
-        label,
-        meta: String::new(),
-        severity,
-        hotspot: None,
+    if state.search_editing {
+        match key.code {
+            KeyCode::Esc => state.search_editing = false,
+            KeyCode::Enter => state.search_editing = false,
+            KeyCode::Backspace => {
+                state.search_query.pop();
+                state.clamp(state.filtered_indices(snapshot).len());
+            }
+            KeyCode::Char(character) => {
+                state.search_query.push(character);
+                state.clamp(state.filtered_indices(snapshot).len());
+            }
+            _ => {}
+        }
+        return;
     }
-}
 
-fn detail_display_row(text: String) -> DisplayRow {
-    let severity = if text.starts_with("Hotspot score:")
-        || text.starts_with("Rank:")
-        || text.starts_with("Large symbol: true")
-    {
-        TuiSeverity::Medium
-    } else if text.starts_with("Limitation:") || text.starts_with("Warnings:") {
-        TuiSeverity::High
-    } else if text.contains("unknown") || text.contains("not ranked") {
-        TuiSeverity::Muted
-    } else {
-        TuiSeverity::Neutral
-    };
-    let label = text
-        .split_once(':')
-        .map(|(label, _)| label.to_ascii_lowercase())
-        .unwrap_or_else(|| "detail".to_owned());
-
-    DisplayRow {
-        text,
-        label,
-        meta: String::new(),
-        severity,
-        hotspot: None,
+    let row_count = state.filtered_indices(snapshot).len();
+    match key.code {
+        KeyCode::Char('q') => state.should_exit = true,
+        KeyCode::Char('?') => state.show_help = !state.show_help,
+        KeyCode::Char('/') => state.search_editing = true,
+        KeyCode::Esc => {
+            if state.show_help {
+                state.show_help = false;
+            } else {
+                state.search_query.clear();
+                state.clamp(row_count);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            state.selected = (state.selected + 1).min(row_count.saturating_sub(1));
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.selected = state.selected.saturating_sub(1);
+        }
+        KeyCode::Char('g') => state.selected = 0,
+        KeyCode::Char('G') => state.selected = row_count.saturating_sub(1),
+        _ => {}
     }
 }
 
-fn coupling_display_row(text: String) -> DisplayRow {
-    let severity = if text.starts_with("Incoming: none")
-        || text.starts_with("Outgoing: none")
-        || text.starts_with("Edges: none")
-    {
-        TuiSeverity::Muted
-    } else if text.contains("fan-in") || text.contains("fan-out") {
-        TuiSeverity::Medium
-    } else {
-        TuiSeverity::Neutral
-    };
-    let label = if text.starts_with("Incoming:") {
-        "incoming"
-    } else if text.starts_with("Outgoing:") {
-        "outgoing"
-    } else {
-        "coupling"
-    };
-
-    DisplayRow {
-        text,
-        label: label.to_owned(),
-        meta: String::new(),
-        severity,
-        hotspot: None,
-    }
-}
-
-fn context_display_row(text: String) -> DisplayRow {
-    let severity = if text.contains("over budget") {
-        TuiSeverity::High
-    } else if text.starts_with("Skipped:") || text.starts_with("Approximation:") {
-        TuiSeverity::Muted
-    } else if text.starts_with("Group:") || text.starts_with("Budget:") {
-        TuiSeverity::Medium
-    } else {
-        TuiSeverity::Neutral
-    };
-
-    DisplayRow {
-        text,
-        label: "context".to_owned(),
-        meta: String::new(),
-        severity,
-        hotspot: None,
-    }
-}
-
-fn explain_display_row(text: String) -> DisplayRow {
-    let severity = if text.starts_with("Limitation:") {
-        TuiSeverity::High
-    } else if text.starts_with("Term:") {
-        TuiSeverity::Medium
-    } else {
-        TuiSeverity::Neutral
-    };
-
-    DisplayRow {
-        text,
-        label: "score".to_owned(),
-        meta: String::new(),
-        severity,
-        hotspot: None,
-    }
-}
-
-fn severity_for_score(score: f64) -> TuiSeverity {
-    if score >= 0.70 {
-        TuiSeverity::High
-    } else if score >= 0.40 {
-        TuiSeverity::Medium
-    } else {
-        TuiSeverity::Low
-    }
-}
-
-#[cfg(test)]
-fn render(frame: &mut Frame<'_>, snapshot: &TuiSnapshot, state: &TuiAppState) {
-    render_with_options(frame, snapshot, state, TuiOptions::default());
-}
-
-fn render_with_options(
-    frame: &mut Frame<'_>,
-    snapshot: &TuiSnapshot,
-    state: &TuiAppState,
-    options: TuiOptions,
-) {
+fn render(frame: &mut Frame<'_>, snapshot: &TuiDatabaseSnapshot, state: &TuiState) {
     let area = frame.area();
     let [header, body, footer] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(4),
-            Constraint::Min(10),
+            Constraint::Min(8),
             Constraint::Length(1),
         ])
         .areas(area);
-    let rows = display_rows(snapshot, state);
-    let mode = layout_mode(area);
 
-    render_header(frame, header, snapshot, state, options);
-    match mode {
-        TuiLayoutMode::Wide => render_wide_body(frame, body, snapshot, state, &rows, options),
-        TuiLayoutMode::Medium => render_medium_body(frame, body, snapshot, state, &rows, options),
-        TuiLayoutMode::Narrow => render_narrow_body(frame, body, snapshot, state, &rows, options),
+    render_header(frame, header, snapshot);
+    match layout_mode(area) {
+        TuiLayoutMode::Wide => render_joined_body(frame, body, snapshot, state, [62, 38]),
+        TuiLayoutMode::Medium => render_joined_body(frame, body, snapshot, state, [64, 36]),
+        TuiLayoutMode::Narrow => render_narrow_body(frame, body, snapshot, state),
     }
-    render_footer(frame, footer, state, options);
-
+    render_footer(frame, footer, state);
     if state.show_help {
-        render_help_overlay(frame, area, options);
-    }
-    if state.command_palette {
-        render_command_palette(frame, area, options);
+        render_help(frame, area);
     }
 }
 
-fn render_header(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    snapshot: &TuiSnapshot,
-    state: &TuiAppState,
-    options: TuiOptions,
-) {
-    let head = short_commit(&snapshot.report.summary.git.head_commit_id);
-    let path = state.current_path().unwrap_or("repo");
-    let title_style = style(options, TuiSeverity::Low).add_modifier(Modifier::BOLD);
-    let muted = style(options, TuiSeverity::Muted);
-    let nav = navigation_line(state, options);
-    let summary = if let Some(index_mode) = &state.index_mode {
-        format!(
-            "{} hotspots loaded from index",
-            format_compact_count(index_mode.hotspots.total)
-        )
-    } else {
-        format!(
-            "{} files  {} hotspots  {} tokens",
-            snapshot.scan.summary.total_files,
-            snapshot.report.summary.hotspot_count,
-            format_compact_count(snapshot.report.summary.context_estimated_tokens)
-        )
-    };
+fn render_header(frame: &mut Frame<'_>, area: Rect, snapshot: &TuiDatabaseSnapshot) {
+    let project = snapshot.project.as_ref();
+    let title = style(TuiSeverity::Low).add_modifier(Modifier::BOLD);
+    let muted = style(TuiSeverity::Muted);
+    let risk = project.map_or_else(
+        || "risk unavailable".to_owned(),
+        |project| format!("risk {:.1}/10 {}", project.risk_10, project.risk_band),
+    );
+    let confidence = project
+        .map(|project| project.confidence.as_str())
+        .unwrap_or("none");
+    let files = project
+        .map(|project| project.active_file_count)
+        .unwrap_or(0);
+    let hotspots = project
+        .map(|project| project.scored_file_count)
+        .unwrap_or(0);
+    let formula = project
+        .map(|project| project.formula_id.as_str())
+        .unwrap_or("none");
+
     let header = Paragraph::new(vec![
-        nav,
-        Line::styled(
-            horizontal_rule(area.width, options),
-            style(options, TuiSeverity::Muted),
-        ),
+        Line::from(vec![Span::styled(
+            "[1 Hotpath]",
+            style(TuiSeverity::Medium).add_modifier(Modifier::BOLD),
+        )]),
+        Line::styled(horizontal_rule(area.width), style(TuiSeverity::Muted)),
         Line::from(vec![
-            Span::styled("Hotpath", title_style),
+            Span::styled("Hotpath", title),
             Span::raw("  "),
             Span::styled("local risk triage", muted),
             Span::raw("  "),
-            Span::styled(format!("HEAD {head}"), muted),
+            Span::styled(risk, muted),
         ]),
         Line::from(vec![
-            Span::styled(
-                state.current_view.title(),
-                style(options, TuiSeverity::Medium),
-            ),
+            Span::styled("Hotpath", style(TuiSeverity::Medium)),
             Span::raw(" / "),
-            Span::raw(truncate_middle(
-                path,
-                area.width.saturating_sub(48) as usize,
+            Span::raw(format!(
+                "{files} files  {hotspots} hotspots  confidence {confidence}"
             )),
             Span::raw("  "),
-            Span::styled(summary, muted),
+            Span::styled(format!("formula {formula}"), muted),
         ]),
     ]);
 
     frame.render_widget(header, area);
 }
 
-fn render_wide_body(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    snapshot: &TuiSnapshot,
-    state: &TuiAppState,
-    rows: &[DisplayRow],
-    options: TuiOptions,
-) {
-    render_joined_body(frame, area, snapshot, state, rows, [62, 38], options);
-}
-
-fn render_medium_body(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    snapshot: &TuiSnapshot,
-    state: &TuiAppState,
-    rows: &[DisplayRow],
-    options: TuiOptions,
-) {
-    render_joined_body(frame, area, snapshot, state, rows, [64, 36], options);
-}
-
-fn render_narrow_body(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    snapshot: &TuiSnapshot,
-    state: &TuiAppState,
-    rows: &[DisplayRow],
-    options: TuiOptions,
-) {
-    render_main_panel(frame, area, snapshot, state, rows, options);
-}
-
-fn navigation_line(state: &TuiAppState, options: TuiOptions) -> Line<'static> {
-    let mut spans = Vec::new();
-    for (index, view) in PRIMARY_VIEWS.iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::raw("  "));
-        }
-        let active = *view == state.current_view;
-        let label = if active {
-            format!("[{} {}]", index + 1, view.title())
-        } else {
-            format!("{} {}", index + 1, view.title())
-        };
-        let mut view_style = if active {
-            style(options, TuiSeverity::Medium).add_modifier(Modifier::BOLD)
-        } else {
-            style(options, TuiSeverity::Muted)
-        };
-        if state.pane_focus == TuiPaneFocus::Nav {
-            view_style = view_style.add_modifier(Modifier::UNDERLINED);
-        }
-        spans.push(Span::styled(label, view_style));
-    }
-
-    Line::from(spans)
-}
-
-fn horizontal_rule(width: u16, options: TuiOptions) -> String {
-    let glyph = if options.ascii { '-' } else { '\u{2500}' };
-    glyph.to_string().repeat(width as usize)
-}
-
 fn render_joined_body(
     frame: &mut Frame<'_>,
     area: Rect,
-    snapshot: &TuiSnapshot,
-    state: &TuiAppState,
-    rows: &[DisplayRow],
+    snapshot: &TuiDatabaseSnapshot,
+    state: &TuiState,
     split_percentages: [u16; 2],
-    options: TuiOptions,
 ) {
-    let focused = matches!(
-        state.pane_focus,
-        TuiPaneFocus::Main | TuiPaneFocus::Inspector
-    );
-    let block = plain_panel_block(focused, options);
+    let block = plain_panel_block(true);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -3809,365 +430,233 @@ fn render_joined_body(
             Constraint::Percentage(split_percentages[1]),
         ])
         .areas(inner);
-
-    render_main_panel_content(frame, main, snapshot, state, rows, options);
-    render_vertical_divider(frame, divider, options);
-    render_inspector_content(frame, inspector, snapshot, state, rows, options);
+    render_main(frame, main, snapshot, state);
+    render_divider(frame, divider);
+    render_inspector(frame, inspector, snapshot, state);
 }
 
-fn render_main_panel_content(
+fn render_narrow_body(
     frame: &mut Frame<'_>,
     area: Rect,
-    snapshot: &TuiSnapshot,
-    state: &TuiAppState,
-    rows: &[DisplayRow],
-    options: TuiOptions,
+    snapshot: &TuiDatabaseSnapshot,
+    state: &TuiState,
+) {
+    let rows = visible_risk_lines(
+        snapshot,
+        state,
+        area.width.saturating_sub(4),
+        area.height as usize / 2,
+    );
+    let selected = selected_row(snapshot, state);
+    let mut lines = rows;
+    if let Some(row) = selected {
+        lines.push(Line::raw(""));
+        lines.extend(inspector_lines(row, area.width.saturating_sub(4)));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(panel_block("Hotpath", true))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_main(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &TuiDatabaseSnapshot,
+    state: &TuiState,
 ) {
     let content = padded_rect(area, 1, 1, 0, 0);
-    let content_width = content.width.max(1);
     let mut lines = vec![
         Line::styled(
-            state.current_view.title(),
-            style(options, TuiSeverity::Medium).add_modifier(Modifier::BOLD),
+            "Hotpath",
+            style(TuiSeverity::Medium).add_modifier(Modifier::BOLD),
         ),
         Line::raw(""),
     ];
-    let body_height = content.height.saturating_sub(lines.len() as u16).max(1) as usize;
-    lines.extend(main_panel_lines(
+    lines.extend(hotpath_kpi_lines(snapshot));
+    lines.push(hotspot_header_line(content.width));
+    let header_height = lines.len();
+    lines.extend(visible_risk_lines(
         snapshot,
         state,
-        rows,
-        content_width,
-        body_height,
-        options,
+        content.width.max(1),
+        content.height.saturating_sub(header_height as u16) as usize,
     ));
     frame.render_widget(Paragraph::new(lines), content);
 }
 
-fn render_inspector_content(
+fn hotpath_kpi_lines(snapshot: &TuiDatabaseSnapshot) -> Vec<Line<'static>> {
+    let score = snapshot
+        .project
+        .as_ref()
+        .map(|project| project.score)
+        .or_else(|| snapshot.rows.first().map(|row| row.score))
+        .unwrap_or(0.0);
+    vec![
+        metric_bar_line(
+            "Repo Risk",
+            score,
+            format!("{} {:.1}", severity_label(score), score * 10.0),
+            severity_for_score(score),
+        ),
+        Line::raw(""),
+    ]
+}
+
+fn render_inspector(
     frame: &mut Frame<'_>,
     area: Rect,
-    snapshot: &TuiSnapshot,
-    state: &TuiAppState,
-    rows: &[DisplayRow],
-    options: TuiOptions,
+    snapshot: &TuiDatabaseSnapshot,
+    state: &TuiState,
 ) {
     let content = padded_rect(area, 1, 1, 0, 0);
     let mut lines = vec![
         Line::styled(
             "Inspector",
-            style(options, TuiSeverity::Medium).add_modifier(Modifier::BOLD),
+            style(TuiSeverity::Medium).add_modifier(Modifier::BOLD),
         ),
         Line::raw(""),
     ];
-    let body_width = content.width.max(1);
-    lines.extend(inspector_lines(snapshot, state, rows, body_width, options));
-    frame.render_widget(Paragraph::new(lines), content);
+    match selected_row(snapshot, state) {
+        Some(row) => lines.extend(inspector_lines(row, content.width)),
+        None => lines.extend(empty_state_lines(snapshot)),
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), content);
 }
 
-fn render_vertical_divider(frame: &mut Frame<'_>, area: Rect, options: TuiOptions) {
-    let glyph = if options.ascii { "|" } else { "\u{2502}" };
+fn render_divider(frame: &mut Frame<'_>, area: Rect) {
     let lines = (0..area.height)
-        .map(|_| Line::styled(glyph, style(options, TuiSeverity::Muted)))
+        .map(|_| Line::styled("\u{2502}", style(TuiSeverity::Muted)))
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn padded_rect(area: Rect, left: u16, right: u16, top: u16, bottom: u16) -> Rect {
-    let x_offset = left.min(area.width);
-    let y_offset = top.min(area.height);
-    Rect {
-        x: area.x.saturating_add(x_offset),
-        y: area.y.saturating_add(y_offset),
-        width: area.width.saturating_sub(left.saturating_add(right)),
-        height: area.height.saturating_sub(top.saturating_add(bottom)),
-    }
-}
-
-fn render_main_panel(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    snapshot: &TuiSnapshot,
-    state: &TuiAppState,
-    rows: &[DisplayRow],
-    options: TuiOptions,
-) {
-    let top_padding = u16::from(state.current_view == TuiView::Hotspots);
-    let inner_height = area.height.saturating_sub(2 + top_padding).max(1) as usize;
-    let horizontal_padding = u16::from(state.current_view == TuiView::Hotspots);
-    let inner_width = area
-        .width
-        .saturating_sub(2 + horizontal_padding.saturating_mul(2))
-        .max(1);
-    let lines = main_panel_lines(snapshot, state, rows, inner_width, inner_height, options);
-    let mut block = panel_block(
-        state.current_view.title(),
-        state.pane_focus == TuiPaneFocus::Main,
-        options,
-    );
-    if horizontal_padding > 0 {
-        block = block.padding(Padding::new(
-            horizontal_padding,
-            horizontal_padding,
-            top_padding,
-            0,
-        ));
-    }
-
-    frame.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-fn main_panel_lines(
-    snapshot: &TuiSnapshot,
-    state: &TuiAppState,
-    rows: &[DisplayRow],
-    width: u16,
-    height: usize,
-    options: TuiOptions,
-) -> Vec<Line<'static>> {
-    let selected = state.selected_index();
-    let mut lines = match state.current_view {
-        TuiView::Hotspots => hotspot_kpi_lines(snapshot, options),
-        TuiView::ContextBudgeting => context_kpi_lines(snapshot, options),
-        TuiView::CouplingGraph => coupling_kpi_lines(snapshot, options),
-        _ => Vec::new(),
-    };
-    if state.current_view == TuiView::Hotspots {
-        lines.push(hotspot_header_line(width, options));
-    }
-    let remaining = height.saturating_sub(lines.len()).max(1);
-    if rows.is_empty() {
-        lines.push(Line::styled("No rows.", style(options, TuiSeverity::Muted)));
-    } else {
-        lines.extend(
-            visible_display_row_window(rows, selected, remaining)
-                .map(|(index, row)| render_display_row(row, index == selected, width, options)),
-        );
-    }
-    lines
-}
-
-fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiAppState, options: TuiOptions) {
+fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let text = if state.search_editing {
-        format!("/{}", state.search_query().unwrap_or(""))
-    } else if state.analysis_running {
-        state
-            .background_status
-            .as_ref()
-            .map(|update| progress_status_text(update, area.width as usize, options))
-            .or_else(|| state.status().map(str::to_owned))
-            .unwrap_or_else(|| "Analyzing repository in background".to_owned())
+        format!("/{}", state.search_query)
+    } else if state.search_query.is_empty() {
+        [
+            "j/k or arrows move",
+            "/ search",
+            "g/G jump",
+            "? help",
+            "q quit",
+        ]
+        .join(HOTSPOT_TAG_SEPARATOR)
     } else {
-        let default_status = || {
-            [
-                "j/k or arrows move",
-                "Enter drill",
-                "/ search",
-                "1-4 views",
-                "? help",
-                "Ctrl-P commands",
-                "e editor",
-                "q quit",
-            ]
-            .join(HOTSPOT_TAG_SEPARATOR)
-        };
-        state
-            .status()
-            .map(str::to_owned)
-            .unwrap_or_else(default_status)
+        format!(
+            "filter /{}{HOTSPOT_TAG_SEPARATOR}Esc clear{HOTSPOT_TAG_SEPARATOR}j/k move{HOTSPOT_TAG_SEPARATOR}? help{HOTSPOT_TAG_SEPARATOR}q quit",
+            state.search_query,
+        )
     };
     frame.render_widget(Paragraph::new(text).alignment(Alignment::Left), area);
 }
 
-fn progress_status_text(update: &TuiProgressUpdate, width: usize, options: TuiOptions) -> String {
-    progress_status_text_at(update, width, options, Instant::now())
-}
-
-fn progress_status_text_at(
-    update: &TuiProgressUpdate,
-    width: usize,
-    options: TuiOptions,
-    now: Instant,
-) -> String {
-    let mut text = if let (Some(completed), Some(total)) = (update.completed, update.total) {
-        let percent = progress_percent(update).unwrap_or(0);
-        let bar = progress_bar(percent, options);
-        let unit = if update.unit.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", update.unit)
-        };
-        let rate = if update.unit.is_empty() {
-            String::new()
-        } else {
-            let rate = progress_rate_per_second(update, now).unwrap_or(0);
-            format!("{HOTSPOT_TAG_SEPARATOR}{rate}{unit}/s")
-        };
-        let detail = if update.detail.is_empty() {
-            String::new()
-        } else {
-            format!("{HOTSPOT_TAG_SEPARATOR}{}", update.detail)
-        };
-        format!(
-            "{} [{}] {:>3}%  {}/{}{}{}{}",
-            update.phase, bar, percent, completed, total, unit, rate, detail
-        )
-    } else if update.detail.is_empty() {
-        update.phase.to_owned()
-    } else {
-        let elapsed = update
-            .started_at
-            .map(|started_at| {
-                format!(
-                    "{HOTSPOT_TAG_SEPARATOR}{} elapsed",
-                    human_duration(now.duration_since(started_at))
-                )
-            })
-            .unwrap_or_default();
-        format!("{}... {}{}", update.phase, update.detail, elapsed)
+fn render_help(frame: &mut Frame<'_>, area: Rect) {
+    let width = area.width.min(54);
+    let height = area.height.min(10);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
     };
+    let lines = vec![
+        Line::styled(
+            "Hotpath keys",
+            style(TuiSeverity::Medium).add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::raw("j/k or arrows  move selection"),
+        Line::raw("g/G            first / last row"),
+        Line::raw("/              search paths"),
+        Line::raw("Esc            clear search or close help"),
+        Line::raw("q              quit"),
+    ];
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(panel_block("Help", true)),
+        popup,
+    );
+}
 
-    if text.chars().count() > width {
-        text = truncate_end(&text, width);
+fn visible_risk_lines(
+    snapshot: &TuiDatabaseSnapshot,
+    state: &TuiState,
+    width: u16,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    let indices = state.filtered_indices(snapshot);
+    if snapshot.rows.is_empty() {
+        return empty_state_lines(snapshot);
     }
-
-    text
-}
-
-fn human_duration(duration: Duration) -> String {
-    let seconds = duration.as_secs();
-    if seconds < 60 {
-        format!("{seconds}s")
-    } else {
-        format!("{}m {}s", seconds / 60, seconds % 60)
+    if indices.is_empty() {
+        return vec![Line::styled(
+            "No rows match the current search.",
+            Style::default().fg(Color::DarkGray),
+        )];
     }
-}
-
-fn progress_rate_per_second(update: &TuiProgressUpdate, now: Instant) -> Option<u64> {
-    let completed = update.completed?;
-    let rate = update.rate?;
-    let elapsed = now.duration_since(rate.started_at).as_secs_f64();
-    if elapsed <= 0.0 {
-        return None;
-    }
-    Some(((completed.saturating_sub(rate.completed_at_start) as f64) / elapsed).round() as u64)
-}
-
-fn progress_bar(percent: u64, options: TuiOptions) -> String {
-    let (filled, empty) = score_bar_parts(percent.min(100) as f64 / 100.0, 10, options);
-    format!("{filled}{empty}")
-}
-
-fn visible_display_row_window(
-    rows: &[DisplayRow],
-    selected: usize,
-    limit: usize,
-) -> impl Iterator<Item = (usize, &DisplayRow)> {
+    let selected = state.selected.min(indices.len().saturating_sub(1));
     let start = selected
         .saturating_add(1)
-        .saturating_sub(limit)
-        .min(rows.len());
-
-    rows.iter().enumerate().skip(start).take(limit)
+        .saturating_sub(max_rows)
+        .min(indices.len());
+    indices
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(max_rows.max(1))
+        .filter_map(|(display_index, row_index)| {
+            snapshot
+                .rows
+                .get(*row_index)
+                .map(|row| risk_row_line(row, display_index == selected, width))
+        })
+        .collect()
 }
 
-fn render_display_row(
-    row: &DisplayRow,
-    selected: bool,
-    width: u16,
-    options: TuiOptions,
-) -> Line<'static> {
-    if let Some(hotspot) = &row.hotspot {
-        return render_hotspot_display_row(hotspot, selected, width, options);
-    }
-
-    let marker = if selected { "\u{258C}" } else { " " };
-    let label_width = 9usize;
-    let meta_width = row.meta.len().min(32);
-    let text_limit = (width as usize)
-        .saturating_sub(label_width + meta_width + 8)
-        .max(12);
-    let row_style = if selected {
-        style(options, row.severity).add_modifier(Modifier::BOLD)
-    } else {
-        style(options, row.severity)
-    };
-
-    let mut spans = vec![
-        Span::styled(marker.to_owned(), marker_style(selected, options)),
-        Span::raw(" "),
-        Span::styled(
-            format!("{:<label_width$}", row.label),
-            style(options, TuiSeverity::Muted),
-        ),
-        Span::raw(" "),
-        Span::styled(truncate_middle(&row.text, text_limit), row_style),
-    ];
-    if !row.meta.is_empty() {
-        spans.extend([
-            Span::raw("  "),
-            Span::styled(
-                truncate_middle(&row.meta, meta_width.max(1)),
-                style(options, TuiSeverity::Muted),
-            ),
-        ]);
-    }
-
-    Line::from(spans)
-}
-
-fn render_hotspot_display_row(
-    hotspot: &DisplayHotspotRow,
-    selected: bool,
-    width: u16,
-    options: TuiOptions,
-) -> Line<'static> {
+fn risk_row_line(row: &RiskRow, selected: bool, width: u16) -> Line<'static> {
     let marker = if selected { "\u{258C}" } else { " " };
     let row_style = if selected {
-        selected_row_style(options, severity_for_score(hotspot.score))
+        selected_row_style(severity_for_score(row.score))
     } else {
-        style(options, severity_for_score(hotspot.score))
+        style(severity_for_score(row.score))
     };
     let muted_style = if selected {
-        selected_row_style(options, TuiSeverity::Muted)
+        selected_row_style(TuiSeverity::Muted)
     } else {
-        style(options, TuiSeverity::Muted)
+        style(TuiSeverity::Muted)
     };
     let gap_style = if selected {
-        selected_gap_style(options)
+        selected_gap_style()
     } else {
         Style::default()
     };
-    let tags = hotspot_tag_text(&hotspot.tags);
+    let tags = hotspot_tag_text(&row.tags);
     let (path_width, tag_width) = hotspot_column_widths(width as usize);
-    let risk = hotspot.score * 10.0;
-    let path = pad_truncated_path(&hotspot.path, path_width);
+    let path = pad_truncated_path(&row.relative_path, path_width);
 
     let mut spans = vec![
         Span::styled(
             format!("{marker:<HOTSPOT_SELECTOR_WIDTH$}"),
-            marker_style(selected, options),
+            marker_style(selected),
         ),
         Span::styled(path, row_style),
         Span::styled("  ", gap_style),
     ];
     if selected {
         spans.extend(selected_score_bar_spans(
-            hotspot.score,
+            row.score,
             METRIC_BAR_WIDTH,
             row_style,
-            options,
         ));
     } else {
-        spans.extend(score_bar_spans(
-            hotspot.score,
-            METRIC_BAR_WIDTH,
-            row_style,
-            options,
-        ));
+        spans.extend(score_bar_spans(row.score, METRIC_BAR_WIDTH, row_style));
     }
     spans.push(Span::styled(
-        format!(" {:>HOTSPOT_SCORE_WIDTH$.1}", risk),
+        format!(" {:>HOTSPOT_SCORE_WIDTH$.1}", row.risk_10),
         row_style,
     ));
     if tag_width > 0 && !tags.is_empty() {
@@ -4181,10 +670,449 @@ fn render_hotspot_display_row(
     Line::from(spans)
 }
 
-fn hotspot_header_line(width: u16, options: TuiOptions) -> Line<'static> {
+fn inspector_lines(row: &RiskRow, width: u16) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::styled(
+            truncate_middle(&row.relative_path, width.saturating_sub(4) as usize),
+            style(TuiSeverity::Medium).add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+        metric_bar_line(
+            "RISK",
+            row.score,
+            severity_label(row.score).to_owned(),
+            severity_for_score(row.score),
+        ),
+        metric_bar_line(
+            "FRAGILITY",
+            ownership_risk(row),
+            ownership_risk_label(row).to_owned(),
+            severity_for_score(ownership_risk(row)),
+        ),
+        metric_bar_line(
+            "COUPLING",
+            coupling_pressure(row),
+            coupling_severity_label(coupling_pressure(row)).to_owned(),
+            severity_for_score(coupling_pressure(row)),
+        ),
+        metric_bar_line(
+            "COMPLEXITY",
+            complexity_pressure(row),
+            complexity_severity_label(row.max_function_complexity.unwrap_or(0) as f64).to_owned(),
+            severity_for_complexity_score(row.max_function_complexity.unwrap_or(0) as f64),
+        ),
+    ];
+    if let Some(line_count) = row.line_count {
+        let band = line_size_band(line_count);
+        lines.push(metric_bar_line(
+            "SIZE",
+            band.bar_value(),
+            format!(
+                "{} {} lines",
+                band.label(),
+                format_compact_count(line_count)
+            ),
+            band.severity(),
+        ));
+    }
+
+    let tags = hotspot_tag_text(&inspector_tags(row));
+    if !tags.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(tags, style(TuiSeverity::Muted)));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(section_divider(width));
+    lines.extend(risk_driver_lines(row));
+
+    lines.push(Line::raw(""));
+    lines.push(section_divider(width));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        format!("Ownership ({})", ownership_shape_label(row)),
+        style(TuiSeverity::Medium).add_modifier(Modifier::BOLD),
+    ));
+    lines.extend(ownership_distribution_lines(row));
+
+    if !row.limitations.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(section_divider(width));
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "Limitations",
+            style(TuiSeverity::Medium).add_modifier(Modifier::BOLD),
+        ));
+        for limitation in &row.limitations {
+            lines.push(Line::styled(
+                format!("  - {}: {}", limitation.code, limitation.message),
+                style(TuiSeverity::Muted),
+            ));
+        }
+    }
+    lines
+}
+
+fn empty_state_lines(snapshot: &TuiDatabaseSnapshot) -> Vec<Line<'static>> {
+    vec![Line::styled(
+        snapshot
+            .status
+            .as_deref()
+            .unwrap_or("No scored Go files found. Run hotpath scan after Go files are present.")
+            .to_owned(),
+        Style::default().fg(Color::DarkGray),
+    )]
+}
+
+fn selected_row<'a>(snapshot: &'a TuiDatabaseSnapshot, state: &TuiState) -> Option<&'a RiskRow> {
+    let indices = state.filtered_indices(snapshot);
+    indices
+        .get(state.selected.min(indices.len().saturating_sub(1)))
+        .and_then(|index| snapshot.rows.get(*index))
+}
+
+fn load_project_summary(connection: &Connection) -> rusqlite::Result<Option<ProjectRiskSummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT
+            formula_id,
+            score,
+            risk_10,
+            risk_band,
+            confidence,
+            active_file_count,
+            active_go_file_count,
+            scored_file_count,
+            scoring_coverage,
+            go_score_coverage
+        FROM project_risk_summary
+        ORDER BY formula_id
+        LIMIT 1
+        ",
+    )?;
+    let result = statement.query_row([], |row| {
+        Ok(ProjectRiskSummary {
+            formula_id: row.get(0)?,
+            score: row.get(1)?,
+            risk_10: row.get(2)?,
+            risk_band: row.get(3)?,
+            confidence: row.get(4)?,
+            active_file_count: i64_to_u64(row.get::<_, i64>(5)?),
+            active_go_file_count: i64_to_u64(row.get::<_, i64>(6)?),
+            scored_file_count: i64_to_u64(row.get::<_, i64>(7)?),
+            scoring_coverage: row.get(8)?,
+            go_score_coverage: row.get(9)?,
+        })
+    });
+    match result {
+        Ok(summary) => Ok(Some(summary)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn load_risk_rows(connection: &Connection) -> rusqlite::Result<Vec<RiskRow>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT
+            score.rank,
+            score.relative_path,
+            score.path,
+            score.formula_id,
+            score.score,
+            score.risk_10,
+            score.risk_band,
+            score.is_generated,
+            score.is_vendor,
+            facts.line_count,
+            facts.byte_size,
+            facts.language_id,
+            facts.cognitive_complexity,
+            facts.max_function_complexity,
+            facts.source_coupling_in,
+            facts.source_coupling_out,
+            facts.co_changed_file_count,
+            facts.total_churn_lines,
+            facts.recent_churn_lines,
+            facts.commits_per_file,
+            facts.dominant_owner,
+            facts.dominant_owner_share,
+            facts.owner_count,
+            facts.author_count
+        FROM file_risk_scores score
+        LEFT JOIN file_facts facts
+            ON facts.relative_path = score.relative_path
+        ORDER BY score.rank ASC
+        ",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(RiskRow {
+            rank: i64_to_u64(row.get::<_, i64>(0)?),
+            relative_path: row.get(1)?,
+            absolute_path: row.get(2)?,
+            formula_id: row.get(3)?,
+            score: row.get(4)?,
+            risk_10: row.get(5)?,
+            risk_band: row.get(6)?,
+            is_generated: row.get::<_, i64>(7)? != 0,
+            is_vendor: row.get::<_, i64>(8)? != 0,
+            line_count: optional_i64_to_u64(row.get::<_, Option<i64>>(9)?),
+            byte_size: optional_i64_to_u64(row.get::<_, Option<i64>>(10)?),
+            language_id: row.get(11)?,
+            cognitive_complexity: optional_i64_to_u64(row.get::<_, Option<i64>>(12)?),
+            max_function_complexity: optional_i64_to_u64(row.get::<_, Option<i64>>(13)?),
+            source_coupling_in: optional_i64_to_u64(row.get::<_, Option<i64>>(14)?),
+            source_coupling_out: optional_i64_to_u64(row.get::<_, Option<i64>>(15)?),
+            co_changed_file_count: i64_to_u64(row.get::<_, i64>(16)?),
+            total_churn_lines: i64_to_u64(row.get::<_, i64>(17)?),
+            recent_churn_lines: i64_to_u64(row.get::<_, i64>(18)?),
+            commits_per_file: i64_to_u64(row.get::<_, i64>(19)?),
+            dominant_owner: row.get(20)?,
+            dominant_owner_share: row.get(21)?,
+            owner_count: optional_i64_to_u64(row.get::<_, Option<i64>>(22)?),
+            author_count: i64_to_u64(row.get::<_, i64>(23)?),
+            terms: Vec::new(),
+            facts: Vec::new(),
+            limitations: Vec::new(),
+            owners: Vec::new(),
+            tags: Vec::new(),
+        })
+    })?;
+    rows.collect()
+}
+
+fn load_terms(connection: &Connection) -> rusqlite::Result<BTreeMap<String, Vec<RiskTerm>>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT relative_path, term_name, raw_value, normalized_value, weight, contribution
+        FROM file_risk_terms
+        ORDER BY relative_path, term_name
+        ",
+    )?;
+    let mut grouped = BTreeMap::new();
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            RiskTerm {
+                name: row.get(1)?,
+                raw_value: row.get(2)?,
+                normalized_value: row.get(3)?,
+                weight: row.get(4)?,
+                contribution: row.get(5)?,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (path, term) = row?;
+        grouped.entry(path).or_insert_with(Vec::new).push(term);
+    }
+    Ok(grouped)
+}
+
+fn load_facts(connection: &Connection) -> rusqlite::Result<BTreeMap<String, Vec<RiskFact>>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT relative_path, fact_kind, message
+        FROM file_risk_facts
+        ORDER BY relative_path, fact_index
+        ",
+    )?;
+    let mut grouped = BTreeMap::new();
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            RiskFact {
+                kind: row.get(1)?,
+                message: row.get(2)?,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (path, fact) = row?;
+        grouped.entry(path).or_insert_with(Vec::new).push(fact);
+    }
+    Ok(grouped)
+}
+
+fn load_limitations(
+    connection: &Connection,
+) -> rusqlite::Result<BTreeMap<String, Vec<RiskLimitation>>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT relative_path, code, message
+        FROM file_risk_limitations
+        ORDER BY relative_path, limitation_index
+        ",
+    )?;
+    let mut grouped = BTreeMap::new();
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            RiskLimitation {
+                code: row.get(1)?,
+                message: row.get(2)?,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (path, limitation) = row?;
+        grouped
+            .entry(path)
+            .or_insert_with(Vec::new)
+            .push(limitation);
+    }
+    Ok(grouped)
+}
+
+fn load_owners(connection: &Connection) -> rusqlite::Result<BTreeMap<String, Vec<RiskOwner>>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT path, author, ownership_share, touch_count
+        FROM git_file_owners
+        ORDER BY path, owner_rank
+        ",
+    )?;
+    let mut grouped = BTreeMap::new();
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            RiskOwner {
+                author: row.get(1)?,
+                ownership_share: row.get(2)?,
+                touch_count: i64_to_u64(row.get::<_, i64>(3)?),
+            },
+        ))
+    })?;
+    for row in rows {
+        let (path, owner) = row?;
+        grouped.entry(path).or_insert_with(Vec::new).push(owner);
+    }
+    Ok(grouped)
+}
+
+fn find_index_root(current_dir: &Path) -> Option<PathBuf> {
+    current_dir
+        .ancestors()
+        .find(|candidate| candidate.join(INDEX_DB).is_file())
+        .map(Path::to_path_buf)
+}
+
+fn tags_for_row(row: &RiskRow) -> Vec<String> {
+    inspector_tags(row).into_iter().take(1).collect()
+}
+
+fn inspector_tags(row: &RiskRow) -> Vec<String> {
+    let mut signals = Vec::new();
+    if row.is_generated {
+        signals.push(("GEN", 1.0, 10));
+    }
+    if row.is_vendor {
+        signals.push(("VENDOR", 1.0, 10));
+    }
+    for term in &row.terms {
+        let value = term.normalized_value.unwrap_or_default();
+        if value < 0.60 {
+            continue;
+        }
+        match term.name.as_str() {
+            "churn" => signals.push(("CHURN", value, 90)),
+            "recent_churn" => signals.push(("VOLATILITY", value, 65)),
+            "size" => signals.push(("SIZE", value, 75)),
+            "ownership_risk" => signals.push(("FRAGILITY", value, 80)),
+            "cochange_coupling" | "source_coupling" => signals.push(("COUPLING", value, 85)),
+            "cognitive_complexity" => signals.push(("COMPLEXITY", value, 70)),
+            _ => {}
+        }
+    }
+
+    signals.sort_by(|left, right| {
+        right
+            .2
+            .cmp(&left.2)
+            .then_with(|| {
+                right
+                    .1
+                    .partial_cmp(&left.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.0.cmp(right.0))
+    });
+    let mut tags = Vec::new();
+    for (label, _, _) in signals {
+        push_tag(&mut tags, label);
+    }
+    tags
+}
+
+fn push_tag(tags: &mut Vec<String>, tag: &str) {
+    if !tags.iter().any(|existing| existing == tag) {
+        tags.push(tag.to_owned());
+    }
+}
+
+fn panel_block(title: &str, focused: bool) -> Block<'static> {
+    let border_style = if focused {
+        style(TuiSeverity::Medium)
+    } else {
+        style(TuiSeverity::Muted)
+    };
+    Block::default()
+        .title(format!(" {title} "))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+}
+
+fn plain_panel_block(focused: bool) -> Block<'static> {
+    let border_style = if focused {
+        style(TuiSeverity::Medium)
+    } else {
+        style(TuiSeverity::Muted)
+    };
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+}
+
+fn metric_bar_line(label: &str, value: f64, text: String, severity: TuiSeverity) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        format!("{label:<METRIC_LABEL_WIDTH$} "),
+        style(TuiSeverity::Muted),
+    )];
+    spans.extend(score_bar_spans(value, METRIC_BAR_WIDTH, style(severity)));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(text, style(severity)));
+
+    Line::from(spans)
+}
+
+fn section_divider(width: u16) -> Line<'static> {
+    let inner_width = width.saturating_sub(4).max(12) as usize;
+    Line::styled(
+        "\u{2500}".repeat(inner_width.min(48)),
+        style(TuiSeverity::Muted),
+    )
+}
+
+fn layout_mode(area: Rect) -> TuiLayoutMode {
+    if area.width >= 120 && area.height >= 30 {
+        TuiLayoutMode::Wide
+    } else if area.width >= 90 {
+        TuiLayoutMode::Medium
+    } else {
+        TuiLayoutMode::Narrow
+    }
+}
+
+fn horizontal_rule(width: u16) -> String {
+    "\u{2500}".repeat(width as usize)
+}
+
+fn hotspot_header_line(width: u16) -> Line<'static> {
     let (path_width, tag_width) = hotspot_column_widths(width as usize);
     let risk_width = METRIC_BAR_WIDTH + 1 + HOTSPOT_SCORE_WIDTH;
-    let header_style = style(options, TuiSeverity::Muted).add_modifier(Modifier::BOLD);
+    let header_style = style(TuiSeverity::Muted).add_modifier(Modifier::BOLD);
 
     let mut spans = vec![
         Span::raw(" ".repeat(HOTSPOT_SELECTOR_WIDTH)),
@@ -4232,452 +1160,83 @@ fn hotspot_column_widths(total_width: usize) -> (usize, usize) {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct DriverSignal {
-    label: &'static str,
-    strength: f64,
-    percentile: f64,
-    priority: u8,
-}
-
-fn driver_signal(label: &'static str, strength: f64, priority: u8) -> DriverSignal {
-    DriverSignal {
-        label,
-        strength,
-        percentile: 0.0,
-        priority,
-    }
-}
-
-fn hotspot_driver_tags(snapshot: &TuiSnapshot, hotspot: &ReportHotspot) -> Vec<String> {
-    qualified_driver_tags(snapshot, hotspot)
-        .into_iter()
-        .filter(|signal| signal_qualifies_for_row_tag(hotspot, signal))
-        .map(|signal| signal.label.to_owned())
-        .take(1)
-        .collect()
-}
-
-fn inspector_driver_tags(snapshot: &TuiSnapshot, hotspot: &ReportHotspot) -> Vec<String> {
-    qualified_driver_tags(snapshot, hotspot)
-        .into_iter()
-        .filter(signal_qualifies_for_inspector_tag)
-        .map(|signal| signal.label.to_owned())
-        .take(3)
-        .collect()
-}
-
-fn qualified_driver_tags(snapshot: &TuiSnapshot, hotspot: &ReportHotspot) -> Vec<DriverSignal> {
-    let mut signals = collect_driver_signals(snapshot, hotspot)
-        .into_iter()
-        .filter_map(|mut signal| {
-            signal.percentile =
-                driver_signal_percentile_rank(snapshot, signal.label, signal.strength);
-            signal_qualifies_for_tag(&signal).then_some(signal)
-        })
-        .collect::<Vec<_>>();
-
-    signals.sort_by(|left, right| {
-        right
-            .priority
-            .cmp(&left.priority)
-            .then_with(|| {
-                right
-                    .strength
-                    .partial_cmp(&left.strength)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| {
-                right
-                    .percentile
-                    .partial_cmp(&left.percentile)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| left.label.cmp(right.label))
-    });
-
-    let mut tags = Vec::new();
-    for signal in signals {
-        if !tags
-            .iter()
-            .any(|existing: &DriverSignal| existing.label == signal.label)
-        {
-            tags.push(signal);
-        }
-    }
-
-    tags
-}
-
-fn signal_qualifies_for_row_tag(hotspot: &ReportHotspot, signal: &DriverSignal) -> bool {
-    if hotspot.score >= 0.70 {
-        return signal.strength >= 0.70 && signal.percentile >= 0.90;
-    }
-
-    hotspot.score >= 0.55 && signal.strength >= 0.85 && signal.percentile >= 0.95
-}
-
-fn signal_qualifies_for_inspector_tag(signal: &DriverSignal) -> bool {
-    signal.strength >= 0.65 && signal.percentile >= 0.75
-}
-
-fn signal_qualifies_for_tag(signal: &DriverSignal) -> bool {
-    signal.strength >= 0.60 || signal.percentile >= 0.75
-}
-
-fn driver_signal_percentile_rank(snapshot: &TuiSnapshot, label: &str, strength: f64) -> f64 {
-    let values = snapshot
-        .report
-        .hotspots
-        .iter()
-        .filter(|hotspot| hotspot.score >= 0.55)
-        .flat_map(|hotspot| collect_driver_signals(snapshot, hotspot))
-        .filter(|signal| signal.label == label)
-        .map(|signal| signal.strength)
-        .filter(|value| value.is_finite())
-        .collect::<Vec<_>>();
-
-    percentile_rank(&values, strength)
-}
-
-fn percentile_rank(values: &[f64], value: f64) -> f64 {
-    if !value.is_finite() || values.is_empty() {
-        return 0.0;
-    }
-    if values.len() == 1 {
-        return if value > 0.0 { 1.0 } else { 0.0 };
-    }
-
-    let below_or_equal = values
-        .iter()
-        .filter(|candidate| candidate.is_finite() && **candidate <= value)
-        .count();
-
-    ((below_or_equal.saturating_sub(1)) as f64 / (values.len() - 1) as f64).clamp(0.0, 1.0)
-}
-
-fn collect_driver_signals(snapshot: &TuiSnapshot, hotspot: &ReportHotspot) -> Vec<DriverSignal> {
-    let mut signals = hotspot
-        .weighted_terms
-        .iter()
-        .filter_map(driver_signal_from_term)
-        .collect::<Vec<_>>();
-    if let Some(fan) = fan_for_path(snapshot, &hotspot.path) {
-        let fanout = normalized_u64(fan.fan_out, 25);
-        if fanout >= 0.45 {
-            signals.push(driver_signal("CORE", fanout, 80));
-        }
-        let fanin = normalized_u64(fan.fan_in, 25);
-        if fanin >= 0.45 {
-            signals.push(driver_signal("CORE", fanin, 95));
-        }
-    }
-    if let Some(complexity) = complexity_pressure_for_path(snapshot, &hotspot.path) {
-        if complexity >= 0.50 {
-            signals.push(driver_signal("COMPLEXITY", complexity, 70));
-        }
-    }
-    if let Some(file) = file_for_path(snapshot, &hotspot.path) {
-        if let Some(byte_size) = file.byte_size {
-            let context = normalized_context_tokens(byte_size.div_ceil(4), 100_000);
-            if context >= 0.65 {
-                signals.push(driver_signal("SIZE", context, 75));
-            }
-        }
-    }
-
-    signals.sort_by(|left, right| {
-        right
-            .strength
-            .partial_cmp(&left.strength)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.label.cmp(right.label))
-    });
-    let mut unique_signals = Vec::new();
-    for signal in signals {
-        if unique_signals
-            .iter()
-            .all(|existing: &DriverSignal| existing.label != signal.label)
-        {
-            unique_signals.push(signal);
-        }
-    }
-
-    unique_signals
-}
-
-fn driver_signal_from_term(term: &WeightedTerm) -> Option<DriverSignal> {
-    let input = term.normalized_input.unwrap_or(0.0);
-    let label = match term.metric {
-        NormalizedMetric::Churn if input >= 0.60 => "CHURN",
-        NormalizedMetric::Size if input >= 0.65 => "SIZE",
-        NormalizedMetric::RecentChurn if input >= 0.75 => "VOLATILITY",
-        NormalizedMetric::Ownership if input >= 0.70 => "FRAGILITY",
-        NormalizedMetric::Coupling if input >= 0.60 => "COUPLING",
-        _ => return None,
+fn style(severity: TuiSeverity) -> Style {
+    let color = match severity {
+        TuiSeverity::High => Color::Red,
+        TuiSeverity::Medium => Color::Yellow,
+        TuiSeverity::Low => Color::Green,
+        TuiSeverity::Neutral => Color::White,
+        TuiSeverity::Muted => Color::DarkGray,
     };
 
-    Some(driver_signal(label, input, driver_signal_priority(label)))
+    Style::default().fg(color)
 }
 
-fn driver_signal_priority(label: &str) -> u8 {
-    match label {
-        "CORE" => 95,
-        "CHURN" => 90,
-        "COUPLING" => 85,
-        "FRAGILITY" => 80,
-        "SIZE" => 75,
-        "COMPLEXITY" => 70,
-        "VOLATILITY" => 65,
-        _ => 0,
+fn selected_row_style(severity: TuiSeverity) -> Style {
+    style(severity)
+        .add_modifier(Modifier::BOLD)
+        .bg(Color::Rgb(32, 32, 32))
+}
+
+fn selected_gap_style() -> Style {
+    Style::default().bg(Color::Rgb(32, 32, 32))
+}
+
+fn marker_style(selected: bool) -> Style {
+    if selected {
+        selected_row_style(TuiSeverity::Medium)
+    } else {
+        Style::default()
     }
 }
 
-fn hotspot_kpi_lines(snapshot: &TuiSnapshot, options: TuiOptions) -> Vec<Line<'static>> {
-    let top_score = snapshot
-        .report
-        .hotspots
-        .first()
-        .map(|hotspot| hotspot.score)
-        .unwrap_or(0.0);
-    vec![
-        metric_bar_line(
-            "Repo Risk",
-            top_score,
-            format!("{} {:.1}", severity_label(top_score), top_score * 10.0),
-            severity_for_score(top_score),
-            options,
-        ),
-        Line::raw(""),
-    ]
-}
-
-fn context_kpi_lines(snapshot: &TuiSnapshot, options: TuiOptions) -> Vec<Line<'static>> {
-    let context = &snapshot.report.context;
-    let budget = context
-        .budget
-        .as_ref()
-        .map(context_budget_status_text)
-        .unwrap_or_else(|| "no budget".to_owned());
-    vec![
-        metric_bar_line(
-            "Context",
-            context_pressure(snapshot),
-            format!("{} tokens", context.summary.estimated_tokens),
-            severity_for_score(context_pressure(snapshot)),
-            options,
-        ),
-        Line::styled(
-            format!("Budget     {budget}"),
-            style(options, TuiSeverity::Muted),
-        ),
-        Line::raw(""),
-    ]
-}
-
-fn coupling_kpi_lines(snapshot: &TuiSnapshot, options: TuiOptions) -> Vec<Line<'static>> {
-    vec![
-        metric_bar_line(
-            "Coupling",
-            coupling_pressure(snapshot),
-            format!("{} edges", snapshot.coupling.edges.len()),
-            severity_for_score(coupling_pressure(snapshot)),
-            options,
-        ),
-        Line::styled(
-            format!(
-                "Files      {} with fan metrics",
-                snapshot.coupling.fan_by_file.len()
-            ),
-            style(options, TuiSeverity::Muted),
-        ),
-        Line::raw(""),
-    ]
-}
-
-fn metric_bar_line(
-    label: &str,
-    value: f64,
-    text: String,
-    severity: TuiSeverity,
-    options: TuiOptions,
-) -> Line<'static> {
-    let mut spans = vec![Span::styled(
-        format!("{label:<METRIC_LABEL_WIDTH$} "),
-        style(options, TuiSeverity::Muted),
-    )];
-    spans.extend(score_bar_spans(
-        value,
-        METRIC_BAR_WIDTH,
-        style(options, severity),
-        options,
-    ));
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(text, style(options, severity)));
-
-    Line::from(spans)
-}
-
-fn section_divider(width: u16, options: TuiOptions) -> Line<'static> {
-    let inner_width = width.saturating_sub(4).max(12) as usize;
-    let glyph = if options.ascii { "-" } else { "\u{2500}" };
-
-    Line::styled(
-        glyph.repeat(inner_width.min(48)),
-        style(options, TuiSeverity::Muted),
+fn score_bar_parts(score: f64, width: usize) -> (String, String) {
+    let filled = ((score.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
+    (
+        "\u{25A0}".repeat(filled),
+        "\u{25A1}".repeat(width.saturating_sub(filled)),
     )
 }
 
-fn coupling_pressure(snapshot: &TuiSnapshot) -> f64 {
-    let max_fan = snapshot
-        .coupling
-        .fan_by_file
-        .iter()
-        .map(|fan| fan.fan_in.max(fan.fan_out))
-        .max()
-        .unwrap_or(0);
-    let edge_pressure = normalized_u64(snapshot.coupling.edges.len() as u64, 100);
-    let fan_pressure = normalized_u64(max_fan, 25);
-
-    edge_pressure.max(fan_pressure)
+fn score_bar_spans(score: f64, width: usize, active_style: Style) -> Vec<Span<'static>> {
+    score_bar_spans_with_inactive(score, width, active_style, inactive_bar_style())
 }
 
-fn context_pressure(snapshot: &TuiSnapshot) -> f64 {
-    let estimated = snapshot.report.context.summary.estimated_tokens;
-    snapshot
-        .report
-        .context
-        .budget
-        .as_ref()
-        .map(|budget| normalized_u64(estimated, budget.budget_tokens.max(1)))
-        .unwrap_or_else(|| normalized_context_tokens(estimated, 500_000))
+fn selected_score_bar_spans(score: f64, width: usize, active_style: Style) -> Vec<Span<'static>> {
+    score_bar_spans_with_inactive(score, width, active_style, selected_inactive_bar_style())
 }
 
-fn context_pressure_for_path(snapshot: &TuiSnapshot, path: &str) -> Option<(f64, u64)> {
-    let bytes = file_for_path(snapshot, path)?.byte_size?;
-    let tokens = bytes.div_ceil(4);
-
-    Some((normalized_context_tokens(tokens, 100_000), tokens))
+fn score_bar_spans_with_inactive(
+    score: f64,
+    width: usize,
+    active_style: Style,
+    inactive_style: Style,
+) -> Vec<Span<'static>> {
+    let (filled, empty) = score_bar_parts(score, width);
+    vec![
+        Span::styled(filled, active_style),
+        Span::styled(empty, inactive_style),
+    ]
 }
 
-fn coupling_pressure_for_path(snapshot: &TuiSnapshot, path: &str) -> Option<f64> {
-    let zero_fan;
-    let fan = match fan_for_path(snapshot, path) {
-        Some(fan) => fan,
-        None => {
-            zero_fan = TuiFileFan {
-                path: path.to_owned(),
-                fan_in: 0,
-                fan_out: 0,
-            };
-            &zero_fan
-        }
-    };
-    let degree = fan.fan_in.saturating_add(fan.fan_out);
-    let cochange_count = hotspot_for_path(snapshot, path)
-        .and_then(|hotspot| hotspot.raw_metrics.co_changed_file_count)
-        .unwrap_or(0);
-    if degree == 0 && cochange_count == 0 {
-        return Some(0.0);
+fn inactive_bar_style() -> Style {
+    Style::default().fg(Color::Rgb(82, 82, 82)).bg(Color::Black)
+}
+
+fn selected_inactive_bar_style() -> Style {
+    Style::default()
+        .fg(Color::Rgb(118, 118, 118))
+        .bg(Color::Rgb(32, 32, 32))
+}
+
+fn severity_for_score(score: f64) -> TuiSeverity {
+    if score >= 0.70 {
+        TuiSeverity::High
+    } else if score >= 0.40 {
+        TuiSeverity::Medium
+    } else {
+        TuiSeverity::Low
     }
-
-    let mut fan_in_values = snapshot
-        .coupling
-        .fan_by_file
-        .iter()
-        .map(|fan| fan.fan_in as f64)
-        .collect::<Vec<_>>();
-    if fan_for_path(snapshot, path).is_none() {
-        fan_in_values.push(0.0);
-    }
-    let mut fan_out_values = snapshot
-        .coupling
-        .fan_by_file
-        .iter()
-        .map(|fan| fan.fan_out as f64)
-        .collect::<Vec<_>>();
-    if fan_for_path(snapshot, path).is_none() {
-        fan_out_values.push(0.0);
-    }
-    let mut degree_values = snapshot
-        .coupling
-        .fan_by_file
-        .iter()
-        .map(|fan| fan.fan_in.saturating_add(fan.fan_out) as f64)
-        .collect::<Vec<_>>();
-    if fan_for_path(snapshot, path).is_none() {
-        degree_values.push(0.0);
-    }
-    let cochange_values = snapshot
-        .report
-        .hotspots
-        .iter()
-        .filter_map(|hotspot| {
-            hotspot
-                .raw_metrics
-                .co_changed_file_count
-                .map(|value| value as f64)
-        })
-        .collect::<Vec<_>>();
-
-    let fan_in_rank = percentile_rank(&fan_in_values, fan.fan_in as f64);
-    let fan_out_rank = percentile_rank(&fan_out_values, fan.fan_out as f64);
-    let degree_rank = percentile_rank(&degree_values, degree as f64);
-    let cochange_rank = percentile_rank(&cochange_values, cochange_count as f64);
-    let edge_share = normalized_u64(degree, snapshot.coupling.edges.len().max(1) as u64);
-
-    let mut pressure = (degree_rank * 0.45)
-        .max(fan_in_rank * 0.35 + fan_out_rank * 0.20)
-        .max(cochange_rank * 0.45)
-        + edge_share * 0.10
-        + normalized_u64(cochange_count, 25) * 0.10;
-    pressure = pressure.clamp(0.0, 1.0);
-
-    if degree <= 1 && cochange_count <= 1 {
-        pressure = pressure.min(0.25);
-    } else if degree <= 3 && cochange_count <= 2 {
-        pressure = pressure.min(0.55);
-    }
-
-    Some(pressure)
-}
-
-fn complexity_pressure_for_path(snapshot: &TuiSnapshot, path: &str) -> Option<f64> {
-    Some((complexity_score_for_path(snapshot, path)? / 35.0).clamp(0.0, 1.0))
-}
-
-fn complexity_score_for_path(snapshot: &TuiSnapshot, path: &str) -> Option<f64> {
-    let max_complexity = snapshot
-        .complexity
-        .symbols
-        .iter()
-        .filter(|symbol| symbol.path == path)
-        .filter_map(|symbol| symbol.cyclomatic_complexity)
-        .max()?;
-
-    Some(max_complexity as f64)
-}
-
-fn unavailable_metric_line(label: &str, options: TuiOptions) -> Line<'static> {
-    metric_bar_line(
-        label,
-        0.0,
-        "unavailable".to_owned(),
-        TuiSeverity::Muted,
-        options,
-    )
-}
-
-fn normalized_u64(value: u64, saturation: u64) -> f64 {
-    if saturation == 0 {
-        return 0.0;
-    }
-
-    (value as f64 / saturation as f64).clamp(0.0, 1.0)
-}
-
-fn normalized_context_tokens(tokens: u64, large_threshold: u64) -> f64 {
-    normalized_u64(tokens, large_threshold)
 }
 
 fn severity_label(value: f64) -> &'static str {
@@ -4686,18 +1245,6 @@ fn severity_label(value: f64) -> &'static str {
     } else if value >= 0.70 {
         "HIGH"
     } else if value >= 0.40 {
-        "MEDIUM"
-    } else {
-        "LOW"
-    }
-}
-
-fn complexity_severity_label(score: f64) -> &'static str {
-    if score >= 35.0 {
-        "EXTREME"
-    } else if score >= 20.0 {
-        "HIGH"
-    } else if score >= 10.0 {
         "MEDIUM"
     } else {
         "LOW"
@@ -4714,87 +1261,52 @@ fn severity_for_complexity_score(score: f64) -> TuiSeverity {
     }
 }
 
-fn coupling_severity_label(value: f64) -> &'static str {
-    if value >= 0.90 {
+fn complexity_severity_label(score: f64) -> &'static str {
+    if score >= 35.0 {
         "EXTREME"
-    } else if value >= 0.70 {
+    } else if score >= 20.0 {
         "HIGH"
-    } else if value >= 0.40 {
+    } else if score >= 10.0 {
         "MEDIUM"
     } else {
         "LOW"
     }
 }
 
-fn line_size_band(lines: u64) -> TuiSizeBand {
-    match lines {
-        0..=999 => TuiSizeBand::Small,
-        1_000..=3_999 => TuiSizeBand::Medium,
-        4_000..=15_999 => TuiSizeBand::Large,
-        _ => TuiSizeBand::VeryLarge,
-    }
-}
-
-fn format_compact_count(value: u64) -> String {
-    if value >= 1_000_000 {
-        format!("{:.1}m", value as f64 / 1_000_000.0)
-    } else if value >= 1_000 {
-        format!("{:.1}k", value as f64 / 1_000.0)
+fn line_size_band(line_count: u64) -> TuiSizeBand {
+    if line_count >= 2_000 {
+        TuiSizeBand::VeryLarge
+    } else if line_count >= 1_000 {
+        TuiSizeBand::Large
+    } else if line_count >= 250 {
+        TuiSizeBand::Medium
     } else {
-        value.to_string()
+        TuiSizeBand::Small
     }
 }
 
-#[cfg(test)]
-fn format_bytes(bytes: Option<u64>) -> String {
-    let Some(bytes) = bytes else {
-        return "unknown".to_owned();
-    };
+fn ownership_risk(row: &RiskRow) -> f64 {
+    term_value(row, "ownership_risk").unwrap_or_else(|| {
+        row.dominant_owner_share
+            .map(|share| share.clamp(0.0, 1.0))
+            .unwrap_or(0.0)
+    })
+}
 
-    if bytes >= 1_048_576 {
-        format!("{:.1} MiB", bytes as f64 / 1_048_576.0)
-    } else if bytes >= 1024 {
-        format!("{:.1} KiB", bytes as f64 / 1024.0)
-    } else if bytes == 1 {
-        "1 byte".to_owned()
+fn ownership_risk_label(row: &RiskRow) -> &'static str {
+    if ownership_risk(row) >= 0.70 {
+        "CONCENTRATED"
+    } else if ownership_risk(row) >= 0.40 {
+        "SHARED"
     } else {
-        format!("{bytes} bytes")
+        "DISTRIBUTED"
     }
 }
 
-fn ownership_risk(hotspot: &ReportHotspot) -> f64 {
-    hotspot
-        .normalized_metrics
-        .ownership
-        .unwrap_or(0.0)
-        .clamp(0.0, 1.0)
-}
-
-fn ownership_risk_label(hotspot: &ReportHotspot) -> &'static str {
-    owner_risk_label(ownership_risk(hotspot))
-}
-
-fn owner_risk_label(value: f64) -> &'static str {
-    if value >= 0.85 {
-        "EXTREME"
-    } else if value >= 0.60 {
-        "HIGH"
-    } else if value >= 0.30 {
-        "MEDIUM"
-    } else {
-        "LOW"
-    }
-}
-
-fn ownership_shape_label(hotspot: &ReportHotspot) -> &'static str {
-    let Some(concentration) = hotspot.raw_metrics.dominant_owner_share else {
-        return "UNOBSERVED";
-    };
-
-    ownership_shape_label_for_share(concentration)
-}
-
-fn ownership_shape_label_for_share(concentration: f64) -> &'static str {
+fn ownership_shape_label(row: &RiskRow) -> &'static str {
+    let concentration = row
+        .dominant_owner_share
+        .unwrap_or_else(|| ownership_risk(row));
     if concentration > 0.90 {
         "single owner"
     } else if concentration >= 0.70 {
@@ -4806,328 +1318,193 @@ fn ownership_shape_label_for_share(concentration: f64) -> &'static str {
     }
 }
 
-fn risk_driver_lines(
-    snapshot: &TuiSnapshot,
-    hotspot: &ReportHotspot,
-    options: TuiOptions,
-) -> Vec<Line<'static>> {
-    let mut lines = qualified_driver_tags(snapshot, hotspot)
-        .into_iter()
-        .filter(|signal| signal.strength >= 0.60 || signal.percentile >= 0.75)
-        .filter_map(|signal| {
-            risk_driver_sentence_from_signal(signal.label)
-                .map(|message| (message.to_owned(), signal.strength, signal.priority))
-        })
-        .collect::<Vec<_>>();
-    if ownership_risk(hotspot) >= 0.60 {
-        lines.push((
-            "Concentrated ownership / low maintainer redundancy".to_owned(),
-            ownership_risk(hotspot),
-            80,
-        ));
-    }
-    if fan_for_path(snapshot, &hotspot.path).is_some_and(|fan| fan.fan_out >= 10) {
-        lines.push(("Central architectural dependency point".to_owned(), 1.0, 75));
-    }
-    if fan_for_path(snapshot, &hotspot.path).is_some_and(|fan| fan.fan_in >= 10) {
-        lines.push(("Central architectural dependency point".to_owned(), 1.0, 95));
-    }
-    if complexity_pressure_for_path(snapshot, &hotspot.path).is_some_and(|value| value >= 0.50) {
-        lines.push(("High structural or logical complexity".to_owned(), 1.0, 70));
-    }
-    if file_for_path(snapshot, &hotspot.path)
-        .and_then(|file| file.byte_size)
-        .is_some_and(|bytes| normalized_context_tokens(bytes.div_ceil(4), 100_000) >= 0.50)
-    {
-        lines.push((
-            "Expensive to review or reason about due to scale".to_owned(),
-            1.0,
-            75,
-        ));
-    }
-    lines.sort_by(|left, right| {
-        right
-            .2
-            .cmp(&left.2)
-            .then_with(|| {
-                right
-                    .1
-                    .partial_cmp(&left.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| left.0.cmp(&right.0))
+fn coupling_pressure(row: &RiskRow) -> f64 {
+    let source = term_value(row, "source_coupling").unwrap_or_else(|| {
+        let incoming = row.source_coupling_in.unwrap_or(0) as f64 / 25.0;
+        let outgoing = row.source_coupling_out.unwrap_or(0) as f64 / 15.0;
+        incoming.max(outgoing).clamp(0.0, 1.0)
     });
-    lines.dedup_by(|left, right| left.0 == right.0);
+    let cochange =
+        term_value(row, "cochange_coupling").unwrap_or(row.co_changed_file_count as f64 / 25.0);
+    source.max(cochange).clamp(0.0, 1.0)
+}
 
-    if lines.is_empty() {
+fn coupling_severity_label(value: f64) -> &'static str {
+    if value >= 0.85 {
+        "CENTRAL"
+    } else if value >= 0.60 {
+        "HIGH"
+    } else if value >= 0.35 {
+        "MODERATE"
+    } else {
+        "LOW"
+    }
+}
+
+fn complexity_pressure(row: &RiskRow) -> f64 {
+    term_value(row, "cognitive_complexity").unwrap_or_else(|| {
+        let file = row.cognitive_complexity.unwrap_or(0) as f64 / 150.0;
+        let function = row.max_function_complexity.unwrap_or(0) as f64 / 30.0;
+        file.max(function).clamp(0.0, 1.0)
+    })
+}
+
+fn term_value(row: &RiskRow, name: &str) -> Option<f64> {
+    row.terms
+        .iter()
+        .find(|term| term.name == name)
+        .and_then(|term| term.normalized_value)
+}
+
+fn risk_driver_lines(row: &RiskRow) -> Vec<Line<'static>> {
+    let mut messages = row
+        .facts
+        .iter()
+        .map(|fact| fact.message.clone())
+        .collect::<Vec<_>>();
+    if ownership_risk(row) >= 0.60 {
+        messages.push("Concentrated ownership / low maintainer redundancy".to_owned());
+    }
+    if coupling_pressure(row) >= 0.60 {
+        messages.push("Central architectural dependency point".to_owned());
+    }
+    if complexity_pressure(row) >= 0.50 {
+        messages.push("High structural or logical complexity".to_owned());
+    }
+    if row
+        .line_count
+        .is_some_and(|line_count| line_size_band(line_count).bar_value() >= 0.60)
+    {
+        messages.push("Expensive to review or reason about due to scale".to_owned());
+    }
+    messages.sort();
+    messages.dedup();
+
+    if messages.is_empty() {
         return Vec::new();
     }
 
-    let mut rendered = vec![
+    let mut lines = vec![
         Line::raw(""),
         Line::styled(
             "Why This File Matters",
-            style(options, TuiSeverity::Medium).add_modifier(Modifier::BOLD),
+            style(TuiSeverity::Medium).add_modifier(Modifier::BOLD),
         ),
     ];
-    rendered.extend(
-        lines
+    lines.extend(
+        messages
             .into_iter()
             .take(4)
-            .map(|(message, _, _)| Line::raw(format!("  - {message}"))),
+            .map(|message| Line::raw(format!("  - {message}"))),
     );
-
-    rendered
-}
-
-fn risk_driver_sentence_from_signal(label: &str) -> Option<&'static str> {
-    match label {
-        "CORE" => Some("Central architectural dependency point"),
-        "CHURN" => Some("Changes significantly more often than typical files"),
-        "COUPLING" => Some("Frequently changes alongside related modules"),
-        "FRAGILITY" => Some("Concentrated ownership / low maintainer redundancy"),
-        "SIZE" => Some("Expensive to review or reason about due to scale"),
-        "COMPLEXITY" => Some("High structural or logical complexity"),
-        "VOLATILITY" => Some("Unstable recent modification activity"),
-        _ => None,
-    }
-}
-
-fn inspector_lines(
-    snapshot: &TuiSnapshot,
-    state: &TuiAppState,
-    rows: &[DisplayRow],
-    width: u16,
-    options: TuiOptions,
-) -> Vec<Line<'static>> {
-    if state.index_mode.is_some() && state.current_view == TuiView::Hotspots {
-        return index_inspector_lines(state, width, options);
-    }
-    let selected_text = rows
-        .get(state.selected_index())
-        .map(|row| row.text.as_str());
-    let selected_path = selected_text
-        .and_then(|row| match state.current_view {
-            TuiView::Hotspots => hotspot_path_from_row(snapshot, row),
-            TuiView::RepoTree => repo_tree_path_from_row(snapshot, row),
-            TuiView::CouplingGraph => {
-                coupling_graph_path_from_row(snapshot, state.current_path.as_deref(), row)
-            }
-            TuiView::FileDetail
-            | TuiView::SymbolDetail
-            | TuiView::GitDetail
-            | TuiView::ExplainScore => state.current_path.clone(),
-            TuiView::ContextBudgeting => None,
-        })
-        .or_else(|| state.current_path.clone());
-
-    match selected_path {
-        Some(path) => file_inspector_lines(snapshot, &path, width, options),
-        None => repo_inspector_lines(snapshot, options),
-    }
-}
-
-fn index_inspector_lines(
-    state: &TuiAppState,
-    width: u16,
-    options: TuiOptions,
-) -> Vec<Line<'static>> {
-    let Some(index_mode) = &state.index_mode else {
-        return Vec::new();
-    };
-    if let Some(error) = &index_mode.last_query_error {
-        return vec![Line::styled(
-            format!("Index read failed: {error}"),
-            style(options, TuiSeverity::High),
-        )];
-    }
-    if let Some(pending) = &index_mode.pending_inspector {
-        if pending.started_at.elapsed() >= TUI_INSPECTOR_LOADING_DELAY {
-            return vec![Line::styled(
-                format!("Loading inspector for {}", pending.detail),
-                style(options, TuiSeverity::Muted),
-            )];
-        }
-    }
-    let Some(inspector) = &index_mode.inspector else {
-        return vec![Line::styled(
-            "No hotspot selected",
-            style(options, TuiSeverity::Muted),
-        )];
-    };
-    file_inspector_lines(
-        &index_mode.presentation,
-        &inspector.hotspot.path,
-        width,
-        options,
-    )
-}
-
-fn file_inspector_lines(
-    snapshot: &TuiSnapshot,
-    path: &str,
-    width: u16,
-    options: TuiOptions,
-) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::styled(
-        truncate_middle(path, width.saturating_sub(4) as usize),
-        style(options, TuiSeverity::Medium).add_modifier(Modifier::BOLD),
-    )];
-    if let Some(hotspot) = hotspot_for_path(snapshot, path) {
-        lines.push(Line::raw(""));
-        lines.push(metric_bar_line(
-            "RISK",
-            hotspot.score,
-            severity_label(hotspot.score).to_owned(),
-            severity_for_score(hotspot.score),
-            options,
-        ));
-        lines.push(metric_bar_line(
-            "FRAGILITY",
-            ownership_risk(hotspot),
-            ownership_risk_label(hotspot).to_owned(),
-            severity_for_score(ownership_risk(hotspot)),
-            options,
-        ));
-
-        let coupling = coupling_pressure_for_path(snapshot, path).unwrap_or(0.0);
-        lines.push(metric_bar_line(
-            "COUPLING",
-            coupling,
-            coupling_severity_label(coupling).to_owned(),
-            severity_for_score(coupling),
-            options,
-        ));
-        match complexity_score_for_path(snapshot, path) {
-            Some(complexity) => lines.push(metric_bar_line(
-                "COMPLEXITY",
-                (complexity / 35.0).clamp(0.0, 1.0),
-                complexity_severity_label(complexity).to_owned(),
-                severity_for_complexity_score(complexity),
-                options,
-            )),
-            None => lines.push(unavailable_metric_line("COMPLEXITY", options)),
-        }
-        if let Some(line_count) = file_for_path(snapshot, path).and_then(|file| file.line_count) {
-            let band = line_size_band(line_count);
-            let size_text = context_pressure_for_path(snapshot, path).map_or_else(
-                || {
-                    format!(
-                        "{} {} lines",
-                        band.label(),
-                        format_compact_count(line_count)
-                    )
-                },
-                |(_context, tokens)| {
-                    format!(
-                        "{} {} lines · {} tokens",
-                        band.label(),
-                        format_compact_count(line_count),
-                        format_compact_count(tokens)
-                    )
-                },
-            );
-            lines.push(metric_bar_line(
-                "SIZE",
-                band.bar_value(),
-                size_text,
-                band.severity(),
-                options,
-            ));
-        }
-
-        let tags = hotspot_tag_text(&inspector_driver_tags(snapshot, hotspot));
-        if !tags.is_empty() {
-            lines.push(Line::raw(""));
-            lines.push(Line::styled(tags, style(options, TuiSeverity::Muted)));
-        }
-
-        lines.push(Line::raw(""));
-        lines.push(section_divider(width, options));
-        lines.extend(risk_driver_lines(snapshot, hotspot, options));
-    } else {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            "No hotspot score for this file",
-            style(options, TuiSeverity::Muted),
-        ));
-    }
-
-    lines.push(Line::raw(""));
-    lines.push(section_divider(width, options));
-    lines.push(Line::raw(""));
-    let ownership_title = hotspot_for_path(snapshot, path).map_or_else(
-        || "Ownership".to_owned(),
-        |hotspot| format!("Ownership ({})", ownership_shape_label(hotspot)),
-    );
-    lines.push(Line::styled(
-        ownership_title,
-        style(options, TuiSeverity::Medium).add_modifier(Modifier::BOLD),
-    ));
-    lines.extend(ownership_distribution_lines(snapshot, path, options));
 
     lines
 }
 
-fn ownership_distribution_lines(
-    snapshot: &TuiSnapshot,
-    path: &str,
-    options: TuiOptions,
-) -> Vec<Line<'static>> {
-    let Some(ownership) = ownership_for_path(snapshot, path) else {
-        return vec![Line::styled(
-            "  unavailable",
-            style(options, TuiSeverity::Muted),
-        )];
-    };
-    if ownership.owners.is_empty() {
-        return vec![Line::styled(
-            "  unavailable",
-            style(options, TuiSeverity::Muted),
-        )];
+fn ownership_distribution_lines(row: &RiskRow) -> Vec<Line<'static>> {
+    if row.owners.is_empty() {
+        return vec![Line::styled("  unavailable", style(TuiSeverity::Muted))];
     }
 
     let mut visible = Vec::new();
     let mut others_share = 0.0;
     let mut others_touches = 0;
-    for owner in &ownership.owners {
+    for owner in &row.owners {
         if visible.len() < 3 && owner.author != "others" {
             visible.push(owner);
         } else {
-            others_share += owner.share;
+            others_share += owner.ownership_share;
             others_touches += owner.touch_count;
         }
     }
 
     let mut lines = visible
         .into_iter()
-        .map(|owner| owner_share_line(&display_author_name(&owner.author), owner.share, options))
+        .map(|owner| owner_share_line(&display_author(&owner.author), owner.ownership_share))
         .collect::<Vec<_>>();
     if others_touches > 0 && rounded_percent(others_share) >= 1.0 {
-        lines.push(owner_share_line("others", others_share, options));
+        lines.push(owner_share_line("others", others_share));
     }
 
     lines
 }
 
-fn rounded_percent(share: f64) -> f64 {
-    (share * 100.0).round()
-}
-
-fn owner_share_line(author: &str, share: f64, options: TuiOptions) -> Line<'static> {
+fn owner_share_line(author: &str, share: f64) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!(
                 "  {:<OWNER_NAME_WIDTH$}",
                 truncate_end(author, OWNER_NAME_WIDTH)
             ),
-            style(options, TuiSeverity::Muted),
+            style(TuiSeverity::Muted),
         ),
         Span::raw(format!(" {:>3.0}%", share * 100.0)),
     ])
 }
 
-fn display_author_name(author: &str) -> String {
+fn rounded_percent(share: f64) -> f64 {
+    (share * 100.0).round()
+}
+
+fn format_compact_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn padded_rect(area: Rect, left: u16, right: u16, top: u16, bottom: u16) -> Rect {
+    Rect {
+        x: area.x.saturating_add(left.min(area.width)),
+        y: area.y.saturating_add(top.min(area.height)),
+        width: area.width.saturating_sub(left.saturating_add(right)),
+        height: area.height.saturating_sub(top.saturating_add(bottom)),
+    }
+}
+
+fn truncate_middle(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_owned();
+    }
+    if width <= 1 {
+        return "…".to_owned();
+    }
+    let left = (width - 1) / 2;
+    let right = width - 1 - left;
+    let prefix = value.chars().take(left).collect::<String>();
+    let suffix = value
+        .chars()
+        .rev()
+        .take(right)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{prefix}…{suffix}")
+}
+
+fn truncate_end(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_owned();
+    }
+    if width <= 1 {
+        return "…".to_owned();
+    }
+    format!("{}…", value.chars().take(width - 1).collect::<String>())
+}
+
+fn pad_truncated_end(value: &str, width: usize) -> String {
+    format!("{:<width$}", truncate_end(value, width))
+}
+
+fn pad_truncated_path(value: &str, width: usize) -> String {
+    format!("{:<width$}", truncate_middle(value, width))
+}
+
+fn display_author(author: &str) -> String {
     author
         .split_once(" <")
         .map(|(name, _email)| name.trim())
@@ -5136,384 +1513,34 @@ fn display_author_name(author: &str) -> String {
         .to_owned()
 }
 
-fn repo_inspector_lines(snapshot: &TuiSnapshot, options: TuiOptions) -> Vec<Line<'static>> {
-    vec![
-        Line::styled(
-            "Repository",
-            style(options, TuiSeverity::Medium).add_modifier(Modifier::BOLD),
-        ),
-        Line::raw(""),
-        Line::raw(format!("Files: {}", snapshot.scan.summary.total_files)),
-        Line::raw(format!(
-            "Hotspots: {}",
-            snapshot.report.summary.hotspot_count
-        )),
-        Line::raw(format!(
-            "Context tokens: {}",
-            snapshot.report.summary.context_estimated_tokens
-        )),
-        Line::raw(format!(
-            "Dependency edges: {}",
-            snapshot.coupling.edges.len()
-        )),
-        Line::raw(format!(
-            "Symbols: {}",
-            snapshot.symbols.summary.symbol_count
-        )),
-        Line::raw(""),
-        Line::styled(
-            "Scores are advisory and local.",
-            style(options, TuiSeverity::Muted),
-        ),
-    ]
+fn optional_i64_to_u64(value: Option<i64>) -> Option<u64> {
+    value.map(i64_to_u64)
 }
 
-fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, options: TuiOptions) {
-    let popup = centered_rect(72, 60, area);
-    frame.render_widget(Clear, popup);
-    let lines = vec![
-        Line::styled(
-            "Hotpath keys",
-            style(options, TuiSeverity::Medium).add_modifier(Modifier::BOLD),
-        ),
-        Line::raw(""),
-        Line::raw("j/k or arrows  move selection"),
-        Line::raw("Enter or l      drill into selected row"),
-        Line::raw("h or Esc        go back, then exit at root"),
-        Line::raw("/               search current view"),
-        Line::raw("1..4            Hotspots, Tree, Coupling, Context"),
-        Line::raw("t/g/c/x         tree, graph, context, explain score"),
-        Line::raw("Tab             cycle focus"),
-        Line::raw("Ctrl-P          command palette"),
-        Line::raw("e               resolve editor action"),
-        Line::raw("q               quit"),
-        Line::raw(""),
-        Line::styled(
-            "All analysis stays local and offline.",
-            style(options, TuiSeverity::Muted),
-        ),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines).block(panel_block("Help", true, options)),
-        popup,
-    );
-}
-
-fn render_command_palette(frame: &mut Frame<'_>, area: Rect, options: TuiOptions) {
-    let popup = centered_rect(64, 42, area);
-    frame.render_widget(Clear, popup);
-    let lines = vec![
-        Line::styled(
-            "Command palette",
-            style(options, TuiSeverity::Medium).add_modifier(Modifier::BOLD),
-        ),
-        Line::raw(""),
-        Line::raw("1  Open hotspots"),
-        Line::raw("2  Open repository tree"),
-        Line::raw("3  Open coupling graph"),
-        Line::raw("4  Open context budgeting"),
-        Line::raw("/  Search current view"),
-        Line::raw("Esc close"),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines).block(panel_block("Ctrl-P", true, options)),
-        popup,
-    );
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-    let horizontal = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vertical[1]);
-
-    horizontal[1]
-}
-
-fn panel_block<'a>(title: &'a str, focused: bool, options: TuiOptions) -> Block<'a> {
-    let border_style = if focused {
-        style(options, TuiSeverity::Medium)
-    } else {
-        style(options, TuiSeverity::Muted)
-    };
-    Block::default()
-        .title(format!(" {title} "))
-        .borders(Borders::ALL)
-        .border_type(if options.ascii {
-            BorderType::Plain
-        } else {
-            BorderType::Rounded
-        })
-        .border_style(border_style)
-}
-
-fn plain_panel_block(focused: bool, options: TuiOptions) -> Block<'static> {
-    let border_style = if focused {
-        style(options, TuiSeverity::Medium)
-    } else {
-        style(options, TuiSeverity::Muted)
-    };
-    Block::default()
-        .borders(Borders::ALL)
-        .border_type(if options.ascii {
-            BorderType::Plain
-        } else {
-            BorderType::Rounded
-        })
-        .border_style(border_style)
-}
-
-fn style(options: TuiOptions, severity: TuiSeverity) -> Style {
-    if options.no_color {
-        return Style::default();
-    }
-
-    let color = match severity {
-        TuiSeverity::High => Color::Red,
-        TuiSeverity::Medium => Color::Yellow,
-        TuiSeverity::Low => Color::Green,
-        TuiSeverity::Neutral => Color::White,
-        TuiSeverity::Muted => Color::DarkGray,
-    };
-
-    Style::default().fg(color)
-}
-
-fn selected_row_style(options: TuiOptions, severity: TuiSeverity) -> Style {
-    let base = style(options, severity).add_modifier(Modifier::BOLD);
-    if options.no_color {
-        return base.add_modifier(Modifier::REVERSED);
-    }
-
-    base.bg(Color::Rgb(32, 32, 32))
-}
-
-fn selected_gap_style(options: TuiOptions) -> Style {
-    if options.no_color {
-        return Style::default().add_modifier(Modifier::REVERSED);
-    }
-
-    Style::default().bg(Color::Rgb(32, 32, 32))
-}
-
-fn marker_style(selected: bool, options: TuiOptions) -> Style {
-    if !selected {
-        return Style::default();
-    }
-
-    selected_row_style(options, TuiSeverity::Medium)
-}
-
-fn score_bar_parts(score: f64, width: usize, options: TuiOptions) -> (String, String) {
-    let filled = ((score.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
-    let fill = if options.ascii { "=" } else { "■" };
-    let empty = if options.ascii { "." } else { "□" };
-
-    (
-        fill.repeat(filled),
-        empty.repeat(width.saturating_sub(filled)),
-    )
-}
-
-fn score_bar_spans(
-    score: f64,
-    width: usize,
-    active_style: Style,
-    options: TuiOptions,
-) -> Vec<Span<'static>> {
-    score_bar_spans_with_inactive(
-        score,
-        width,
-        active_style,
-        inactive_bar_style(options),
-        options,
-    )
-}
-
-fn selected_score_bar_spans(
-    score: f64,
-    width: usize,
-    active_style: Style,
-    options: TuiOptions,
-) -> Vec<Span<'static>> {
-    score_bar_spans_with_inactive(
-        score,
-        width,
-        active_style,
-        selected_inactive_bar_style(options),
-        options,
-    )
-}
-
-fn score_bar_spans_with_inactive(
-    score: f64,
-    width: usize,
-    active_style: Style,
-    inactive_style: Style,
-    options: TuiOptions,
-) -> Vec<Span<'static>> {
-    let (filled, empty) = score_bar_parts(score, width, options);
-    vec![
-        Span::styled(filled, active_style),
-        Span::styled(empty, inactive_style),
-    ]
-}
-
-fn inactive_bar_style(options: TuiOptions) -> Style {
-    if options.no_color {
-        return Style::default();
-    }
-    if options.ascii {
-        return style(options, TuiSeverity::Muted);
-    }
-
-    Style::default().fg(Color::Rgb(82, 82, 82)).bg(Color::Black)
-}
-
-fn selected_inactive_bar_style(options: TuiOptions) -> Style {
-    if options.no_color {
-        return Style::default().add_modifier(Modifier::REVERSED);
-    }
-    if options.ascii {
-        return selected_row_style(options, TuiSeverity::Muted);
-    }
-
-    Style::default()
-        .fg(Color::Rgb(118, 118, 118))
-        .bg(Color::Rgb(32, 32, 32))
-}
-
-fn short_commit(value: &str) -> String {
-    value.chars().take(7).collect()
-}
-
-fn truncate_middle(value: &str, max: usize) -> String {
-    let length = value.chars().count();
-    if length <= max {
-        return value.to_owned();
-    }
-    if max <= 1 {
-        return "…".to_owned();
-    }
-    if max <= 3 {
-        return ".".repeat(max);
-    }
-    let left_len = (max - 1) / 2;
-    let right_len = max - 1 - left_len;
-    let left = value.chars().take(left_len).collect::<String>();
-    let right = value
-        .chars()
-        .rev()
-        .take(right_len)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>();
-
-    format!("{left}…{right}")
-}
-
-fn truncate_end(value: &str, max: usize) -> String {
-    let length = value.chars().count();
-    if length <= max {
-        return value.to_owned();
-    }
-    if max <= 1 {
-        return "…".to_owned();
-    }
-
-    let prefix = value.chars().take(max - 1).collect::<String>();
-
-    format!("{prefix}…")
-}
-
-fn pad_truncated_end(value: &str, width: usize) -> String {
-    let truncated = truncate_end(value, width);
-    let padding = width.saturating_sub(truncated.chars().count());
-
-    format!("{truncated}{}", " ".repeat(padding))
-}
-
-fn truncate_path_start(value: &str, max: usize) -> String {
-    let length = value.chars().count();
-    if length <= max {
-        return value.to_owned();
-    }
-    if max <= 1 {
-        return "…".to_owned();
-    }
-
-    let suffix = value
-        .chars()
-        .rev()
-        .take(max - 1)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>();
-
-    format!("…{suffix}")
-}
-
-fn pad_truncated_path(value: &str, width: usize) -> String {
-    let truncated = truncate_path_start(value, width);
-    let padding = width.saturating_sub(truncated.chars().count());
-
-    format!("{truncated}{}", " ".repeat(padding))
-}
-#[cfg(test)]
-fn should_quit(key: KeyEvent) -> bool {
-    if key.kind != KeyEventKind::Press {
-        return false;
-    }
-
-    matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+fn i64_to_u64(value: i64) -> u64 {
+    value.max(0) as u64
 }
 
 struct TerminalSession {
     terminal: TuiTerminal,
-    raw_mode_enabled: bool,
-    alternate_screen_enabled: bool,
 }
 
 impl TerminalSession {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-
         let mut stdout = io::stdout();
         if let Err(error) = execute!(stdout, EnterAlternateScreen) {
             let _ = disable_raw_mode();
             return Err(error);
         }
-
         let backend = CrosstermBackend::new(stdout);
-        let terminal = match Terminal::new(backend) {
-            Ok(terminal) => terminal,
+        match Terminal::new(backend) {
+            Ok(terminal) => Ok(Self { terminal }),
             Err(error) => {
-                let mut stdout = io::stdout();
-                let _ = execute!(stdout, LeaveAlternateScreen);
                 let _ = disable_raw_mode();
-                return Err(error);
+                Err(error)
             }
-        };
-
-        Ok(Self {
-            terminal,
-            raw_mode_enabled: true,
-            alternate_screen_enabled: true,
-        })
+        }
     }
 
     fn terminal_mut(&mut self) -> &mut TuiTerminal {
@@ -5523,2090 +1550,383 @@ impl TerminalSession {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        if self.alternate_screen_enabled {
-            let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
-            self.alternate_screen_enabled = false;
-        }
-
-        if self.raw_mode_enabled {
-            let _ = disable_raw_mode();
-            self.raw_mode_enabled = false;
-        }
+        let _ = disable_raw_mode();
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = self.terminal.show_cursor();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::context::{ContextSkippedReason, ContextSkippedRow, ContextSummary};
-    use crate::parse::{ParseFileReason, ParseFileStatus};
-    use crate::report::{
-        ReportContext, ReportFindingLevel, ReportGitSummary, ReportSummary, REPORT_SCHEMA_VERSION,
-    };
-    use crate::scoring::{
-        FormulaVersion, NormalizedMetric, NormalizedScoreMetrics, RawScoreMetrics, ScoreLimitation,
-        WeightedTerm,
-    };
-    use crate::test_support::parse_import as import;
-    use crate::{ContentKind, FileRecord, ParseFileRecord, ParseSymbolRecord, ScanReport};
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use ratatui::backend::TestBackend;
+    use rusqlite::Connection;
 
-    #[test]
-    fn quit_keys_are_q_and_escape_key_presses() {
-        assert!(should_quit(KeyEvent::from(KeyCode::Char('q'))));
-        assert!(should_quit(KeyEvent::from(KeyCode::Esc)));
-        assert!(!should_quit(KeyEvent::from(KeyCode::Char('Q'))));
-        assert!(!should_quit(KeyEvent::from(KeyCode::Enter)));
+    use super::*;
+
+    static NEXT_FIXTURE_ID: AtomicUsize = AtomicUsize::new(0);
+
+    struct Fixture {
+        path: PathBuf,
     }
 
-    #[test]
-    fn reducer_moves_selection_with_j_and_k() {
-        let snapshot = test_snapshot();
-        let mut state = TuiAppState::default();
-
-        reduce_test_key(&mut state, &snapshot, KeyCode::Char('j'), None);
-        reduce_test_key(&mut state, &snapshot, KeyCode::Char('j'), None);
-        reduce_test_key(&mut state, &snapshot, KeyCode::Char('k'), None);
-
-        assert_eq!(state.selected_index(), 0);
-    }
-
-    #[test]
-    fn reducer_supports_modern_navigation_keys_and_overlays() {
-        let snapshot = test_snapshot();
-        let mut state = TuiAppState::default();
-
-        reduce_test_key(&mut state, &snapshot, KeyCode::Char('?'), None);
-        assert!(state.show_help());
-        reduce_test_key(&mut state, &snapshot, KeyCode::Esc, None);
-        assert!(!state.show_help());
-
-        reduce_test_key(&mut state, &snapshot, KeyCode::Tab, None);
-        assert_eq!(state.pane_focus(), TuiPaneFocus::Inspector);
-        reduce_test_key(&mut state, &snapshot, KeyCode::BackTab, None);
-        assert_eq!(state.pane_focus(), TuiPaneFocus::Main);
-
-        reduce_test_key(&mut state, &snapshot, KeyCode::Char('2'), None);
-        assert_eq!(state.current_view(), TuiView::RepoTree);
-        reduce_test_key(&mut state, &snapshot, KeyCode::Char('1'), None);
-        assert_eq!(state.current_view(), TuiView::Hotspots);
-    }
-
-    #[test]
-    fn index_mode_renders_paged_hotspots_and_disables_other_views() {
-        let snapshot = test_snapshot();
-        let mut state = TuiAppState {
-            index_mode: Some(TuiIndexMode {
-                worktree_root: PathBuf::from("."),
-                include_generated_hotspots: false,
-                hotspots: TuiHotspotPage {
-                    rows: vec![storage::index::PersistedHotspot {
-                        path: "src/lib.rs".to_owned(),
-                        score: 0.64,
-                        rank: 1,
-                        formula_version: "hotpath.score.v3".to_owned(),
-                        raw_metrics_json: None,
-                        explanation: None,
-                        limitation: None,
-                    }],
-                    total: 1,
-                    offset: 0,
-                    limit: 200,
-                    query: None,
-                },
-                presentation: snapshot.clone(),
-                inspector: None,
-                pending_page: None,
-                pending_inspector: None,
-                last_query_error: None,
-            }),
-            ..TuiAppState::default()
-        };
-
-        let rows = display_rows(&snapshot, &state);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].hotspot.as_ref().map(|row| row.path.as_str()),
-            Some("src/lib.rs")
-        );
-        assert_eq!(rows[0].meta, "risk 6/10  churn 120  authors 3");
-
-        reduce_test_key(&mut state, &snapshot, KeyCode::Char('2'), None);
-
-        assert_eq!(state.current_view(), TuiView::Hotspots);
-        assert_eq!(
-            state.status(),
-            Some("Only hotspot view is loaded for this repository size")
-        );
-    }
-
-    #[test]
-    fn find_existing_index_root_walks_parents_without_git_discovery() {
-        let root = std::env::current_dir()
-            .expect("test should have cwd")
-            .join("target")
-            .join(format!(
-                "tui-index-root-{}-{}",
-                std::process::id(),
-                Instant::now().elapsed().as_nanos()
-            ));
-        let nested = root.join("src").join("nested");
-        std::fs::create_dir_all(root.join(".hotpath")).expect("index dir should be created");
-        std::fs::create_dir_all(&nested).expect("nested dir should be created");
-        std::fs::write(storage::index::default_index_path(&root), b"")
-            .expect("index marker should be created");
-
-        assert_eq!(find_existing_index_root(&nested), Some(root.clone()));
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn reducer_drills_down_and_escape_navigates_back() {
-        let snapshot = test_snapshot();
-        let mut state = TuiAppState::default();
-
-        reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
-
-        assert_eq!(state.current_view(), TuiView::FileDetail);
-        assert_eq!(state.current_path(), Some("src/lib.rs"));
-        assert_eq!(
-            state.last_action(),
-            Some(&TuiAction::DrillDown {
-                from: TuiView::Hotspots,
-                to: TuiView::FileDetail,
-                path: "src/lib.rs".to_owned(),
-            })
-        );
-
-        reduce_test_key(&mut state, &snapshot, KeyCode::Esc, None);
-
-        assert_eq!(state.current_view(), TuiView::Hotspots);
-        assert_eq!(state.current_path(), None);
-        assert!(!state.should_exit());
-    }
-
-    #[test]
-    fn reducer_search_filters_current_view_and_escape_clears_search_first() {
-        let snapshot = test_snapshot();
-        let mut state = TuiAppState::default();
-
-        reduce_test_key(&mut state, &snapshot, KeyCode::Char('/'), None);
-        assert!(state.is_search_editing());
-        for character in "lib".chars() {
-            reduce_test_key(&mut state, &snapshot, KeyCode::Char(character), None);
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::SeqCst);
+            let path =
+                env::temp_dir().join(format!("hotpath-tui-{name}-{}-{id}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(path.join(".hotpath")).expect("fixture dir should exist");
+            Self { path }
         }
 
-        assert_eq!(state.search_query(), Some("lib"));
-        assert_eq!(
-            filtered_visible_rows(&snapshot, &state),
-            vec!["#1 src/lib.rs score 0.640"]
-        );
-
-        reduce_test_key(&mut state, &snapshot, KeyCode::Esc, None);
-
-        assert_eq!(state.search_query(), None);
-        assert!(!state.is_search_editing());
-        assert_eq!(state.current_view(), TuiView::Hotspots);
-        assert!(!state.should_exit());
-    }
-
-    #[test]
-    fn reducer_enter_confirms_search_and_keeps_filtered_rows_active() {
-        let snapshot = test_snapshot();
-        let mut state = TuiAppState::default();
-
-        reduce_test_key(&mut state, &snapshot, KeyCode::Char('/'), None);
-        for character in "lib".chars() {
-            reduce_test_key(&mut state, &snapshot, KeyCode::Char(character), None);
+        fn db_path(&self) -> PathBuf {
+            self.path.join(INDEX_DB)
         }
-        reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
+    }
 
-        assert_eq!(state.search_query(), Some("lib"));
-        assert!(!state.is_search_editing());
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn missing_db_returns_empty_state() {
+        let fixture = env::temp_dir().join("hotpath-tui-missing-db");
+        let _ = fs::remove_dir_all(&fixture);
+        fs::create_dir_all(&fixture).expect("fixture should exist");
+
+        let snapshot = TuiDatabaseSnapshot::load_from_dir(&fixture);
+
+        assert!(snapshot.index_root.is_none());
+        assert!(snapshot
+            .status
+            .as_deref()
+            .is_some_and(|status| status.contains("Run hotpath scan first")));
+        let _ = fs::remove_dir_all(&fixture);
+    }
+
+    #[test]
+    fn loads_project_summary_and_ranked_rows() {
+        let fixture = Fixture::new("load");
+        create_tui_db(&fixture.db_path());
+
+        let snapshot = TuiDatabaseSnapshot::load_from_dir(&fixture.path);
+
         assert_eq!(
-            filtered_visible_rows(&snapshot, &state),
-            vec!["#1 src/lib.rs score 0.640"]
+            snapshot
+                .project
+                .as_ref()
+                .map(|project| project.risk_band.as_str()),
+            Some("high")
         );
-
-        reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
-
-        assert_eq!(state.current_view(), TuiView::FileDetail);
-        assert_eq!(state.current_path(), Some("src/lib.rs"));
+        assert_eq!(snapshot.rows.len(), 2);
+        assert_eq!(snapshot.rows[0].relative_path, "src/risky.go");
+        assert!(snapshot.rows[0].is_generated);
+        assert!(inspector_tags(&snapshot.rows[0])
+            .iter()
+            .any(|tag| tag == "GEN"));
+        assert_eq!(snapshot.rows[0].terms.len(), 2);
+        assert_eq!(snapshot.rows[0].facts.len(), 1);
+        assert_eq!(snapshot.rows[0].limitations.len(), 1);
+        assert_eq!(snapshot.rows[0].owners.len(), 1);
     }
 
     #[test]
-    fn reducer_search_accepts_q_as_query_text() {
-        let snapshot = test_snapshot();
-        let mut state = TuiAppState::default();
+    fn empty_risk_tables_return_scored_go_empty_state() {
+        let fixture = Fixture::new("empty-risk");
+        create_empty_tui_db(&fixture.db_path());
 
-        reduce_test_key(&mut state, &snapshot, KeyCode::Char('/'), None);
-        reduce_test_key(&mut state, &snapshot, KeyCode::Char('q'), None);
+        let snapshot = TuiDatabaseSnapshot::load_from_dir(&fixture.path);
 
-        assert_eq!(state.search_query(), Some("q"));
-        assert!(!state.should_exit());
+        assert!(snapshot.rows.is_empty());
+        assert!(snapshot
+            .status
+            .as_deref()
+            .is_some_and(|status| status.contains("No scored Go files found")));
     }
 
     #[test]
-    fn reducer_does_not_create_self_history_from_detail_view() {
-        let snapshot = test_snapshot();
-        let mut state = TuiAppState::default();
+    fn search_filters_rows_and_clamps_selection() {
+        let snapshot = sample_snapshot();
+        let mut state = TuiState::new();
 
-        reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
-        reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
-        reduce_test_key(&mut state, &snapshot, KeyCode::Esc, None);
+        reduce_key(&mut state, &snapshot, KeyEvent::from(KeyCode::Char('/')));
+        reduce_key(&mut state, &snapshot, KeyEvent::from(KeyCode::Char('s')));
+        reduce_key(&mut state, &snapshot, KeyEvent::from(KeyCode::Char('a')));
+        reduce_key(&mut state, &snapshot, KeyEvent::from(KeyCode::Char('f')));
+        reduce_key(&mut state, &snapshot, KeyEvent::from(KeyCode::Enter));
 
-        assert_eq!(state.current_view(), TuiView::Hotspots);
-        assert!(!state.should_exit());
+        let filtered = state.filtered_indices(&snapshot);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(snapshot.rows[filtered[0]].relative_path, "src/safe.go");
     }
 
     #[test]
-    fn visible_row_window_keeps_selection_rendered() {
-        let rows = ["a", "b", "c", "d", "e", "f"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-
-        let window = visible_row_window(&rows, 5, 4)
-            .map(|(index, row)| (index, row.as_str()))
-            .collect::<Vec<_>>();
-
-        assert_eq!(window, vec![(2, "c"), (3, "d"), (4, "e"), (5, "f")]);
-    }
-
-    #[test]
-    fn responsive_layout_modes_match_terminal_widths() {
-        assert_eq!(layout_mode(Rect::new(0, 0, 130, 36)), TuiLayoutMode::Wide);
-        assert_eq!(layout_mode(Rect::new(0, 0, 100, 26)), TuiLayoutMode::Medium);
-        assert_eq!(layout_mode(Rect::new(0, 0, 80, 24)), TuiLayoutMode::Narrow);
-    }
-
-    #[test]
-    fn render_dashboard_contains_top_navigation_and_inspector() {
-        let snapshot = test_snapshot();
-        let state = TuiAppState::default();
-        let backend = TestBackend::new(130, 36);
-        let mut terminal = Terminal::new(backend).expect("test terminal should initialize");
+    fn renders_hotpath_view_with_inspector() {
+        let snapshot = sample_snapshot();
+        let state = TuiState::new();
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
 
         terminal
             .draw(|frame| render(frame, &snapshot, &state))
             .expect("render should succeed");
+        let output = buffer_text(&terminal);
 
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(rendered.contains("Hotpath"));
-        assert!(rendered.contains("[1 Hotspots]  2 Repo Tree"));
-        assert!(!rendered.contains("Navigate"));
-        assert!(rendered.contains("Inspector"));
-        assert!(rendered.contains("src/lib.rs"));
+        assert!(output.contains("Hotpath"));
+        assert!(output.contains("Repo Risk"));
+        assert!(output.contains("Top Factor"));
+        assert!(output.contains("Inspector"));
+        assert!(output.contains("src/risky.go"));
+        assert!(output.contains("CHURN"));
     }
 
     #[test]
-    fn header_uses_human_readable_token_count() {
-        let mut snapshot = test_snapshot();
-        snapshot.report.summary.context_estimated_tokens = 32_400;
-        let state = TuiAppState::default();
-        let backend = TestBackend::new(130, 4);
-        let mut terminal = Terminal::new(backend).expect("test terminal should initialize");
+    fn renders_missing_index_empty_state() {
+        let snapshot = TuiDatabaseSnapshot {
+            index_root: None,
+            status: Some("No Hotpath index found. Run hotpath scan first.".to_owned()),
+            project: None,
+            rows: Vec::new(),
+        };
+        let state = TuiState::new();
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
 
         terminal
-            .draw(|frame| {
-                render_header(
-                    frame,
-                    Rect::new(0, 0, 130, 4),
-                    &snapshot,
-                    &state,
-                    TuiOptions::default(),
-                )
-            })
+            .draw(|frame| render(frame, &snapshot, &state))
             .expect("render should succeed");
+        let output = buffer_text(&terminal);
 
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(rendered.starts_with("[1 Hotspots]"));
-        assert!(rendered.contains("32.4k tokens"));
-        assert!(!rendered.contains("32400 tokens"));
+        assert!(output.contains("No Hotpath index found"));
     }
 
-    #[test]
-    fn footer_hints_use_middle_dot_separators() {
-        let state = TuiAppState::default();
-        let backend = TestBackend::new(140, 3);
-        let mut terminal = Terminal::new(backend).expect("test terminal should initialize");
-
-        terminal
-            .draw(|frame| {
-                render_footer(
-                    frame,
-                    Rect::new(0, 0, 140, 3),
-                    &state,
-                    TuiOptions::default(),
-                )
-            })
-            .expect("render should succeed");
-
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(rendered.contains(&format!("move{HOTSPOT_TAG_SEPARATOR}Enter")));
-        assert!(rendered.contains(&format!("help{HOTSPOT_TAG_SEPARATOR}Ctrl-P")));
-        assert!(!rendered.contains("move  Enter"));
-    }
-
-    #[test]
-    fn footer_shows_background_progress_while_analysis_runs() {
-        let state = TuiAppState {
-            status: Some("Repo tree".to_owned()),
-            background_status: Some({
-                let mut update = TuiProgressUpdate::measured(
-                    "Git history",
-                    "diffing reachable commits",
-                    500,
-                    1_000,
-                    "commits",
+    fn create_empty_tui_db(path: &Path) {
+        let connection = Connection::open(path).expect("db should open");
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE project_risk_summary (
+                    formula_id TEXT PRIMARY KEY NOT NULL,
+                    active_scan_id INTEGER NOT NULL,
+                    score REAL NOT NULL,
+                    risk_10 REAL NOT NULL,
+                    risk_band TEXT NOT NULL,
+                    confidence TEXT NOT NULL,
+                    active_file_count INTEGER NOT NULL,
+                    active_go_file_count INTEGER NOT NULL,
+                    scored_file_count INTEGER NOT NULL,
+                    scoring_coverage REAL NOT NULL,
+                    go_score_coverage REAL
                 );
-                update.rate = Some(TuiProgressRate {
-                    completed_at_start: 0,
-                    started_at: Instant::now() - Duration::from_secs(4),
-                });
-                update
-            }),
-            analysis_running: true,
-            ..TuiAppState::default()
-        };
-        let now = state
-            .background_status
-            .as_ref()
-            .and_then(|update| update.rate)
-            .expect("progress rate exists")
-            .started_at
-            + Duration::from_secs(4);
-        let text = progress_status_text_at(
-            state.background_status.as_ref().expect("progress exists"),
-            120,
-            TuiOptions {
-                ascii: true,
-                ..TuiOptions::default()
-            },
-            now,
-        );
-
-        assert!(text.contains("Git history"));
-        assert!(text.contains("[=====.....]"));
-        assert!(text.contains("50%"));
-        assert!(text.contains("500/1000 commits"));
-        assert!(text.contains("125 commits/s"));
-        assert!(text.contains(&format!(
-            "commits{HOTSPOT_TAG_SEPARATOR}125 commits/s{HOTSPOT_TAG_SEPARATOR}diffing reachable commits"
-        )));
-        assert!(!text.contains("Repo tree"));
+                CREATE TABLE file_risk_scores (
+                    relative_path TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    active_scan_id INTEGER NOT NULL,
+                    formula_id TEXT NOT NULL,
+                    rank INTEGER NOT NULL,
+                    score REAL NOT NULL,
+                    risk_10 REAL NOT NULL,
+                    risk_band TEXT NOT NULL,
+                    is_generated INTEGER NOT NULL,
+                    is_vendor INTEGER NOT NULL
+                );
+                CREATE TABLE file_facts (
+                    relative_path TEXT,
+                    line_count INTEGER,
+                    byte_size INTEGER,
+                    language_id TEXT,
+                    cognitive_complexity INTEGER,
+                    max_function_complexity INTEGER,
+                    source_coupling_in INTEGER,
+                    source_coupling_out INTEGER,
+                    co_changed_file_count INTEGER NOT NULL,
+                    total_churn_lines INTEGER NOT NULL,
+                    recent_churn_lines INTEGER NOT NULL,
+                    commits_per_file INTEGER NOT NULL,
+                    dominant_owner TEXT,
+                    dominant_owner_share REAL,
+                    owner_count INTEGER,
+                    author_count INTEGER NOT NULL
+                );
+                CREATE TABLE file_risk_terms (
+                    relative_path TEXT NOT NULL,
+                    formula_id TEXT NOT NULL,
+                    term_name TEXT NOT NULL,
+                    raw_value REAL,
+                    normalized_value REAL,
+                    weight REAL NOT NULL,
+                    contribution REAL NOT NULL
+                );
+                CREATE TABLE file_risk_facts (
+                    relative_path TEXT NOT NULL,
+                    formula_id TEXT NOT NULL,
+                    fact_index INTEGER NOT NULL,
+                    fact_kind TEXT NOT NULL,
+                    message TEXT NOT NULL
+                );
+                CREATE TABLE file_risk_limitations (
+                    relative_path TEXT NOT NULL,
+                    formula_id TEXT NOT NULL,
+                    limitation_index INTEGER NOT NULL,
+                    code TEXT NOT NULL,
+                    message TEXT NOT NULL
+                );
+                CREATE TABLE git_file_owners (
+                    path TEXT NOT NULL,
+                    owner_rank INTEGER NOT NULL,
+                    author TEXT NOT NULL,
+                    ownership_score REAL NOT NULL,
+                    ownership_share REAL NOT NULL,
+                    touch_count INTEGER NOT NULL
+                );
+                ",
+            )
+            .expect("fixture schema should be created");
     }
 
     #[test]
-    fn progress_emitter_throttles_small_repeated_updates() {
-        let (sender, receiver) = mpsc::channel();
-        let mut emitter = TuiProgressEmitter::new(sender);
-
-        emitter.emit(TuiProgressUpdate::measured(
-            "Git history",
-            "a",
-            1,
-            100,
-            "commits",
-        ));
-        emitter.emit(TuiProgressUpdate::measured(
-            "Git history",
-            "b",
-            2,
-            100,
-            "commits",
-        ));
-        emitter.emit(TuiProgressUpdate::measured(
-            "Git history",
-            "c",
-            3,
-            100,
-            "commits",
-        ));
-        emitter.emit(TuiProgressUpdate::measured(
-            "Git history",
-            "done",
-            100,
-            100,
-            "commits",
-        ));
-
-        let messages = receiver.try_iter().collect::<Vec<_>>();
-        assert_eq!(messages.len(), 3);
-        assert!(matches!(
-            &messages[0],
-            TuiWorkerMessage::Progress(TuiProgressUpdate { detail, .. }) if detail == "a"
-        ));
-        assert!(matches!(
-            &messages[1],
-            TuiWorkerMessage::Progress(TuiProgressUpdate { detail, .. }) if detail == "c"
-        ));
-        assert!(matches!(
-            &messages[2],
-            TuiWorkerMessage::Progress(TuiProgressUpdate { detail, .. }) if detail == "done"
-        ));
-    }
-
-    #[test]
-    fn indeterminate_progress_shows_elapsed_time() {
-        let started_at = Instant::now() - Duration::from_secs(75);
-        let mut update = TuiProgressUpdate::indeterminate(
-            "Writing index",
-            "persisting scan, parser, Git, and hotspot facts",
-        );
-        update.started_at = Some(started_at);
-
-        let text = progress_status_text_at(
-            &update,
-            120,
-            TuiOptions::default(),
-            started_at + Duration::from_secs(75),
-        );
-
-        assert!(text.contains("Writing index"));
-        assert!(text.contains("persisting scan"));
-        assert!(text.contains(&format!("{HOTSPOT_TAG_SEPARATOR}1m 15s elapsed")));
-    }
-
-    #[test]
-    fn progress_rate_uses_first_emitted_completion_as_baseline() {
-        let (sender, receiver) = mpsc::channel();
-        let mut emitter = TuiProgressEmitter::new(sender);
-
-        emitter.emit(TuiProgressUpdate::measured(
-            "Git history",
-            "diffing reachable commits",
-            500,
-            1_000,
-            "commits",
-        ));
-
-        let messages = receiver.try_iter().collect::<Vec<_>>();
-        let TuiWorkerMessage::Progress(update) = &messages[0];
-        let rate = update
-            .rate
-            .expect("measured progress should carry rate data");
-
-        assert_eq!(rate.completed_at_start, 500);
-    }
-
-    #[test]
-    fn hotspot_rows_render_fixed_path_and_score_bar() {
-        let snapshot = test_snapshot();
-        let state = TuiAppState::default();
-        let row = display_rows(&snapshot, &state)
-            .into_iter()
-            .next()
-            .expect("fixture should have a hotspot row");
-
-        let line = render_display_row(&row, true, 80, TuiOptions::default());
-        let rendered = line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-
-        assert!(rendered.starts_with("\u{258C} src/lib.rs"));
-        assert!(!rendered.contains("#1"));
-        assert!(rendered.contains("src/lib.rs"));
-        assert!(!rendered.contains("hotspot"));
-        assert!(rendered.contains("6.4"));
-        assert!(!rendered.contains("CHURN"));
-    }
-
-    #[test]
-    fn selected_hotspot_row_uses_continuous_background() {
-        let row = DisplayHotspotRow {
-            path: "src/lib.rs".to_owned(),
-            score: 0.8,
-            tags: vec!["CHURN".to_owned()],
-        };
-
-        let line = render_hotspot_display_row(&row, true, 80, TuiOptions::default());
-
-        assert!(line
-            .spans
-            .iter()
-            .filter(|span| !span.content.is_empty())
-            .all(|span| span.style.bg == Some(Color::Rgb(32, 32, 32))));
-        assert_eq!(line.spans[0].content.as_ref(), "\u{258C} ");
-        assert_eq!(line.spans[0].style.fg, Some(Color::Yellow));
-    }
-
-    #[test]
-    fn hotspot_driver_tags_are_deterministic_and_suppress_weak_terms() {
-        let snapshot = test_snapshot();
-        let tags = hotspot_driver_tags(&snapshot, &snapshot.report.hotspots[0]);
-
-        assert!(tags.is_empty());
-    }
-
-    #[test]
-    fn hotspot_score_bars_start_in_the_same_column() {
-        let short = DisplayHotspotRow {
-            path: "a.rs".to_owned(),
-            score: 0.6,
-            tags: Vec::new(),
-        };
-        let long = DisplayHotspotRow {
-            path: "src/deeply/nested/repository/file.rs".to_owned(),
-            score: 0.7,
-            tags: Vec::new(),
-        };
-        let docs = DisplayHotspotRow {
-            path: "docs/json-schema.md".to_owned(),
-            score: 0.25,
-            tags: Vec::new(),
-        };
-        let short_line = render_hotspot_display_row(&short, true, 80, TuiOptions::default());
-        let long_line = render_hotspot_display_row(&long, false, 80, TuiOptions::default());
-        let docs_line = render_hotspot_display_row(&docs, false, 80, TuiOptions::default());
-        let short_rendered = line_text(&short_line);
-        let long_rendered = line_text(&long_line);
-        let docs_rendered = line_text(&docs_line);
-        let active_bar = score_bar_parts(1.0, 1, TuiOptions::default()).0;
-        let active_bar = active_bar.chars().next().expect("bar glyph");
-
-        assert_eq!(
-            char_position(&short_rendered, active_bar),
-            char_position(&long_rendered, active_bar),
-            "score bars should share a stable column"
-        );
-        assert_eq!(
-            char_position(&short_rendered, active_bar),
-            char_position(&docs_rendered, active_bar),
-            "docs paths should not shift the score bar"
-        );
-        assert!(short_rendered.starts_with("\u{258C} a.rs"));
-        assert!(long_rendered.contains("file.rs"));
-        assert!(docs_rendered.starts_with("  docs/json-schema.md"));
-        assert!(!short_rendered.contains("#1"));
-        assert!(!docs_rendered.contains("GROWTH"));
-    }
-
-    #[test]
-    fn hotspot_rows_clip_tags_and_paths_without_moving_bars() {
-        let high = DisplayHotspotRow {
-            path: "src/very/long/storage/integration/module/file.rs".to_owned(),
-            score: 0.82,
-            tags: vec!["CHURN".to_owned(), "CORE".to_owned(), "SIZE".to_owned()],
-        };
-        let low = DisplayHotspotRow {
-            path: "src/main.rs".to_owned(),
-            score: 0.39,
-            tags: Vec::new(),
-        };
-        let high_rendered = line_text(&render_hotspot_display_row(
-            &high,
-            true,
-            54,
-            TuiOptions::default(),
-        ));
-        let low_rendered = line_text(&render_hotspot_display_row(
-            &low,
-            false,
-            54,
-            TuiOptions::default(),
-        ));
-        let active_bar = score_bar_parts(1.0, 1, TuiOptions::default()).0;
-        let active_bar = active_bar.chars().next().expect("bar glyph");
-
-        assert_eq!(
-            char_position(&high_rendered, active_bar),
-            char_position(&low_rendered, active_bar)
-        );
-        assert!(high_rendered.contains("…"));
-        assert!(!low_rendered.contains("CHURN"));
-        assert!(high_rendered.chars().count() <= 54);
-    }
-
-    #[test]
-    fn hotspot_tags_render_with_centered_separators_and_clip_in_place() {
-        let row = DisplayHotspotRow {
-            path: "src/lib.rs".to_owned(),
-            score: 0.8,
-            tags: vec![
-                "CHURN".to_owned(),
-                "SIZE".to_owned(),
-                "VOLATILITY".to_owned(),
-                "COUPLING".to_owned(),
-            ],
-        };
-
-        let wide = line_text(&render_hotspot_display_row(
-            &row,
-            true,
-            96,
-            TuiOptions::default(),
-        ));
-        let narrow = line_text(&render_hotspot_display_row(
-            &row,
-            true,
-            58,
-            TuiOptions::default(),
-        ));
-
-        assert_eq!(
-            hotspot_tag_text(&[
-                "CHURN".to_owned(),
-                "SIZE".to_owned(),
-                "VOLATILITY".to_owned()
-            ]),
-            format!("CHURN{HOTSPOT_TAG_SEPARATOR}SIZE{HOTSPOT_TAG_SEPARATOR}VOLATILITY")
-        );
-        assert!(wide.contains(&format!("CHURN{HOTSPOT_TAG_SEPARATOR}SIZE")));
-        assert!(!wide.contains("CHURN SIZE"));
-        assert!(!wide.contains("COUPLING ·"));
-        assert!(narrow.chars().count() <= 58);
-        assert!(!narrow.contains("COUPLING"));
-    }
-
-    #[test]
-    fn dense_hotspot_list_renders_without_empty_spacer_rows() {
-        let mut snapshot = test_snapshot();
-        let mut second = snapshot.report.hotspots[0].clone();
-        second.rank = 2;
-        second.path = "src/very/long/storage/integration/module/file.rs".to_owned();
-        second.score = 0.72;
-        second.raw_metrics.path = second.path.clone();
-        let mut third = snapshot.report.hotspots[0].clone();
-        third.rank = 3;
-        third.path = "docs/json-schema.md".to_owned();
-        third.score = 0.25;
-        third.raw_metrics.path = third.path.clone();
-        snapshot.report.hotspots = vec![snapshot.report.hotspots[0].clone(), second, third];
-        snapshot.report.summary.hotspot_count = 3;
-        snapshot.scan.files.push(file_record(
-            "src/very/long/storage/integration/module/file.rs",
-        ));
-        snapshot.scan.files.push(file_record("docs/json-schema.md"));
-
-        let state = TuiAppState::default();
-        let rows = display_rows(&snapshot, &state);
-        let backend = TestBackend::new(82, 12);
-        let mut terminal = Terminal::new(backend).expect("test terminal should initialize");
+    fn narrow_layout_renders_without_overlap_sensitive_panic() {
+        let snapshot = sample_snapshot();
+        let state = TuiState::new();
+        let backend = TestBackend::new(70, 28);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
 
         terminal
-            .draw(|frame| {
-                render_main_panel(
-                    frame,
-                    Rect::new(0, 0, 82, 12),
-                    &snapshot,
-                    &state,
-                    &rows,
-                    TuiOptions::default(),
-                )
-            })
-            .expect("render should succeed");
+            .draw(|frame| render(frame, &snapshot, &state))
+            .expect("narrow render should succeed");
+        let output = buffer_text(&terminal);
+        assert!(output.contains("src/risky.go"));
+        assert!(output.contains("File"));
+    }
 
-        let rendered = terminal
+    fn create_tui_db(path: &Path) {
+        let connection = Connection::open(path).expect("db should open");
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE project_risk_summary (
+                    formula_id TEXT PRIMARY KEY NOT NULL,
+                    active_scan_id INTEGER NOT NULL,
+                    score REAL NOT NULL,
+                    risk_10 REAL NOT NULL,
+                    risk_band TEXT NOT NULL,
+                    confidence TEXT NOT NULL,
+                    active_file_count INTEGER NOT NULL,
+                    active_go_file_count INTEGER NOT NULL,
+                    scored_file_count INTEGER NOT NULL,
+                    scoring_coverage REAL NOT NULL,
+                    go_score_coverage REAL,
+                    max_file_score REAL NOT NULL,
+                    top_10_mean_score REAL NOT NULL,
+                    high_risk_file_count INTEGER NOT NULL,
+                    medium_risk_file_count INTEGER NOT NULL,
+                    dominant_dimension TEXT,
+                    dominant_dimension_pressure REAL NOT NULL,
+                    git_index_status TEXT NOT NULL
+                );
+                CREATE TABLE file_risk_scores (
+                    relative_path TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    active_scan_id INTEGER NOT NULL,
+                    formula_id TEXT NOT NULL,
+                    rank INTEGER NOT NULL,
+                    score REAL NOT NULL,
+                    risk_10 REAL NOT NULL,
+                    risk_band TEXT NOT NULL,
+                    is_generated INTEGER NOT NULL,
+                    is_vendor INTEGER NOT NULL
+                );
+                CREATE TABLE file_facts (
+                    relative_path TEXT,
+                    line_count INTEGER,
+                    byte_size INTEGER,
+                    language_id TEXT,
+                    cognitive_complexity INTEGER,
+                    max_function_complexity INTEGER,
+                    source_coupling_in INTEGER,
+                    source_coupling_out INTEGER,
+                    co_changed_file_count INTEGER NOT NULL,
+                    total_churn_lines INTEGER NOT NULL,
+                    recent_churn_lines INTEGER NOT NULL,
+                    commits_per_file INTEGER NOT NULL,
+                    dominant_owner TEXT,
+                    dominant_owner_share REAL,
+                    owner_count INTEGER,
+                    author_count INTEGER NOT NULL
+                );
+                CREATE TABLE file_risk_terms (
+                    relative_path TEXT NOT NULL,
+                    formula_id TEXT NOT NULL,
+                    term_name TEXT NOT NULL,
+                    raw_value REAL,
+                    normalized_value REAL,
+                    weight REAL NOT NULL,
+                    contribution REAL NOT NULL
+                );
+                CREATE TABLE file_risk_facts (
+                    relative_path TEXT NOT NULL,
+                    formula_id TEXT NOT NULL,
+                    fact_index INTEGER NOT NULL,
+                    fact_kind TEXT NOT NULL,
+                    message TEXT NOT NULL
+                );
+                CREATE TABLE file_risk_limitations (
+                    relative_path TEXT NOT NULL,
+                    formula_id TEXT NOT NULL,
+                    limitation_index INTEGER NOT NULL,
+                    code TEXT NOT NULL,
+                    message TEXT NOT NULL
+                );
+                CREATE TABLE git_file_owners (
+                    path TEXT NOT NULL,
+                    owner_rank INTEGER NOT NULL,
+                    author TEXT NOT NULL,
+                    ownership_score REAL NOT NULL,
+                    ownership_share REAL NOT NULL,
+                    touch_count INTEGER NOT NULL
+                );
+
+                INSERT INTO project_risk_summary VALUES
+                    ('hotpath.project_risk.go.v1', 1, 0.72, 7.2, 'high', 'high', 2, 2, 2, 1.0, 1.0, 0.90, 0.55, 1, 1, 'churn', 0.8, 'available');
+                INSERT INTO file_risk_scores VALUES
+                    ('src/risky.go', 'C:/repo/src/risky.go', 1, 'hotpath.score.go.v1', 1, 0.9, 9.0, 'extreme', 1, 0),
+                    ('src/safe.go', 'C:/repo/src/safe.go', 1, 'hotpath.score.go.v1', 2, 0.2, 2.0, 'low', 0, 0);
+                INSERT INTO file_facts VALUES
+                    ('src/risky.go', 1200, 48000, 'go', 220, 45, 12, 8, 20, 2300, 1000, 3, 'Alice <a@example.invalid>', 0.9, 1, 1),
+                    ('src/safe.go', 10, 400, 'go', 1, 1, 0, 0, 0, 1, 0, 1, NULL, NULL, NULL, 1);
+                INSERT INTO file_risk_terms VALUES
+                    ('src/risky.go', 'hotpath.score.go.v1', 'churn', 2300, 1.0, 0.18, 0.18),
+                    ('src/risky.go', 'hotpath.score.go.v1', 'cognitive_complexity', 220, 1.0, 0.16, 0.16),
+                    ('src/safe.go', 'hotpath.score.go.v1', 'churn', 1, 0.0, 0.18, 0.0);
+                INSERT INTO file_risk_facts VALUES
+                    ('src/risky.go', 'hotpath.score.go.v1', 0, 'high_churn', 'High total churn');
+                INSERT INTO file_risk_limitations VALUES
+                    ('src/risky.go', 'hotpath.score.go.v1', 0, 'test_limit', 'fixture limitation');
+                INSERT INTO git_file_owners VALUES
+                    ('src/risky.go', 1, 'Alice <a@example.invalid>', 10.0, 0.9, 3);
+                ",
+            )
+            .expect("fixture schema should be created");
+    }
+
+    fn sample_snapshot() -> TuiDatabaseSnapshot {
+        let fixture = Fixture::new("sample");
+        create_tui_db(&fixture.db_path());
+        TuiDatabaseSnapshot::load_from_dir(&fixture.path)
+    }
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
             .backend()
             .buffer()
             .content()
             .iter()
             .map(|cell| cell.symbol())
-            .collect::<String>();
-        let header = buffer_line_text(&terminal, 4, 82);
-        let first = buffer_line_text(&terminal, 5, 82);
-        let second = buffer_line_text(&terminal, 6, 82);
-        let third = buffer_line_text(&terminal, 7, 82);
-
-        assert!(header.contains("Path"));
-        assert!(header.contains("Risk"));
-        assert!(header.contains("Top Factor"));
-        assert!(!rendered.contains("Coupling"));
-        assert!(first.contains("src/lib.rs"));
-        assert!(second.contains("file.rs"));
-        assert!(third.contains("docs/json-schema.md"));
-        assert!(!first.contains("#1"));
-        assert!(!second.contains("#2"));
-        assert!(!third.contains("#3"));
-        assert!(!first.trim().is_empty());
-        assert!(!second.trim().is_empty());
-        assert!(!third.trim().is_empty());
-    }
-
-    #[test]
-    fn generated_and_lockfile_hotspots_are_suppressed_by_default_policy() {
-        let scan = ScanReport::from_parts(
-            Vec::new(),
-            vec![file_record("src/lib.rs"), file_record("Cargo.lock")],
-        );
-        let mut report = report_with_hotspots(&scan);
-        let mut lockfile = report.hotspots[0].clone();
-        lockfile.rank = 2;
-        lockfile.path = "Cargo.lock".to_owned();
-        lockfile.raw_metrics.path = "Cargo.lock".to_owned();
-        report.hotspots.push(lockfile);
-        report.summary.hotspot_count = 2;
-
-        suppress_generated_hotspots(&scan.files, &mut report);
-
-        assert_eq!(
-            report
-                .hotspots
-                .iter()
-                .map(|hotspot| hotspot.path.as_str())
-                .collect::<Vec<_>>(),
-            vec!["src/lib.rs"]
-        );
-        assert_eq!(report.summary.hotspot_count, 1);
-    }
-
-    #[test]
-    fn ownership_bar_represents_operational_risk_not_health() {
-        let mut snapshot = test_snapshot();
-        snapshot.report.hotspots[0].raw_metrics.dominant_owner_share = Some(1.0);
-        snapshot.report.hotspots[0].normalized_metrics.ownership = Some(0.0);
-
-        let text = lines_text(&file_inspector_lines(
-            &snapshot,
-            "src/lib.rs",
-            80,
-            TuiOptions::default(),
-        ));
-
-        assert!(text.contains("FRAGILITY"));
-        assert!(text.contains("Ownership (single owner)"));
-        assert!(!text.contains("Ownership    SINGLE OWNER"));
-        assert!(!text.contains("Owner Risk"));
-        assert!(text.contains("LOW"));
-        let ownership_line = text
-            .lines()
-            .find(|line| line.starts_with("Ownership"))
-            .expect("ownership section title should render");
-        assert!(!ownership_line.contains("■"));
-    }
-
-    #[test]
-    fn inspector_includes_concise_risk_driver_section() {
-        let snapshot = test_snapshot();
-        let text = lines_text(&file_inspector_lines(
-            &snapshot,
-            "src/lib.rs",
-            80,
-            TuiOptions::default(),
-        ));
-
-        assert!(text.contains("Why This File Matters"));
-        assert!(text.contains("  - Changes significantly more often than typical files"));
-        assert!(!text.contains("Key Signals"));
-        assert!(!text.contains("Structure"));
-        assert!(!text.contains("  Formula"));
-        assert!(!text.contains("  Rank"));
-    }
-
-    #[test]
-    fn low_owner_risk_does_not_emit_strong_ownership_driver() {
-        let mut snapshot = test_snapshot();
-        snapshot.report.hotspots[0].raw_metrics.dominant_owner_share = Some(1.0);
-        snapshot.report.hotspots[0].normalized_metrics.ownership = Some(0.10);
-
-        let text = lines_text(&risk_driver_lines(
-            &snapshot,
-            &snapshot.report.hotspots[0],
-            TuiOptions::default(),
-        ));
-
-        assert!(!text.contains("Concentrated ownership / low maintainer redundancy"));
-    }
-
-    #[test]
-    fn high_owner_risk_emits_contextual_ownership_driver() {
-        let mut snapshot = test_snapshot();
-        snapshot.report.hotspots[0].raw_metrics.dominant_owner_share = Some(1.0);
-        snapshot.report.hotspots[0].normalized_metrics.ownership = Some(0.85);
-
-        let text = lines_text(&risk_driver_lines(
-            &snapshot,
-            &snapshot.report.hotspots[0],
-            TuiOptions::default(),
-        ));
-
-        assert!(text.contains("Concentrated ownership / low maintainer redundancy"));
-    }
-
-    #[test]
-    fn inspector_uses_operational_metric_labels() {
-        let snapshot = test_snapshot();
-        let text = lines_text(&file_inspector_lines(
-            &snapshot,
-            "src/lib.rs",
-            80,
-            TuiOptions::default(),
-        ));
-
-        assert!(text.contains("Ownership"));
-        assert!(text.contains("Ownership (shared)"));
-        assert!(text.contains("SIZE"));
-        assert!(!text.lines().any(|line| line.starts_with("Context")));
-        assert!(!text.contains("Key Signals"));
-        assert!(!text.contains("Structure"));
-        assert!(!text.contains("Lifetime Churn"));
-        assert!(!text.contains("90 days Churn"));
-        assert!(!text.contains("Bytes"));
-        assert!(!text.contains("90d Churn"));
-        assert!(!text.contains("Recent"));
-        assert!(!text.contains("Fan-in"));
-        assert!(!text.contains("Fan-out"));
-    }
-
-    #[test]
-    fn inspector_renders_ownership_distribution_in_descending_order() {
-        let mut snapshot = test_snapshot();
-        snapshot.ownership = TuiOwnershipSnapshot {
-            by_file: vec![TuiFileOwnership {
-                path: "src/lib.rs".to_owned(),
-                owners: vec![
-                    owner_share("alice <alice@example.invalid>", 91, 0.91),
-                    owner_share("bob <bob@example.invalid>", 7, 0.07),
-                    owner_share("carol <carol@example.invalid>", 2, 0.02),
-                ],
-            }],
-        };
-
-        let text = lines_text(&file_inspector_lines(
-            &snapshot,
-            "src/lib.rs",
-            80,
-            TuiOptions::default(),
-        ));
-
-        let alice = text.find("alice").expect("alice should render");
-        let bob = text.find("bob").expect("bob should render");
-        let carol = text.find("carol").expect("carol should render");
-        assert!(alice < bob && bob < carol);
-        assert!(text.contains("alice                     91%"));
-        assert!(text.contains("bob                        7%"));
-        assert!(text.contains("carol                      2%"));
-    }
-
-    #[test]
-    fn inspector_collapses_long_author_lists_into_others() {
-        let mut snapshot = test_snapshot();
-        snapshot.ownership = TuiOwnershipSnapshot {
-            by_file: vec![TuiFileOwnership {
-                path: "src/lib.rs".to_owned(),
-                owners: vec![
-                    owner_share("alice <alice@example.invalid>", 40, 0.40),
-                    owner_share("bob <bob@example.invalid>", 25, 0.25),
-                    owner_share("carol <carol@example.invalid>", 20, 0.20),
-                    owner_share("dana <dana@example.invalid>", 10, 0.10),
-                    owner_share("erin <erin@example.invalid>", 1, 0.01),
-                    owner_share("frank <frank@example.invalid>", 1, 0.01),
-                    owner_share("grace <grace@example.invalid>", 1, 0.01),
-                ],
-            }],
-        };
-
-        let text = lines_text(&file_inspector_lines(
-            &snapshot,
-            "src/lib.rs",
-            80,
-            TuiOptions::default(),
-        ));
-
-        assert!(text.contains("others                    13%"));
-        assert!(!text.contains("erin"));
-        assert!(!text.contains("frank"));
-        assert!(!text.contains("grace"));
-    }
-
-    #[test]
-    fn hotspot_tags_are_selective_by_risk_band() {
-        let mut snapshot = test_snapshot();
-        snapshot.report.hotspots = vec![
-            hotspot_fixture(1, "src/high.rs", 0.80, 0.90, 0.89, 0.88),
-            hotspot_fixture(2, "src/medium.rs", 0.55, 0.86, 0.80, 0.20),
-            hotspot_fixture(3, "src/low.rs", 0.30, 0.95, 0.95, 0.95),
-        ];
-
-        assert_eq!(
-            hotspot_driver_tags(&snapshot, &snapshot.report.hotspots[0]),
-            vec!["CHURN"]
-        );
-        assert!(hotspot_driver_tags(&snapshot, &snapshot.report.hotspots[1]).is_empty());
-        assert!(hotspot_driver_tags(&snapshot, &snapshot.report.hotspots[2]).is_empty());
-    }
-
-    #[test]
-    fn exceptional_hotspot_rows_show_only_one_tag() {
-        let mut snapshot = test_snapshot();
-        snapshot.report.hotspots = vec![hotspot_fixture(
-            1,
-            "src/critical.rs",
-            0.90,
-            0.95,
-            0.92,
-            0.91,
-        )];
-
-        assert_eq!(
-            hotspot_driver_tags(&snapshot, &snapshot.report.hotspots[0]),
-            vec!["CHURN"]
-        );
-    }
-
-    #[test]
-    fn inspector_headline_renders_coupling_and_complexity_severity() {
-        let mut snapshot = coupling_snapshot();
-        snapshot.report.hotspots[0].score = 0.77;
-        snapshot.report.hotspots[0].path = "src/lib.rs".to_owned();
-        snapshot.report.hotspots[0].raw_metrics.path = "src/lib.rs".to_owned();
-        snapshot.complexity.symbols = vec![ComplexitySymbolRecord {
-            path: "src/lib.rs".to_owned(),
-            name: "hard".to_owned(),
-            kind: "function".to_owned(),
-            start_line: 1,
-            end_line: 10,
-            length_lines: 10,
-            function_length_lines: Some(10),
-            nesting_depth: 0,
-            cyclomatic_complexity: Some(18),
-            max_control_flow_nesting: Some(2),
-            is_large_symbol: false,
-        }];
-
-        let text = lines_text(&file_inspector_lines(
-            &snapshot,
-            "src/lib.rs",
-            80,
-            TuiOptions::default(),
-        ));
-
-        assert!(text.contains("COUPLING"));
-        assert!(text.contains("COMPLEXITY"));
-        assert!(text.contains("MEDIUM"));
-        assert!(!text.contains("18.0 MEDIUM"));
-    }
-
-    #[test]
-    fn inspector_keeps_coupling_and_complexity_rows_when_parser_facts_are_missing() {
-        let mut snapshot = test_snapshot();
-        snapshot.report.hotspots[0]
-            .raw_metrics
-            .co_changed_file_count = Some(12);
-        snapshot.coupling.fan_by_file.clear();
-        snapshot.complexity.symbols.clear();
-
-        let text = lines_text(&file_inspector_lines(
-            &snapshot,
-            "src/lib.rs",
-            80,
-            TuiOptions::default(),
-        ));
-
-        assert!(text.contains("COUPLING"));
-        assert!(text.contains("COMPLEXITY"));
-        assert!(text.contains("unavailable"));
-    }
-
-    #[test]
-    fn coupling_pressure_uses_percentile_pressure_not_raw_count_linear_mapping() {
-        let mut snapshot = test_snapshot();
-        snapshot.coupling.fan_by_file = vec![
-            TuiFileFan {
-                path: "src/lib.rs".to_owned(),
-                fan_in: 31,
-                fan_out: 12,
-            },
-            TuiFileFan {
-                path: "src/main.rs".to_owned(),
-                fan_in: 1,
-                fan_out: 0,
-            },
-            TuiFileFan {
-                path: "src/leaf.rs".to_owned(),
-                fan_in: 0,
-                fan_out: 1,
-            },
-        ];
-        snapshot.report.hotspots[0]
-            .raw_metrics
-            .co_changed_file_count = Some(20);
-
-        let hub = coupling_pressure_for_path(&snapshot, "src/lib.rs")
-            .expect("hub should have coupling pressure");
-        let leaf = coupling_pressure_for_path(&snapshot, "src/leaf.rs")
-            .expect("leaf should have coupling pressure");
-
-        assert!(hub >= 0.70, "expected hub pressure to be high, got {hub}");
-        assert!(
-            leaf <= 0.25,
-            "expected leaf pressure to stay low, got {leaf}"
-        );
-    }
-
-    #[test]
-    fn narrow_width_inspector_keeps_headline_bars_aligned() {
-        let mut snapshot = test_snapshot();
-        if let Some(file) = snapshot
-            .scan
-            .files
-            .iter_mut()
-            .find(|file| file.path == "src/lib.rs")
-        {
-            file.byte_size = Some(200_000);
-        }
-        let text = lines_text(&file_inspector_lines(
-            &snapshot,
-            "src/lib.rs",
-            42,
-            TuiOptions::default(),
-        ));
-        let filled = score_bar_parts(1.0, 1, TuiOptions::default()).0;
-        let glyph = filled.chars().next().expect("bar glyph");
-        let columns = text
-            .lines()
-            .filter(|line| {
-                line.starts_with("RISK")
-                    || line.starts_with("FRAGILITY")
-                    || line.starts_with("SIZE")
-            })
-            .filter_map(|line| char_position(line, glyph))
-            .collect::<Vec<_>>();
-
-        assert!(columns.len() >= 3);
-        assert!(columns.windows(2).all(|pair| pair[0] == pair[1]));
-    }
-
-    #[test]
-    fn inspector_tags_use_unicode_middle_dot_separator() {
-        let mut snapshot = test_snapshot();
-        snapshot.report.hotspots = vec![hotspot_fixture(1, "src/lib.rs", 0.90, 0.95, 0.92, 0.91)];
-
-        let text = lines_text(&file_inspector_lines(
-            &snapshot,
-            "src/lib.rs",
-            80,
-            TuiOptions::default(),
-        ));
-
-        assert!(text.contains(&format!(
-            "CHURN{HOTSPOT_TAG_SEPARATOR}SIZE{HOTSPOT_TAG_SEPARATOR}VOLATILITY"
-        )));
-    }
-
-    #[test]
-    fn inspector_tags_show_top_three_by_severity() {
-        let mut snapshot = test_snapshot();
-        let mut hotspot = hotspot_fixture(1, "src/lib.rs", 0.90, 0.95, 0.95, 0.95);
-        hotspot.weighted_terms.push(weighted_term(
-            "coupling_score",
-            NormalizedMetric::Coupling,
-            0.95,
-            0.20,
-        ));
-        snapshot.report.hotspots = vec![hotspot];
-
-        assert_eq!(
-            inspector_driver_tags(&snapshot, &snapshot.report.hotspots[0]),
-            vec!["CHURN", "COUPLING", "SIZE"]
-        );
-    }
-
-    #[test]
-    fn context_pressure_normalization_preserves_relative_scale() {
-        assert!(normalized_context_tokens(32_000, 100_000) < 0.50);
-        assert!(normalized_context_tokens(282_000, 500_000) < 0.70);
-    }
-
-    #[test]
-    fn structure_size_uses_human_readable_units() {
-        assert_eq!(format_bytes(Some(1)), "1 byte");
-        assert_eq!(format_bytes(Some(166_687)), "162.8 KiB");
-        assert_eq!(format_bytes(Some(2_097_152)), "2.0 MiB");
-        assert_eq!(format_bytes(None), "unknown");
-    }
-
-    #[test]
-    fn inspector_context_and_size_header_labels_use_operational_bands() {
-        assert_eq!(line_size_band(999).label(), "SMALL");
-        assert_eq!(line_size_band(3_700).label(), "MEDIUM");
-        assert_eq!(line_size_band(4_000).label(), "LARGE");
-        assert_eq!(line_size_band(16_000).label(), "VERY LARGE");
-        assert_eq!(format_compact_count(32_200), "32.2k");
-    }
-
-    #[test]
-    fn context_and_size_header_bars_use_their_size_band_severity() {
-        let size = line_size_band(3_700);
-        assert_eq!(size.label(), "MEDIUM");
-        assert_eq!(size.bar_value(), 0.40);
-        assert_eq!(size.severity(), TuiSeverity::Medium);
-    }
-
-    #[test]
-    fn inspector_size_row_includes_context_tokens_when_available() {
-        let mut snapshot = test_snapshot();
-        if let Some(file) = snapshot
-            .scan
-            .files
-            .iter_mut()
-            .find(|file| file.path == "src/lib.rs")
-        {
-            file.line_count = Some(3_800);
-            file.byte_size = Some(129_600);
-        }
-
-        let text = lines_text(&file_inspector_lines(
-            &snapshot,
-            "src/lib.rs",
-            80,
-            TuiOptions::default(),
-        ));
-
-        assert!(text.contains("SIZE"));
-        assert!(text.contains("MEDIUM 3.8k lines · 32.4k tokens"));
-        assert!(!text.lines().any(|line| line.starts_with("Context")));
-    }
-
-    #[test]
-    fn reducer_q_exits_and_escape_at_root_preserves_existing_exit_behavior() {
-        let snapshot = test_snapshot();
-        let mut state = TuiAppState::default();
-
-        reduce_test_key(&mut state, &snapshot, KeyCode::Esc, None);
-
-        assert!(state.should_exit());
-
-        let mut state = TuiAppState::default();
-        reduce_test_key(&mut state, &snapshot, KeyCode::Char('q'), None);
-
-        assert!(state.should_exit());
-    }
-
-    #[test]
-    fn editor_resolution_prefers_visual_then_editor() {
-        let resolved = resolve_editor_from_env(|name| match name {
-            "VISUAL" => Some("code".to_owned()),
-            "EDITOR" => Some("vim".to_owned()),
-            _ => None,
-        });
-
-        assert_eq!(resolved, EditorResolution::Command("code".to_owned()));
-
-        let resolved = resolve_editor_from_env(|name| match name {
-            "EDITOR" => Some("vim".to_owned()),
-            _ => None,
-        });
-
-        assert_eq!(resolved, EditorResolution::Command("vim".to_owned()));
-    }
-
-    #[test]
-    fn reducer_editor_action_sets_status_when_editor_is_missing() {
-        let snapshot = test_snapshot();
-        let mut state = TuiAppState::default();
-
-        reduce_test_key(&mut state, &snapshot, KeyCode::Char('e'), None);
-
-        assert_eq!(
-            state.status(),
-            Some("Set VISUAL or EDITOR to open a row in an editor")
-        );
-        assert_eq!(state.last_action(), None);
-    }
-
-    #[test]
-    fn reducer_editor_action_records_resolved_command_without_spawning() {
-        let snapshot = test_snapshot();
-        let mut state = TuiAppState::default();
-
-        reduce_test_key(&mut state, &snapshot, KeyCode::Char('e'), Some("vim"));
-
-        assert_eq!(
-            state.last_action(),
-            Some(&TuiAction::OpenEditor {
-                command: "vim".to_owned(),
-                row_text: "#1 src/lib.rs score 0.640".to_owned(),
-            })
-        );
-    }
-
-    #[test]
-    fn reducer_explain_score_records_selected_row() {
-        let snapshot = test_snapshot();
-        let mut state = TuiAppState::default();
-
-        reduce_test_key(&mut state, &snapshot, KeyCode::Char('x'), None);
-
-        assert_eq!(
-            state.last_action(),
-            Some(&TuiAction::ExplainScore {
-                view: TuiView::Hotspots,
-                path: "src/lib.rs".to_owned(),
-            })
-        );
-        assert_eq!(state.current_view(), TuiView::ExplainScore);
-        assert_eq!(state.current_path(), Some("src/lib.rs"));
-    }
-
-    #[test]
-    fn hotspots_view_is_root_and_uses_ranked_hotspot_rows() {
-        let snapshot = test_snapshot();
-        let state = TuiAppState::default();
-
-        assert_eq!(state.current_view(), TuiView::Hotspots);
-        assert_eq!(
-            filtered_visible_rows(&snapshot, &state),
-            vec!["#1 src/lib.rs score 0.640"]
-        );
-    }
-
-    #[test]
-    fn file_detail_rows_include_scan_score_metrics_limitations_and_symbols() {
-        let snapshot = test_snapshot();
-        let rows = file_detail_rows(&snapshot, "src/lib.rs");
-
-        assert!(rows.contains(&"File: src/lib.rs".to_owned()));
-        assert!(rows.contains(&"Language: Rust".to_owned()));
-        assert!(rows.contains(&"Hotspot score: 0.640".to_owned()));
-        assert!(rows.contains(&"Metric: commits 7".to_owned()));
-        assert!(rows.contains(&"Metric: dominant ownership 57.0%".to_owned()));
-        assert!(rows.contains(&"Limitation: test.limit - fixture limitation".to_owned()));
-        assert!(rows.contains(&"Symbol: function run lines 1-1".to_owned()));
-    }
-
-    #[test]
-    fn file_detail_enter_on_git_row_opens_git_detail_without_self_history() {
-        let snapshot = test_snapshot();
-        let mut state = TuiAppState::default();
-
-        reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
-        while filtered_visible_rows(&snapshot, &state)[state.selected_index()]
-            != "Git detail: press Enter"
-        {
-            reduce_test_key(&mut state, &snapshot, KeyCode::Char('j'), None);
-        }
-        reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
-
-        assert_eq!(state.current_view(), TuiView::GitDetail);
-        assert_eq!(state.current_path(), Some("src/lib.rs"));
-        assert_eq!(
-            state.last_action(),
-            Some(&TuiAction::DrillDown {
-                from: TuiView::FileDetail,
-                to: TuiView::GitDetail,
-                path: "src/lib.rs".to_owned(),
-            })
-        );
-
-        reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
-        reduce_test_key(&mut state, &snapshot, KeyCode::Esc, None);
-        assert_eq!(state.current_view(), TuiView::FileDetail);
-    }
-
-    #[test]
-    fn git_detail_rows_use_existing_raw_score_metrics() {
-        let snapshot = test_snapshot();
-
-        assert_eq!(
-            git_detail_rows(&snapshot, "src/lib.rs"),
-            vec![
-                "File: src/lib.rs",
-                "Commits: 7",
-                "Total churn lines: 120",
-                "Contributors: 3",
-                "Owners: 3",
-                "Dominant ownership: 57.0%",
-                "Co-changed file count: 4",
-            ]
-        );
-    }
-
-    #[test]
-    fn explain_score_rows_include_formula_and_weighted_terms() {
-        let snapshot = test_snapshot();
-        let rows = explain_score_rows(&snapshot, "src/lib.rs");
-
-        assert!(rows.contains(&"Formula: hotpath.score.v3".to_owned()));
-        assert!(rows.contains(&"Formula version: 3.0".to_owned()));
-        assert!(rows
-            .contains(&"Term: churn_score weight 0.35 input 0.600 contribution 0.210".to_owned()));
-        assert!(rows.contains(&"Limitation: test.limit - fixture limitation".to_owned()));
-    }
-
-    #[test]
-    fn coupling_graph_file_rows_include_fan_edges_and_empty_states() {
-        let snapshot = coupling_snapshot();
-
-        assert_eq!(
-            coupling_graph_rows(&snapshot, Some("src/lib.rs")),
-            vec![
-                "File: src/lib.rs",
-                "Matched current file: true",
-                "Coupling: 1 dependencies, 0 dependents",
-                "Incoming edges:",
-                "Incoming: none",
-                "Outgoing edges:",
-                "Outgoing: src/lib.rs -> src/child.rs (mod)",
-            ]
-        );
-        assert_eq!(
-            coupling_graph_rows(&snapshot, Some("src/child.rs")),
-            vec![
-                "File: src/child.rs",
-                "Matched current file: true",
-                "Coupling: 0 dependencies, 1 dependents",
-                "Incoming edges:",
-                "Incoming: src/lib.rs -> src/child.rs (mod)",
-                "Outgoing edges:",
-                "Outgoing: none",
-            ]
-        );
-    }
-
-    #[test]
-    fn coupling_graph_overview_rows_use_deterministic_current_file_fan_rows() {
-        let snapshot = coupling_snapshot();
-
-        assert_eq!(
-            coupling_graph_rows(&snapshot, None),
-            vec![
-                "Coupling graph: 1 resolved dependency edges",
-                "Files by coupling:",
-                "File: src/child.rs dependencies 0 dependents 1",
-                "File: src/lib.rs dependencies 1 dependents 0",
-            ]
-        );
-    }
-
-    #[test]
-    fn coupling_graph_edge_rows_resolve_the_neighbor_endpoint_exactly() {
-        let snapshot = coupling_snapshot();
-
-        assert_eq!(
-            coupling_graph_path_from_row(
-                &snapshot,
-                Some("src/lib.rs"),
-                "Outgoing: src/lib.rs -> src/child.rs (mod)",
-            ),
-            Some("src/child.rs".to_owned())
-        );
-        assert_eq!(
-            coupling_graph_path_from_row(
-                &snapshot,
-                Some("src/child.rs"),
-                "Incoming: src/lib.rs -> src/child.rs (mod)",
-            ),
-            Some("src/lib.rs".to_owned())
-        );
-        assert_eq!(
-            coupling_graph_path_from_row(
-                &snapshot,
-                None,
-                "Outgoing: src/lib.rs -> src/child.rsx (mod)",
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn context_budgeting_rows_include_summary_budget_groups_skips_and_notes() {
-        let mut snapshot = test_snapshot();
-        snapshot.report.context.summary = ContextSummary {
-            total_files: 3,
-            included_files: 2,
-            skipped_files: 1,
-            estimated_tokens: 9,
-            included_bytes: 36,
-            filtered_generated_files: 0,
-            filtered_vendor_files: 0,
-        };
-        snapshot.report.context.groups = vec![crate::ContextGroupRow {
-            path: "src".to_owned(),
-            file_count: 2,
-            byte_size: 36,
-            estimated_tokens: 9,
-        }];
-        snapshot.report.context.skipped = vec![ContextSkippedRow {
-            path: "target/cache.bin".to_owned(),
-            reason: ContextSkippedReason::Binary,
-        }];
-        snapshot.report.context.budget = Some(ContextBudgetStatus {
-            budget_tokens: 8,
-            estimated_tokens: 9,
-            remaining_tokens: None,
-            over_budget_tokens: Some(1),
-        });
-
-        let rows = context_budgeting_rows(&snapshot);
-
-        assert!(rows.contains(&"Total estimated tokens: 9".to_owned()));
-        assert!(rows.contains(&"Included files: 2".to_owned()));
-        assert!(rows.contains(&"Skipped files: 1".to_owned()));
-        assert!(rows.contains(&"Included bytes: 36".to_owned()));
-        assert!(
-            rows.contains(&"Budget: over budget by 1 tokens (budget 8, estimated 9)".to_owned())
-        );
-        assert!(rows.contains(&"Group: src tokens 9 bytes 36 files 2".to_owned()));
-        assert!(rows.contains(&"Skipped: target/cache.bin (binary)".to_owned()));
-        assert!(rows.contains(
-            &"Approximation: estimated tokens = ceil(byte_size / 4) for UTF-8 text files"
-                .to_owned()
-        ));
-    }
-
-    #[test]
-    fn context_budgeting_rows_include_all_groups_and_skips() {
-        let mut snapshot = test_snapshot();
-        snapshot.report.context.groups = (0..6)
-            .map(|index| crate::ContextGroupRow {
-                path: format!("group{index}"),
-                file_count: 1,
-                byte_size: 4,
-                estimated_tokens: 1,
-            })
-            .collect();
-        snapshot.report.context.skipped = (0..6)
-            .map(|index| ContextSkippedRow {
-                path: format!("skip{index}.bin"),
-                reason: ContextSkippedReason::Binary,
-            })
-            .collect();
-
-        let rows = context_budgeting_rows(&snapshot);
-
-        assert!(rows.contains(&"Group: group5 tokens 1 bytes 4 files 1".to_owned()));
-        assert!(rows.contains(&"Skipped: skip5.bin (binary)".to_owned()));
-    }
-
-    #[test]
-    fn context_budgeting_rows_report_empty_groups_and_skips() {
-        let snapshot = test_snapshot();
-        let rows = context_budgeting_rows(&snapshot);
-
-        assert!(rows.contains(&"Budget: none configured".to_owned()));
-        assert!(rows.contains(&"Group: none".to_owned()));
-        assert!(rows.contains(&"Skipped: src/z.rs (unreadable)".to_owned()));
-    }
-
-    #[test]
-    fn reducer_routes_to_coupling_graph_and_context_budgeting() {
-        let snapshot = coupling_snapshot();
-        let mut state = TuiAppState::default();
-
-        reduce_test_key(&mut state, &snapshot, KeyCode::Char('g'), None);
-
-        assert_eq!(state.current_view(), TuiView::CouplingGraph);
-        assert_eq!(state.current_path(), Some("src/lib.rs"));
-        assert!(filtered_visible_rows(&snapshot, &state)
-            .contains(&"Outgoing: src/lib.rs -> src/child.rs (mod)".to_owned()));
-
-        reduce_test_key(&mut state, &snapshot, KeyCode::Char('c'), None);
-
-        assert_eq!(state.current_view(), TuiView::ContextBudgeting);
-        assert_eq!(state.current_path(), None);
-        assert!(filtered_visible_rows(&snapshot, &state)
-            .contains(&"Total estimated tokens: 0".to_owned()));
-    }
-
-    #[test]
-    fn all_milestone_views_have_selection_state_and_titles() {
-        let state = TuiAppState::default();
-        let milestone_views = [
-            TuiView::Hotspots,
-            TuiView::RepoTree,
-            TuiView::FileDetail,
-            TuiView::SymbolDetail,
-            TuiView::GitDetail,
-            TuiView::CouplingGraph,
-            TuiView::ContextBudgeting,
-            TuiView::ExplainScore,
-        ];
-
-        assert_eq!(
-            milestone_views.map(TuiView::title),
-            [
-                "Hotspots",
-                "Repo Tree",
-                "File Detail",
-                "Symbol Detail",
-                "Git Detail",
-                "Coupling Graph",
-                "Context Budgeting",
-                "Explain Score",
-            ]
-        );
-        assert!(milestone_views
-            .iter()
-            .all(|view| state.selections.contains_key(view)));
-    }
-
-    #[test]
-    fn repo_tree_rows_use_deterministic_directory_then_file_ordering() {
-        let scan = ScanReport::from_parts(
-            Vec::new(),
-            vec![
-                file_record("zeta.rs"),
-                file_record("src/z.rs"),
-                file_record("README.md"),
-                file_record("src/bin/main.rs"),
-                file_record("src/a.rs"),
-                file_record("docs/guide.md"),
-            ],
-        );
-        let parse = parse::scaffold_report_from_scan(&scan);
-        let complexity = complexity::report_from_parse(&parse);
-        let snapshot = TuiSnapshot::from_parts(empty_report(&scan), scan, parse, complexity);
-
-        let rows = repo_tree_rows(&snapshot)
-            .into_iter()
-            .map(|row| row.text)
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            rows,
-            vec![
-                "[dir] docs/",
-                "  [file] docs/guide.md",
-                "[dir] src/",
-                "  [dir] bin/",
-                "    [file] src/bin/main.rs",
-                "  [file] src/a.rs",
-                "  [file] src/z.rs",
-                "[file] README.md",
-                "[file] zeta.rs",
-            ]
-        );
-    }
-
-    #[test]
-    fn repo_tree_rows_handle_deep_paths_iteratively() {
-        let depth = 2_000;
-        let path = (0..depth)
-            .map(|index| format!("d{index}"))
-            .chain(std::iter::once("leaf.rs".to_owned()))
-            .collect::<Vec<_>>()
-            .join("/");
-        let scan = ScanReport::from_parts(Vec::new(), vec![file_record(&path)]);
-        let parse = parse::scaffold_report_from_scan(&scan);
-        let complexity = complexity::report_from_parse(&parse);
-        let snapshot = TuiSnapshot::from_parts(empty_report(&scan), scan, parse, complexity);
-
-        let rows = repo_tree_rows(&snapshot);
-
-        assert_eq!(rows.len(), depth + 1);
-        assert_eq!(
-            rows.last().map(|row| row.path.as_str()),
-            Some(path.as_str())
-        );
-        assert!(rows.last().is_some_and(|row| row
-            .text
-            .starts_with(&format!("{}[file]", "  ".repeat(depth)))));
-    }
-
-    #[test]
-    fn reducer_opens_repo_tree_and_drills_file_rows_to_file_detail() {
-        let snapshot = test_snapshot();
-        let mut state = TuiAppState::default();
-
-        reduce_test_key(&mut state, &snapshot, KeyCode::Char('t'), None);
-        select_visible_row(&mut state, &snapshot, "  [file] src/main.rs");
-        reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
-
-        assert_eq!(state.current_view(), TuiView::FileDetail);
-        assert_eq!(state.current_path(), Some("src/main.rs"));
-        assert_eq!(
-            state.last_action(),
-            Some(&TuiAction::DrillDown {
-                from: TuiView::RepoTree,
-                to: TuiView::FileDetail,
-                path: "src/main.rs".to_owned(),
-            })
-        );
-    }
-
-    #[test]
-    fn repo_tree_file_rows_include_relative_paths_to_avoid_ambiguous_basenames() {
-        let scan = ScanReport::from_parts(
-            Vec::new(),
-            vec![file_record("app/main.rs"), file_record("src/main.rs")],
-        );
-        let parse = parse::scaffold_report_from_scan(&scan);
-        let complexity = complexity::report_from_parse(&parse);
-        let snapshot = TuiSnapshot::from_parts(empty_report(&scan), scan, parse, complexity);
-
-        let rows = repo_tree_rows(&snapshot)
-            .into_iter()
-            .map(|row| row.text)
-            .collect::<Vec<_>>();
-
-        assert!(rows.contains(&"  [file] app/main.rs".to_owned()));
-        assert!(rows.contains(&"  [file] src/main.rs".to_owned()));
-        assert_eq!(
-            repo_tree_path_from_row(&snapshot, "  [file] src/main.rs"),
-            Some("src/main.rs".to_owned())
-        );
-    }
-
-    #[test]
-    fn symbol_detail_rows_include_parser_and_complexity_facts() {
-        let snapshot = symbol_detail_snapshot();
-        let key = SymbolKey::from_parse(&snapshot.symbols.symbols[0]);
-        let rows = symbol_detail_rows(&snapshot, &key);
-
-        assert!(rows.contains(&"Symbol: function render".to_owned()));
-        assert!(rows.contains(&"Kind: function".to_owned()));
-        assert!(rows.contains(&"Range: lines 10-92".to_owned()));
-        assert!(rows.contains(&"Parent: impl Widget".to_owned()));
-        assert!(rows.contains(&"Nesting depth: 1".to_owned()));
-        assert!(rows.contains(&"Length lines: 83".to_owned()));
-        assert!(rows.contains(&"Function length lines: 83".to_owned()));
-        assert!(rows.contains(&"Cyclomatic complexity: 8".to_owned()));
-        assert!(rows.contains(&"Max control flow nesting: 3".to_owned()));
-        assert!(rows.contains(&"Large symbol: true".to_owned()));
-    }
-
-    #[test]
-    fn file_detail_symbol_row_drills_to_symbol_detail_and_back() {
-        let snapshot = symbol_detail_snapshot();
-        let mut state = TuiAppState::default();
-
-        reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
-        select_visible_row(&mut state, &snapshot, "Symbol: function render lines 10-92");
-        reduce_test_key(&mut state, &snapshot, KeyCode::Enter, None);
-
-        assert_eq!(state.current_view(), TuiView::SymbolDetail);
-        assert_eq!(state.current_path(), Some("src/lib.rs"));
-        assert_eq!(
-            state.last_action(),
-            Some(&TuiAction::DrillDown {
-                from: TuiView::FileDetail,
-                to: TuiView::SymbolDetail,
-                path: "src/lib.rs".to_owned(),
-            })
-        );
-        assert!(filtered_visible_rows(&snapshot, &state).contains(&"Large symbol: true".to_owned()));
-
-        reduce_test_key(&mut state, &snapshot, KeyCode::Esc, None);
-        assert_eq!(state.current_view(), TuiView::FileDetail);
-        assert_eq!(state.current_path(), Some("src/lib.rs"));
-    }
-
-    #[test]
-    fn snapshot_constructor_sorts_repository_relative_data() {
-        let scan = ScanReport::from_parts(
-            Vec::new(),
-            vec![file_record("src/z.rs"), file_record("src/a.rs")],
-        );
-        let parse = ParseReport {
-            warnings: Vec::new(),
-            files: vec![parse_file("src/z.rs"), parse_file("src/a.rs")],
-            symbols: vec![symbol("src/z.rs", "zed", 5), symbol("src/a.rs", "alpha", 1)],
-            imports: vec![
-                import("src/z.rs", "crate::a::alpha", "use"),
-                import("src/a.rs", "z", "mod"),
-            ],
-        };
-        let complexity = complexity::report_from_parse(&parse);
-
-        let snapshot = TuiSnapshot::from_parts(empty_report(&scan), scan, parse, complexity);
-
-        assert_eq!(
-            snapshot
-                .scan
-                .files
-                .iter()
-                .map(|file| file.path.as_str())
-                .collect::<Vec<_>>(),
-            vec!["src/a.rs", "src/z.rs"]
-        );
-        assert_eq!(
-            snapshot
-                .symbols
-                .symbols
-                .iter()
-                .map(|symbol| symbol.path.as_str())
-                .collect::<Vec<_>>(),
-            vec!["src/a.rs", "src/z.rs"]
-        );
-        assert_eq!(
-            snapshot
-                .symbols
-                .imports
-                .iter()
-                .map(|import| import.path.as_str())
-                .collect::<Vec<_>>(),
-            vec!["src/a.rs", "src/z.rs"]
-        );
-        assert_eq!(
-            snapshot
-                .coupling
-                .fan_by_file
-                .iter()
-                .map(|fan| fan.path.as_str())
-                .collect::<Vec<_>>(),
-            vec!["src/a.rs", "src/z.rs"]
-        );
-    }
-
-    #[test]
-    fn snapshot_constructor_preserves_basic_shape() {
-        let scan = ScanReport::from_parts(Vec::new(), vec![file_record("src/lib.rs")]);
-        let parse = ParseReport {
-            warnings: Vec::new(),
-            files: vec![parse_file("src/lib.rs")],
-            symbols: vec![symbol("src/lib.rs", "run", 1)],
-            imports: Vec::new(),
-        };
-        let complexity = complexity::report_from_parse(&parse);
-
-        let snapshot = TuiSnapshot::from_parts(empty_report(&scan), scan, parse, complexity);
-
-        assert_eq!(snapshot.scan.summary.total_files, 1);
-        assert_eq!(snapshot.symbols.summary.symbol_count, 1);
-        assert_eq!(snapshot.complexity.summary.total_files, 1);
-        assert!(snapshot.coupling.edges.is_empty());
-        assert_eq!(snapshot.report.summary.scan.total_files, 1);
-    }
-
-    fn reduce_test_key(
-        state: &mut TuiAppState,
-        snapshot: &TuiSnapshot,
-        code: KeyCode,
-        editor: Option<&str>,
-    ) {
-        reduce_key_with_editor(state, snapshot, KeyEvent::from(code), |name| match name {
-            "VISUAL" => editor.map(Into::into),
-            _ => None,
-        });
-    }
-
-    fn line_text(line: &Line<'_>) -> String {
-        line.spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect()
-    }
-
-    fn lines_text(lines: &[Line<'_>]) -> String {
-        lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
-    }
-
-    fn buffer_line_text(terminal: &Terminal<TestBackend>, y: usize, width: usize) -> String {
-        let content = terminal.backend().buffer().content();
-        content[y * width..(y + 1) * width]
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect()
-    }
-
-    fn select_visible_row(state: &mut TuiAppState, snapshot: &TuiSnapshot, row_text: &str) {
-        let rows = filtered_visible_rows(snapshot, state);
-        state.selection_for_current_view_mut().selected = rows
-            .iter()
-            .position(|row| row == row_text)
-            .unwrap_or_else(|| panic!("expected visible row {row_text:?}, got {rows:?}"));
-    }
-
-    fn test_snapshot() -> TuiSnapshot {
-        let scan = ScanReport::from_parts(
-            Vec::new(),
-            vec![file_record("src/lib.rs"), file_record("src/main.rs")],
-        );
-        let parse = ParseReport {
-            warnings: Vec::new(),
-            files: vec![parse_file("src/lib.rs"), parse_file("src/main.rs")],
-            symbols: vec![symbol("src/lib.rs", "run", 1)],
-            imports: Vec::new(),
-        };
-        let complexity = complexity::report_from_parse(&parse);
-        let report = report_with_hotspots(&scan);
-
-        TuiSnapshot::from_parts(report, scan, parse, complexity)
-    }
-
-    fn symbol_detail_snapshot() -> TuiSnapshot {
-        let scan = ScanReport::from_parts(
-            Vec::new(),
-            vec![file_record("src/lib.rs"), file_record("src/main.rs")],
-        );
-        let parse = ParseReport {
-            warnings: Vec::new(),
-            files: vec![parse_file("src/lib.rs"), parse_file("src/main.rs")],
-            symbols: vec![detailed_symbol()],
-            imports: Vec::new(),
-        };
-        let complexity = complexity::report_from_parse(&parse);
-        let report = report_with_hotspots(&scan);
-
-        TuiSnapshot::from_parts(report, scan, parse, complexity)
-    }
-
-    fn coupling_snapshot() -> TuiSnapshot {
-        let scan = ScanReport::from_parts(
-            Vec::new(),
-            vec![file_record("src/child.rs"), file_record("src/lib.rs")],
-        );
-        let parse = ParseReport {
-            warnings: Vec::new(),
-            files: vec![parse_file("src/child.rs"), parse_file("src/lib.rs")],
-            symbols: Vec::new(),
-            imports: vec![import("src/lib.rs", "child", "mod")],
-        };
-        let complexity = complexity::report_from_parse(&parse);
-        let report = report_with_hotspots(&scan);
-
-        TuiSnapshot::from_parts(report, scan, parse, complexity)
-    }
-
-    fn report_with_hotspots(scan: &ScanReport) -> Report {
-        let mut report = empty_report(scan);
-        report.summary.hotspot_count = 1;
-        report.summary.git.file_metric_count = 1;
-        report.summary.git.co_change_count = 3;
-        report.hotspots = vec![ReportHotspot {
-            rank: 1,
-            path: "src/lib.rs".to_owned(),
-            score: 0.64,
-            formula_version: FormulaVersion::current(),
-            raw_metrics: RawScoreMetrics {
-                path: "src/lib.rs".to_owned(),
-                byte_size: Some(10),
-                line_count: Some(1),
-                commits_per_file: Some(7),
-                total_churn_lines: Some(120),
-                recent_churn_lines: Some(30),
-                author_count: Some(3),
-                owner_count: Some(3),
-                dominant_owner_share: Some(0.57),
-                co_changed_file_count: Some(4),
-                file_age_days: Some(365),
-                repository_age_days: Some(730),
-                repository_author_count: Some(10),
-                repository_file_count: Some(200),
-            },
-            normalized_metrics: NormalizedScoreMetrics {
-                size: Some(0.1),
-                churn: Some(0.6),
-                recent_churn: Some(0.3),
-                ownership: Some(0.5),
-                coupling: Some(0.4),
-            },
-            weighted_terms: vec![
-                WeightedTerm {
-                    name: "churn_score".to_owned(),
-                    metric: NormalizedMetric::Churn,
-                    formula_version: FormulaVersion::current(),
-                    weight: 0.35,
-                    normalized_input: Some(0.6),
-                    weighted_contribution: 0.21,
-                },
-                WeightedTerm {
-                    name: "size_score".to_owned(),
-                    metric: NormalizedMetric::Size,
-                    formula_version: FormulaVersion::current(),
-                    weight: 0.20,
-                    normalized_input: Some(0.1),
-                    weighted_contribution: 0.02,
-                },
-            ],
-            limitations: vec![ScoreLimitation {
-                code: "test.limit".to_owned(),
-                message: "fixture limitation".to_owned(),
-            }],
-        }];
-        report
-    }
-
-    fn hotspot_fixture(
-        rank: u64,
-        path: &str,
-        score: f64,
-        churn: f64,
-        size: f64,
-        recent_churn: f64,
-    ) -> ReportHotspot {
-        ReportHotspot {
-            rank,
-            path: path.to_owned(),
-            score,
-            formula_version: FormulaVersion::current(),
-            raw_metrics: RawScoreMetrics {
-                path: path.to_owned(),
-                byte_size: Some((size * 400_000.0) as u64),
-                line_count: Some(100),
-                commits_per_file: Some(10),
-                total_churn_lines: Some((churn * 2_000.0) as u64),
-                recent_churn_lines: Some((recent_churn * 100.0) as u64),
-                author_count: Some(2),
-                owner_count: Some(2),
-                dominant_owner_share: Some(0.5),
-                co_changed_file_count: Some(1),
-                file_age_days: Some(365),
-                repository_age_days: Some(730),
-                repository_author_count: Some(10),
-                repository_file_count: Some(200),
-            },
-            normalized_metrics: NormalizedScoreMetrics {
-                size: Some(size),
-                churn: Some(churn),
-                recent_churn: Some(recent_churn),
-                ownership: Some(0.2),
-                coupling: Some(0.1),
-            },
-            weighted_terms: vec![
-                weighted_term("churn_score", NormalizedMetric::Churn, churn, 0.35),
-                weighted_term("size_score", NormalizedMetric::Size, size, 0.20),
-                weighted_term(
-                    "recent_growth",
-                    NormalizedMetric::RecentChurn,
-                    recent_churn,
-                    0.15,
-                ),
-            ],
-            limitations: Vec::new(),
-        }
-    }
-
-    fn weighted_term(
-        name: &str,
-        metric: NormalizedMetric,
-        normalized_input: f64,
-        weight: f64,
-    ) -> WeightedTerm {
-        WeightedTerm {
-            name: name.to_owned(),
-            metric,
-            formula_version: FormulaVersion::current(),
-            weight,
-            normalized_input: Some(normalized_input),
-            weighted_contribution: normalized_input * weight,
-        }
-    }
-
-    fn owner_share(author: &str, touch_count: u64, share: f64) -> TuiOwnerShare {
-        TuiOwnerShare {
-            author: author.to_owned(),
-            touch_count,
-            share,
-        }
-    }
-
-    fn empty_report(scan: &ScanReport) -> Report {
-        Report {
-            schema_version: REPORT_SCHEMA_VERSION,
-            summary: ReportSummary {
-                scan: scan.summary(),
-                git: ReportGitSummary {
-                    head_commit_id: "HEAD".to_owned(),
-                    recent_window_days: 90,
-                    file_metric_count: 0,
-                    co_change_count: 0,
-                },
-                hotspot_count: 0,
-                context_estimated_tokens: 0,
-            },
-            hotspots: Vec::new(),
-            context: ReportContext {
-                options: ContextOptions::default(),
-                summary: ContextSummary {
-                    total_files: scan.files.len() as u64,
-                    included_files: 0,
-                    skipped_files: 0,
-                    estimated_tokens: 0,
-                    included_bytes: 0,
-                    filtered_generated_files: 0,
-                    filtered_vendor_files: 0,
-                },
-                groups: Vec::new(),
-                skipped: vec![ContextSkippedRow {
-                    path: "src/z.rs".to_owned(),
-                    reason: ContextSkippedReason::Unreadable,
-                }],
-                budget: None,
-            },
-            findings: vec![ReportFinding {
-                code: "hotpath.test",
-                level: ReportFindingLevel::Info,
-                path: Some("src/z.rs".to_owned()),
-                message: "test".to_owned(),
-                rank: None,
-                score: None,
-            }],
-        }
-    }
-
-    fn file_record(path: &str) -> FileRecord {
-        FileRecord {
-            path: path.to_owned(),
-            byte_size: Some(10),
-            extension: Some("rs".to_owned()),
-            language: Some("Rust"),
-            line_count: Some(1),
-            is_vendor: false,
-            is_generated: false,
-            content: ContentKind::Text,
-            is_symlink: false,
-            classification: "source",
-            warnings: Vec::new(),
-        }
-    }
-
-    fn parse_file(path: &str) -> ParseFileRecord {
-        ParseFileRecord {
-            path: path.to_owned(),
-            language: Some("Rust"),
-            content: ContentKind::Text,
-            status: ParseFileStatus::Parsed,
-            reason: Some(ParseFileReason::ParserExtractionPending),
-            symbol_count: 1,
-            import_count: 0,
-        }
-    }
-
-    fn symbol(path: &str, name: &str, start_line: u64) -> ParseSymbolRecord {
-        ParseSymbolRecord {
-            path: path.to_owned(),
-            name: name.to_owned(),
-            kind: "function".to_owned(),
-            start_line,
-            end_line: start_line,
-            signature: None,
-            nesting_depth: 0,
-            parent: None,
-            cyclomatic_complexity: Some(1),
-            max_control_flow_nesting: Some(0),
-        }
-    }
-
-    fn detailed_symbol() -> ParseSymbolRecord {
-        ParseSymbolRecord {
-            path: "src/lib.rs".to_owned(),
-            name: "render".to_owned(),
-            kind: "function".to_owned(),
-            start_line: 10,
-            end_line: 92,
-            signature: Some("fn render_lines()".to_owned()),
-            nesting_depth: 1,
-            parent: Some("impl Widget".to_owned()),
-            cyclomatic_complexity: Some(8),
-            max_control_flow_nesting: Some(3),
-        }
-    }
-
-    fn char_position(value: &str, needle: char) -> Option<usize> {
-        value.chars().position(|candidate| candidate == needle)
+            .collect::<String>()
     }
 }
