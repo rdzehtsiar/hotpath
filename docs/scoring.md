@@ -9,9 +9,95 @@ Hotpath is early software. This page documents the currently implemented public
 formula so output can be explained and compared. It is not a compatibility
 promise for future versions.
 
-## Current Formula Version
+## Current Persisted Go Formula
 
-The implemented hotspot formula is:
+The redesigned scan pipeline currently persists Go file risk scores with:
+
+```text
+id: hotpath.score.go.v1
+major: 1
+minor: 0
+```
+
+This formula scores active parsed Go files from the materialized `file_facts`
+table. Generated and vendor files are scored, but their flags are preserved so
+later reports can filter or group them.
+
+The formula is:
+
+```text
+score =
+  0.18 * churn
++ 0.14 * recent_churn
++ 0.12 * size
++ 0.14 * ownership_risk
++ 0.10 * cochange_coupling
++ 0.16 * source_coupling
++ 0.16 * cognitive_complexity
+```
+
+Additional normalized inputs are:
+
+```text
+source_coupling =
+  max(
+    min(source_coupling_in / 25, 1.0),
+    min(source_coupling_out / 15, 1.0)
+  )
+
+cognitive_complexity =
+  max(
+    min(max_function_complexity / 30, 1.0),
+    min(cognitive_complexity / 150, 1.0)
+  )
+```
+
+Persisted rows include the score, public `/10` risk value, rank, weighted terms,
+limitations, and concise explanation facts.
+
+## Current Persisted Project Formula
+
+The redesigned scan pipeline also persists a Go-aware project-level risk summary
+with:
+
+```text
+id: hotpath.project_risk.go.v1
+major: 1
+minor: 0
+```
+
+The project formula aggregates persisted Go file risk rows. It tracks language
+coverage and confidence separately, so missing non-Go scoring lowers confidence
+instead of directly increasing risk.
+
+```text
+project_risk =
+  0.35 * max_file_score
++ 0.25 * top_10_mean_score
++ 0.20 * high_risk_share_pressure
++ 0.10 * medium_risk_share_pressure
++ 0.10 * dominant_dimension_pressure
+```
+
+The aggregate terms are:
+
+```text
+max_file_score = max(file_risk_scores.score)
+top_10_mean_score = average(score of top min(10, scored files))
+high_risk_share_pressure =
+  min((count(score >= 0.70) / scored_file_count) / 0.10, 1.0)
+medium_risk_share_pressure =
+  min((count(score >= 0.40) / scored_file_count) / 0.30, 1.0)
+dominant_dimension_pressure =
+  max(mean normalized_value by file-risk term among top 10 files)
+```
+
+If no Go files have scores, the project summary is persisted as unavailable
+with score `0.0`, confidence `none`, and limitation `no_scored_files`.
+
+## Legacy Hotspot Formula Version
+
+The older documented hotspot formula is:
 
 ```text
 id: hotpath.score.v3
@@ -19,9 +105,9 @@ major: 3
 minor: 0
 ```
 
-Formula identifiers are part of score explanations and persisted hotspot score
-records. Meaningful changes to score semantics should use a new formula
-identifier or version.
+Formula identifiers are part of score explanations and persisted score records.
+Meaningful changes to score semantics should use a new formula identifier or
+version.
 
 The final score is the sum of fixed weighted contributions:
 

@@ -164,8 +164,18 @@ limitations.
 
 ## Hotspot Scores
 
-Hotspot scores currently combine scanner facts with local Git metrics using the
-documented `hotpath.score.v3` formula:
+The redesigned scan pipeline currently persists Go-only file risk scores using
+`hotpath.score.go.v1`. That formula combines scanner facts, local Git metrics,
+source coupling, and Go cognitive complexity from `file_facts`.
+
+It also persists a Go-aware project risk summary using
+`hotpath.project_risk.go.v1`. Project risk combines the highest file risk,
+top-file average risk, the share of high/medium risk files, and the strongest
+dominant risk dimension among top files. Language coverage is stored as
+confidence metadata and does not directly increase the project risk score.
+
+The legacy hotspot formula combined scanner facts with local Git metrics using
+the documented `hotpath.score.v3` formula:
 
 ```text
 score =
@@ -176,9 +186,10 @@ score =
 + 0.10 * coupling
 ```
 
-The current hotspot formula does not consume parser-derived complexity metrics,
-symbol metrics, or resolved dependency edges yet. Its `coupling` term is based
-on Git co-change breadth, not parser dependency fan-in or fan-out.
+The legacy `hotpath.score.v3` formula does not consume parser-derived
+complexity metrics, symbol metrics, or resolved dependency edges. Its
+`coupling` term is based on Git co-change breadth, not parser dependency fan-in
+or fan-out.
 
 See [Scoring](scoring.md) for normalization, ranking, limitation codes, and
 formula details.

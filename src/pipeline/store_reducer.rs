@@ -16,9 +16,16 @@ use crate::pipeline::events::PipelineEvent;
 use crate::pipeline::file_analyzer::{
     ContentKind, FileAnalysisResult, FileDiagnostic, FileParserStatus,
 };
+use crate::pipeline::file_risk_assessor::{
+    FileRiskAssessment, FileRiskAssessor, FileRiskInput, RepositoryRiskContext, FORMULA_ID,
+};
 use crate::pipeline::git_history_analyzer::{
     GitChunkSummary, GitCochangeDelta, GitFileAuthorDelta, GitFileMetricDelta, GitHistoryError,
     GitHistorySink, GitRepositoryDelta,
+};
+use crate::pipeline::repo_risk_assessor::{
+    ProjectFileRiskInput, ProjectFileRiskTermInput, RepoRiskAssessment, RepoRiskAssessor,
+    RepoRiskInput,
 };
 
 pub const DEFAULT_STORE_BATCH_SIZE: usize = 1_000;
@@ -908,6 +915,119 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
                 ON file_facts(recent_churn_lines);
             CREATE INDEX IF NOT EXISTS idx_file_facts_cochanged
                 ON file_facts(co_changed_file_count);
+
+            CREATE TABLE IF NOT EXISTS file_risk_scores (
+                relative_path TEXT NOT NULL,
+                path TEXT NOT NULL,
+                active_scan_id INTEGER NOT NULL,
+                formula_id TEXT NOT NULL,
+                rank INTEGER NOT NULL,
+                score REAL NOT NULL,
+                risk_10 REAL NOT NULL,
+                risk_band TEXT NOT NULL,
+                is_generated INTEGER NOT NULL,
+                is_vendor INTEGER NOT NULL,
+                PRIMARY KEY (relative_path, formula_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_file_risk_scores_rank
+                ON file_risk_scores(formula_id, rank);
+            CREATE INDEX IF NOT EXISTS idx_file_risk_scores_score
+                ON file_risk_scores(formula_id, score);
+            CREATE INDEX IF NOT EXISTS idx_file_risk_scores_generated_vendor
+                ON file_risk_scores(is_generated, is_vendor);
+            CREATE INDEX IF NOT EXISTS idx_file_risk_scores_relative_path
+                ON file_risk_scores(relative_path);
+
+            CREATE TABLE IF NOT EXISTS file_risk_terms (
+                relative_path TEXT NOT NULL,
+                formula_id TEXT NOT NULL,
+                term_name TEXT NOT NULL,
+                raw_value REAL,
+                normalized_value REAL,
+                weight REAL NOT NULL,
+                contribution REAL NOT NULL,
+                PRIMARY KEY (relative_path, formula_id, term_name)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_file_risk_terms_relative_path
+                ON file_risk_terms(relative_path);
+
+            CREATE TABLE IF NOT EXISTS file_risk_limitations (
+                relative_path TEXT NOT NULL,
+                formula_id TEXT NOT NULL,
+                limitation_index INTEGER NOT NULL,
+                code TEXT NOT NULL,
+                message TEXT NOT NULL,
+                PRIMARY KEY (relative_path, formula_id, limitation_index)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_file_risk_limitations_relative_path
+                ON file_risk_limitations(relative_path);
+
+            CREATE TABLE IF NOT EXISTS file_risk_facts (
+                relative_path TEXT NOT NULL,
+                formula_id TEXT NOT NULL,
+                fact_index INTEGER NOT NULL,
+                fact_kind TEXT NOT NULL,
+                message TEXT NOT NULL,
+                PRIMARY KEY (relative_path, formula_id, fact_index)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_file_risk_facts_relative_path
+                ON file_risk_facts(relative_path);
+
+            CREATE TABLE IF NOT EXISTS project_risk_summary (
+                formula_id TEXT PRIMARY KEY NOT NULL,
+                active_scan_id INTEGER NOT NULL,
+                score REAL NOT NULL,
+                risk_10 REAL NOT NULL,
+                risk_band TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                active_file_count INTEGER NOT NULL,
+                active_go_file_count INTEGER NOT NULL,
+                scored_file_count INTEGER NOT NULL,
+                scoring_coverage REAL NOT NULL,
+                go_score_coverage REAL,
+                max_file_score REAL NOT NULL,
+                top_10_mean_score REAL NOT NULL,
+                high_risk_file_count INTEGER NOT NULL,
+                medium_risk_file_count INTEGER NOT NULL,
+                dominant_dimension TEXT,
+                dominant_dimension_pressure REAL NOT NULL,
+                git_index_status TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_project_risk_summary_score
+                ON project_risk_summary(score);
+            CREATE INDEX IF NOT EXISTS idx_project_risk_summary_band
+                ON project_risk_summary(risk_band);
+
+            CREATE TABLE IF NOT EXISTS project_risk_terms (
+                formula_id TEXT NOT NULL,
+                term_name TEXT NOT NULL,
+                raw_value REAL NOT NULL,
+                normalized_value REAL NOT NULL,
+                weight REAL NOT NULL,
+                contribution REAL NOT NULL,
+                PRIMARY KEY (formula_id, term_name)
+            );
+
+            CREATE TABLE IF NOT EXISTS project_risk_facts (
+                formula_id TEXT NOT NULL,
+                fact_index INTEGER NOT NULL,
+                fact_kind TEXT NOT NULL,
+                message TEXT NOT NULL,
+                PRIMARY KEY (formula_id, fact_index)
+            );
+
+            CREATE TABLE IF NOT EXISTS project_risk_limitations (
+                formula_id TEXT NOT NULL,
+                limitation_index INTEGER NOT NULL,
+                code TEXT NOT NULL,
+                message TEXT NOT NULL,
+                PRIMARY KEY (formula_id, limitation_index)
+            );
             ",
         )
         .map_err(StoreReducerError::WriteDatabase)?;
@@ -1734,6 +1854,8 @@ fn finalize_git_tables(
     finalize_git_broad_commit_metadata(&transaction)?;
     finalize_source_dependencies(root, &transaction)?;
     materialize_file_facts(&transaction)?;
+    materialize_file_risk_scores(&transaction)?;
+    materialize_project_risk_summary(&transaction)?;
     transaction
         .commit()
         .map_err(StoreReducerError::WriteDatabase)?;
@@ -2152,6 +2274,602 @@ fn materialize_file_facts(
             ",
         )
         .map_err(StoreReducerError::WriteDatabase)
+}
+
+#[derive(Debug)]
+struct FileRiskRow {
+    path: String,
+    relative_path: String,
+    active_scan_id: i64,
+    is_generated: bool,
+    is_vendor: bool,
+    input: FileRiskInput,
+    assessment: FileRiskAssessment,
+}
+
+fn materialize_file_risk_scores(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), StoreReducerError> {
+    let repository = repository_risk_context(transaction)?;
+    let assessor = FileRiskAssessor::new();
+    let mut statement = transaction
+        .prepare(
+            "
+            SELECT
+                path,
+                relative_path,
+                active_scan_id,
+                byte_size,
+                line_count,
+                is_generated,
+                is_vendor,
+                total_churn_lines,
+                recent_churn_lines,
+                owner_count,
+                dominant_owner_share,
+                co_changed_file_count,
+                file_age_days,
+                source_coupling_in,
+                source_coupling_out,
+                cognitive_complexity,
+                max_function_complexity
+            FROM file_facts
+            WHERE language_id = 'go'
+                AND relative_path IS NOT NULL
+            ORDER BY relative_path
+            ",
+        )
+        .map_err(StoreReducerError::WriteDatabase)?;
+    let rows = statement
+        .query_map([], |row| {
+            let relative_path = row.get::<_, String>(1)?;
+            let input = FileRiskInput {
+                relative_path: relative_path.clone(),
+                line_count: optional_i64_to_u64(row.get::<_, Option<i64>>(4)?),
+                byte_size: optional_i64_to_u64(row.get::<_, Option<i64>>(3)?),
+                total_churn_lines: i64_to_u64(row.get::<_, i64>(7)?),
+                recent_churn_lines: i64_to_u64(row.get::<_, i64>(8)?),
+                owner_count: optional_i64_to_u64(row.get::<_, Option<i64>>(9)?),
+                dominant_owner_share: row.get::<_, Option<f64>>(10)?,
+                co_changed_file_count: i64_to_u64(row.get::<_, i64>(11)?),
+                file_age_days: optional_i64_to_u64(row.get::<_, Option<i64>>(12)?),
+                source_coupling_in: optional_i64_to_u64(row.get::<_, Option<i64>>(13)?),
+                source_coupling_out: optional_i64_to_u64(row.get::<_, Option<i64>>(14)?),
+                cognitive_complexity: optional_i64_to_u64(row.get::<_, Option<i64>>(15)?),
+                max_function_complexity: optional_i64_to_u64(row.get::<_, Option<i64>>(16)?),
+            };
+            Ok(FileRiskRow {
+                path: row.get(0)?,
+                relative_path,
+                active_scan_id: row.get(2)?,
+                is_generated: row.get::<_, i64>(5)? != 0,
+                is_vendor: row.get::<_, i64>(6)? != 0,
+                input,
+                assessment: FileRiskAssessment {
+                    formula_id: FORMULA_ID,
+                    score: 0.0,
+                    risk_10: 0.0,
+                    risk_band: "low",
+                    terms: Vec::new(),
+                    limitations: Vec::new(),
+                    facts: Vec::new(),
+                },
+            })
+        })
+        .map_err(StoreReducerError::WriteDatabase)?;
+
+    let mut risk_rows = Vec::new();
+    for row in rows {
+        let mut risk_row = row.map_err(StoreReducerError::WriteDatabase)?;
+        risk_row.assessment = assessor.assess(&risk_row.input, &repository);
+        risk_rows.push(risk_row);
+    }
+    risk_rows.sort_by(|left, right| {
+        right
+            .assessment
+            .score
+            .total_cmp(&left.assessment.score)
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+    });
+
+    transaction
+        .execute_batch(
+            "
+            DELETE FROM file_risk_scores;
+            DELETE FROM file_risk_terms;
+            DELETE FROM file_risk_limitations;
+            DELETE FROM file_risk_facts;
+            ",
+        )
+        .map_err(StoreReducerError::WriteDatabase)?;
+
+    {
+        let mut score_statement = transaction
+            .prepare(
+                "
+                INSERT INTO file_risk_scores (
+                    relative_path,
+                    path,
+                    active_scan_id,
+                    formula_id,
+                    rank,
+                    score,
+                    risk_10,
+                    risk_band,
+                    is_generated,
+                    is_vendor
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ",
+            )
+            .map_err(StoreReducerError::WriteDatabase)?;
+        let mut term_statement = transaction
+            .prepare(
+                "
+                INSERT INTO file_risk_terms (
+                    relative_path,
+                    formula_id,
+                    term_name,
+                    raw_value,
+                    normalized_value,
+                    weight,
+                    contribution
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ",
+            )
+            .map_err(StoreReducerError::WriteDatabase)?;
+        let mut limitation_statement = transaction
+            .prepare(
+                "
+                INSERT INTO file_risk_limitations (
+                    relative_path,
+                    formula_id,
+                    limitation_index,
+                    code,
+                    message
+                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                ",
+            )
+            .map_err(StoreReducerError::WriteDatabase)?;
+        let mut fact_statement = transaction
+            .prepare(
+                "
+                INSERT INTO file_risk_facts (
+                    relative_path,
+                    formula_id,
+                    fact_index,
+                    fact_kind,
+                    message
+                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                ",
+            )
+            .map_err(StoreReducerError::WriteDatabase)?;
+
+        for (index, risk_row) in risk_rows.iter().enumerate() {
+            let rank = index as i64 + 1;
+            score_statement
+                .execute(params![
+                    risk_row.relative_path,
+                    risk_row.path,
+                    risk_row.active_scan_id,
+                    risk_row.assessment.formula_id,
+                    rank,
+                    risk_row.assessment.score,
+                    risk_row.assessment.risk_10,
+                    risk_row.assessment.risk_band,
+                    bool_to_i64(risk_row.is_generated),
+                    bool_to_i64(risk_row.is_vendor),
+                ])
+                .map_err(StoreReducerError::WriteDatabase)?;
+
+            for term in &risk_row.assessment.terms {
+                term_statement
+                    .execute(params![
+                        risk_row.relative_path,
+                        risk_row.assessment.formula_id,
+                        term.name,
+                        term.raw_value,
+                        term.normalized_value,
+                        term.weight,
+                        term.contribution,
+                    ])
+                    .map_err(StoreReducerError::WriteDatabase)?;
+            }
+
+            for (limitation_index, limitation) in risk_row.assessment.limitations.iter().enumerate()
+            {
+                limitation_statement
+                    .execute(params![
+                        risk_row.relative_path,
+                        risk_row.assessment.formula_id,
+                        limitation_index as i64,
+                        limitation.code,
+                        limitation.message,
+                    ])
+                    .map_err(StoreReducerError::WriteDatabase)?;
+            }
+
+            for (fact_index, fact) in risk_row.assessment.facts.iter().enumerate() {
+                fact_statement
+                    .execute(params![
+                        risk_row.relative_path,
+                        risk_row.assessment.formula_id,
+                        fact_index as i64,
+                        fact.kind,
+                        fact.message,
+                    ])
+                    .map_err(StoreReducerError::WriteDatabase)?;
+            }
+        }
+    }
+
+    transaction
+        .execute(
+            "
+            INSERT OR REPLACE INTO stage_metadata (key, value)
+            VALUES
+                ('file_risk_formula_id', ?1),
+                ('file_risk_scores_materialized', ?2),
+                ('file_risk_scorer_version', '1')
+            ",
+            params![FORMULA_ID, risk_rows.len().to_string()],
+        )
+        .map(|_| ())
+        .map_err(StoreReducerError::WriteDatabase)
+}
+
+fn materialize_project_risk_summary(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), StoreReducerError> {
+    let input = project_risk_input(transaction)?;
+    let assessment = RepoRiskAssessor::new().assess(&input);
+
+    transaction
+        .execute_batch(
+            "
+            DELETE FROM project_risk_summary;
+            DELETE FROM project_risk_terms;
+            DELETE FROM project_risk_facts;
+            DELETE FROM project_risk_limitations;
+            ",
+        )
+        .map_err(StoreReducerError::WriteDatabase)?;
+
+    write_project_risk_summary(transaction, &assessment)?;
+    write_project_risk_terms(transaction, &assessment)?;
+    write_project_risk_facts(transaction, &assessment)?;
+    write_project_risk_limitations(transaction, &assessment)?;
+
+    transaction
+        .execute(
+            "
+            INSERT OR REPLACE INTO stage_metadata (key, value)
+            VALUES
+                ('project_risk_formula_id', ?1),
+                ('project_risk_score', ?2),
+                ('project_risk_band', ?3),
+                ('project_risk_confidence', ?4),
+                ('project_risk_scorer_version', '1')
+            ",
+            params![
+                assessment.formula_id,
+                assessment.score.to_string(),
+                assessment.risk_band,
+                assessment.confidence,
+            ],
+        )
+        .map(|_| ())
+        .map_err(StoreReducerError::WriteDatabase)
+}
+
+fn project_risk_input(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<RepoRiskInput, StoreReducerError> {
+    let active_file_count = transaction
+        .query_row("SELECT COUNT(*) FROM file_facts", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map(i64_to_u64)
+        .map_err(StoreReducerError::WriteDatabase)?;
+    let active_go_file_count = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM file_facts WHERE language_id = 'go'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(i64_to_u64)
+        .map_err(StoreReducerError::WriteDatabase)?;
+    let git_index_status =
+        read_stage_metadata(transaction, "git_index_status")?.unwrap_or_else(|| {
+            git_index_status_from_summary(transaction)
+                .unwrap_or("unavailable")
+                .to_owned()
+        });
+
+    let mut file_statement = transaction
+        .prepare(
+            "
+            SELECT relative_path, score
+            FROM file_risk_scores
+            WHERE formula_id = ?1
+            ORDER BY score DESC, relative_path ASC
+            ",
+        )
+        .map_err(StoreReducerError::WriteDatabase)?;
+    let file_rows = file_statement
+        .query_map([FORMULA_ID], |row| {
+            Ok(ProjectFileRiskInput {
+                relative_path: row.get(0)?,
+                score: row.get(1)?,
+            })
+        })
+        .map_err(StoreReducerError::WriteDatabase)?;
+    let mut files = Vec::new();
+    for row in file_rows {
+        files.push(row.map_err(StoreReducerError::WriteDatabase)?);
+    }
+
+    let mut term_statement = transaction
+        .prepare(
+            "
+            SELECT relative_path, term_name, normalized_value
+            FROM file_risk_terms
+            WHERE formula_id = ?1
+            ORDER BY relative_path, term_name
+            ",
+        )
+        .map_err(StoreReducerError::WriteDatabase)?;
+    let term_rows = term_statement
+        .query_map([FORMULA_ID], |row| {
+            Ok(ProjectFileRiskTermInput {
+                relative_path: row.get(0)?,
+                term_name: row.get(1)?,
+                normalized_value: row.get(2)?,
+            })
+        })
+        .map_err(StoreReducerError::WriteDatabase)?;
+    let mut terms = Vec::new();
+    for row in term_rows {
+        terms.push(row.map_err(StoreReducerError::WriteDatabase)?);
+    }
+
+    Ok(RepoRiskInput {
+        active_file_count,
+        active_go_file_count,
+        git_index_status,
+        files,
+        terms,
+    })
+}
+
+fn write_project_risk_summary(
+    transaction: &rusqlite::Transaction<'_>,
+    assessment: &RepoRiskAssessment,
+) -> Result<(), StoreReducerError> {
+    let active_scan_id = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(active_scan_id), 0) FROM file_facts",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(StoreReducerError::WriteDatabase)?;
+
+    transaction
+        .execute(
+            "
+            INSERT INTO project_risk_summary (
+                formula_id,
+                active_scan_id,
+                score,
+                risk_10,
+                risk_band,
+                confidence,
+                active_file_count,
+                active_go_file_count,
+                scored_file_count,
+                scoring_coverage,
+                go_score_coverage,
+                max_file_score,
+                top_10_mean_score,
+                high_risk_file_count,
+                medium_risk_file_count,
+                dominant_dimension,
+                dominant_dimension_pressure,
+                git_index_status
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+            ",
+            params![
+                assessment.formula_id,
+                active_scan_id,
+                assessment.score,
+                assessment.risk_10,
+                assessment.risk_band,
+                assessment.confidence,
+                assessment.active_file_count as i64,
+                assessment.active_go_file_count as i64,
+                assessment.scored_file_count as i64,
+                assessment.scoring_coverage,
+                assessment.go_score_coverage,
+                assessment.max_file_score,
+                assessment.top_10_mean_score,
+                assessment.high_risk_file_count as i64,
+                assessment.medium_risk_file_count as i64,
+                assessment.dominant_dimension.as_deref(),
+                assessment.dominant_dimension_pressure,
+                assessment.git_index_status,
+            ],
+        )
+        .map(|_| ())
+        .map_err(StoreReducerError::WriteDatabase)
+}
+
+fn write_project_risk_terms(
+    transaction: &rusqlite::Transaction<'_>,
+    assessment: &RepoRiskAssessment,
+) -> Result<(), StoreReducerError> {
+    let mut statement = transaction
+        .prepare(
+            "
+            INSERT INTO project_risk_terms (
+                formula_id,
+                term_name,
+                raw_value,
+                normalized_value,
+                weight,
+                contribution
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ",
+        )
+        .map_err(StoreReducerError::WriteDatabase)?;
+    for term in &assessment.terms {
+        statement
+            .execute(params![
+                assessment.formula_id,
+                term.name,
+                term.raw_value,
+                term.normalized_value,
+                term.weight,
+                term.contribution,
+            ])
+            .map_err(StoreReducerError::WriteDatabase)?;
+    }
+    Ok(())
+}
+
+fn write_project_risk_facts(
+    transaction: &rusqlite::Transaction<'_>,
+    assessment: &RepoRiskAssessment,
+) -> Result<(), StoreReducerError> {
+    let mut statement = transaction
+        .prepare(
+            "
+            INSERT INTO project_risk_facts (
+                formula_id,
+                fact_index,
+                fact_kind,
+                message
+            ) VALUES (?1, ?2, ?3, ?4)
+            ",
+        )
+        .map_err(StoreReducerError::WriteDatabase)?;
+    for (index, fact) in assessment.facts.iter().enumerate() {
+        statement
+            .execute(params![
+                assessment.formula_id,
+                index as i64,
+                fact.kind,
+                fact.message,
+            ])
+            .map_err(StoreReducerError::WriteDatabase)?;
+    }
+    Ok(())
+}
+
+fn write_project_risk_limitations(
+    transaction: &rusqlite::Transaction<'_>,
+    assessment: &RepoRiskAssessment,
+) -> Result<(), StoreReducerError> {
+    let mut statement = transaction
+        .prepare(
+            "
+            INSERT INTO project_risk_limitations (
+                formula_id,
+                limitation_index,
+                code,
+                message
+            ) VALUES (?1, ?2, ?3, ?4)
+            ",
+        )
+        .map_err(StoreReducerError::WriteDatabase)?;
+    for (index, limitation) in assessment.limitations.iter().enumerate() {
+        statement
+            .execute(params![
+                assessment.formula_id,
+                index as i64,
+                limitation.code,
+                limitation.message,
+            ])
+            .map_err(StoreReducerError::WriteDatabase)?;
+    }
+    Ok(())
+}
+
+fn read_stage_metadata(
+    transaction: &rusqlite::Transaction<'_>,
+    key: &str,
+) -> Result<Option<String>, StoreReducerError> {
+    match transaction.query_row(
+        "SELECT value FROM stage_metadata WHERE key = ?1",
+        [key],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(source) => Err(StoreReducerError::WriteDatabase(source)),
+    }
+}
+
+fn git_index_status_from_summary(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<&'static str, StoreReducerError> {
+    let is_skipped = transaction.query_row(
+        "SELECT is_skipped FROM git_repository_summary WHERE id = 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    );
+    match is_skipped {
+        Ok(0) => Ok("available"),
+        Ok(_) | Err(rusqlite::Error::QueryReturnedNoRows) => Ok("unavailable"),
+        Err(source) => Err(StoreReducerError::WriteDatabase(source)),
+    }
+}
+
+fn repository_risk_context(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<RepositoryRiskContext, StoreReducerError> {
+    let repository_file_count = transaction
+        .query_row("SELECT COUNT(*) FROM file_facts", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map(i64_to_u64)
+        .map_err(StoreReducerError::WriteDatabase)?;
+
+    let summary = transaction.query_row(
+        "
+        SELECT repository_age_days, repository_author_count, is_skipped
+        FROM git_repository_summary
+        WHERE id = 1
+        ",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, Option<i64>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)? != 0,
+            ))
+        },
+    );
+
+    match summary {
+        Ok((repository_age_days, repository_author_count, false)) => Ok(RepositoryRiskContext {
+            repository_age_days: optional_i64_to_u64(repository_age_days),
+            repository_author_count: Some(i64_to_u64(repository_author_count)),
+            repository_file_count,
+        }),
+        Ok((_, _, true)) | Err(rusqlite::Error::QueryReturnedNoRows) => Ok(RepositoryRiskContext {
+            repository_age_days: None,
+            repository_author_count: None,
+            repository_file_count,
+        }),
+        Err(source) => Err(StoreReducerError::WriteDatabase(source)),
+    }
+}
+
+fn optional_i64_to_u64(value: Option<i64>) -> Option<u64> {
+    value.map(i64_to_u64)
+}
+
+fn i64_to_u64(value: i64) -> u64 {
+    value.max(0) as u64
 }
 
 fn finalize_git_repository_summary(
@@ -2626,6 +3344,14 @@ mod tests {
         assert_eq!(table_count(&connection, "source_dependency_edges"), 1);
         assert_eq!(table_count(&connection, "source_file_packages"), 1);
         assert_eq!(table_count(&connection, "file_facts"), 1);
+        assert_eq!(table_count(&connection, "file_risk_scores"), 1);
+        assert_eq!(table_count(&connection, "file_risk_terms"), 1);
+        assert_eq!(table_count(&connection, "file_risk_limitations"), 1);
+        assert_eq!(table_count(&connection, "file_risk_facts"), 1);
+        assert_eq!(table_count(&connection, "project_risk_summary"), 1);
+        assert_eq!(table_count(&connection, "project_risk_terms"), 1);
+        assert_eq!(table_count(&connection, "project_risk_limitations"), 1);
+        assert_eq!(table_count(&connection, "project_risk_facts"), 1);
     }
 
     #[test]
@@ -3110,6 +3836,217 @@ mod tests {
     }
 
     #[test]
+    fn materializes_go_file_risk_scores_with_terms_facts_and_flags() {
+        let fixture = Fixture::new("file-risk");
+        write_fixture_file(&fixture.path, "risky.go");
+        write_fixture_file(&fixture.path, "simple.go");
+        write_fixture_file(&fixture.path, "README.md");
+
+        let (event_sender, _event_receiver) = mpsc::channel();
+        let reducer =
+            StoreReducer::start(&fixture.path, StoreReducerOptions::default(), event_sender)
+                .expect("reducer should start");
+        let handle = reducer.handle();
+
+        handle
+            .store_file_analysis(go_result_with_metrics(
+                fixture.path.join("risky.go"),
+                1_200,
+                220,
+                45,
+                true,
+                false,
+            ))
+            .expect("risky go file should enqueue");
+        handle
+            .store_file_analysis(go_result_with_metrics(
+                fixture.path.join("simple.go"),
+                10,
+                1,
+                1,
+                false,
+                false,
+            ))
+            .expect("simple go file should enqueue");
+        handle
+            .store_file_analysis(file_result(fixture.path.join("README.md")))
+            .expect("non-go file should enqueue");
+        handle
+            .store_git_repository_summary(GitRepositorySummaryInput {
+                head_commit: Some("head".to_owned()),
+                head_timestamp: Some(2_000),
+                total_commits: 3,
+                is_shallow: false,
+                is_skipped: false,
+                skip_reason: None,
+            })
+            .expect("repository summary should enqueue");
+        handle
+            .store_git_repository_delta(GitRepositoryDelta {
+                authors: vec!["Alice <alice@example.invalid>".to_owned()],
+                first_commit_timestamp: Some(1_000),
+                last_commit_timestamp: Some(2_000),
+            })
+            .expect("repository delta should enqueue");
+        handle
+            .store_git_file_metrics(vec![
+                GitFileMetricDelta {
+                    path: "risky.go".to_owned(),
+                    commits: 3,
+                    total_added_lines: 2_000,
+                    total_deleted_lines: 300,
+                    recent_added_lines: 900,
+                    recent_deleted_lines: 100,
+                    first_touch_timestamp: 1_000,
+                    last_touch_timestamp: 2_000,
+                },
+                GitFileMetricDelta {
+                    path: "simple.go".to_owned(),
+                    commits: 1,
+                    total_added_lines: 1,
+                    total_deleted_lines: 0,
+                    recent_added_lines: 0,
+                    recent_deleted_lines: 0,
+                    first_touch_timestamp: 2_000,
+                    last_touch_timestamp: 2_000,
+                },
+            ])
+            .expect("git metrics should enqueue");
+        handle
+            .store_git_file_authors(vec![GitFileAuthorDelta {
+                path: "risky.go".to_owned(),
+                author: "Alice <alice@example.invalid>".to_owned(),
+                touch_count: 3,
+                meaningful_commit_count: 3,
+                effective_changed_lines: 2_300,
+                ownership_line_recency_score: 2_300.0,
+            }])
+            .expect("git authors should enqueue");
+
+        reducer.finish().expect("reducer should finish");
+
+        let connection = Connection::open(fixture.db_path()).expect("db should open");
+        assert_eq!(row_count(&connection, "file_risk_scores"), 2);
+        assert_eq!(
+            scalar_text(
+                &connection,
+                "SELECT relative_path FROM file_risk_scores WHERE rank = 1",
+            ),
+            "risky.go"
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT is_generated FROM file_risk_scores WHERE relative_path = 'risky.go'",
+            ),
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT COUNT(*) FROM file_risk_terms WHERE relative_path = 'risky.go'",
+            ),
+            7
+        );
+        assert!(
+            scalar_f64(
+                &connection,
+                "SELECT score FROM file_risk_scores WHERE relative_path = 'risky.go'",
+            ) > scalar_f64(
+                &connection,
+                "SELECT score FROM file_risk_scores WHERE relative_path = 'simple.go'",
+            )
+        );
+        assert_eq!(
+            scalar_text(
+                &connection,
+                "SELECT value FROM stage_metadata WHERE key = 'file_risk_formula_id'",
+            ),
+            "hotpath.score.go.v1"
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT CAST(value AS INTEGER) FROM stage_metadata WHERE key = 'file_risk_scores_materialized'",
+            ),
+            2
+        );
+        assert!(
+            scalar_i64(
+                &connection,
+                "SELECT COUNT(*) FROM file_risk_facts WHERE relative_path = 'risky.go'",
+            ) >= 3
+        );
+        assert_eq!(row_count(&connection, "project_risk_summary"), 1);
+        assert!(
+            scalar_f64(
+                &connection,
+                "SELECT score FROM project_risk_summary WHERE formula_id = 'hotpath.project_risk.go.v1'",
+            ) > 0.0
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT scored_file_count FROM project_risk_summary WHERE formula_id = 'hotpath.project_risk.go.v1'",
+            ),
+            2
+        );
+        assert_eq!(
+            scalar_text(
+                &connection,
+                "SELECT value FROM stage_metadata WHERE key = 'project_risk_formula_id'",
+            ),
+            "hotpath.project_risk.go.v1"
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT COUNT(*) FROM project_risk_terms WHERE formula_id = 'hotpath.project_risk.go.v1'",
+            ),
+            5
+        );
+    }
+
+    #[test]
+    fn materializes_unavailable_project_risk_without_scored_go_files() {
+        let fixture = Fixture::new("project-risk-no-go");
+        fs::write(fixture.path.join("README.md"), "hello\n").expect("fixture file should write");
+        let (event_sender, _event_receiver) = mpsc::channel();
+        let reducer =
+            StoreReducer::start(&fixture.path, StoreReducerOptions::default(), event_sender)
+                .expect("reducer should start");
+
+        reducer
+            .handle()
+            .store_file_analysis(file_result(fixture.path.join("README.md")))
+            .expect("file should enqueue");
+        reducer.finish().expect("reducer should finish");
+
+        let connection = Connection::open(fixture.db_path()).expect("db should open");
+        assert_eq!(
+            scalar_text(
+                &connection,
+                "SELECT risk_band FROM project_risk_summary WHERE formula_id = 'hotpath.project_risk.go.v1'",
+            ),
+            "unavailable"
+        );
+        assert_eq!(
+            scalar_text(
+                &connection,
+                "SELECT confidence FROM project_risk_summary WHERE formula_id = 'hotpath.project_risk.go.v1'",
+            ),
+            "none"
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT COUNT(*) FROM project_risk_limitations WHERE code = 'no_scored_files'",
+            ),
+            1
+        );
+    }
+
+    #[test]
     fn scan_start_preserves_rows_for_incremental_reuse() {
         let fixture = Fixture::new("preserve");
         let (first_event_sender, _first_event_receiver) = mpsc::channel();
@@ -3195,6 +4132,24 @@ mod tests {
         result
     }
 
+    fn go_result_with_metrics(
+        path: impl AsRef<Path>,
+        line_count: u64,
+        cognitive_complexity: u64,
+        max_function_complexity: u64,
+        is_generated: bool,
+        is_vendor: bool,
+    ) -> FileAnalysisResult {
+        let mut result = file_result_with_imports(path, &[]);
+        result.line_count = Some(line_count);
+        result.byte_size = Some(line_count * 40);
+        result.is_generated = is_generated;
+        result.is_vendor = is_vendor;
+        result.cognitive_complexity = Some(cognitive_complexity);
+        result.max_function_complexity = Some(max_function_complexity);
+        result
+    }
+
     fn write_fixture_file(root: &Path, relative_path: &str) {
         let path = root.join(relative_path);
         if let Some(parent) = path.parent() {
@@ -3221,6 +4176,18 @@ mod tests {
     }
 
     fn scalar_i64(connection: &Connection, sql: &str) -> i64 {
+        connection
+            .query_row(sql, [], |row| row.get(0))
+            .expect("scalar query should run")
+    }
+
+    fn scalar_f64(connection: &Connection, sql: &str) -> f64 {
+        connection
+            .query_row(sql, [], |row| row.get(0))
+            .expect("scalar query should run")
+    }
+
+    fn scalar_text(connection: &Connection, sql: &str) -> String {
         connection
             .query_row(sql, [], |row| row.get(0))
             .expect("scalar query should run")
