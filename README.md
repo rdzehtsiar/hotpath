@@ -4,108 +4,152 @@
 [![codecov](https://codecov.io/gh/rdzehtsiar/hotpath/graph/badge.svg)](https://codecov.io/gh/rdzehtsiar/hotpath)
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=rdzehtsiar_hotpath&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=rdzehtsiar_hotpath)
 
-Hotpath is an offline, local-first codebase intelligence tool for engineers who need to find risky, expensive, unstable, bloated, or architecturally drifting parts of a repository.
+Hotpath is an offline, local-first codebase intelligence tool in early
+development. Its long-term purpose is to help engineers identify risky,
+expensive, unstable, bloated, or architecturally drifting areas in a repository
+without uploading source code or depending on hosted services.
 
-The intended experience is simple: install one binary, run one command in a repo, and get useful codebase intelligence in minutes without sending code anywhere.
+The implementation is currently much narrower than that product direction. This
+README documents only what exists in the current codebase.
 
-## Vision
+## Current CLI
 
-Hotpath is built around a practical question:
+The CLI currently exposes two subcommands:
 
-```text
-Where is this repo likely to hurt us next?
+```powershell
+hotpath scan
+hotpath tui
 ```
 
-The product direction is a terminal-native engine that combines local repository signals such as:
+### `hotpath scan`
 
-- file structure
-- Git history
-- churn and ownership
-- size and growth
-- symbols and language-aware structure
-- complexity and coupling
-- AI context cost
-- architecture rule violations
+`hotpath scan` runs from the current working directory. It:
 
-into explainable hotspot reports that help engineers decide where to investigate, refactor, test, or constrain change.
+- enumerates repository files with local ignore rules
+- reads file metadata and a bounded content window
+- classifies basic content kind, generated paths, and vendor paths
+- parses supported Go files
+- computes approximate Go-derived source metrics where possible
+- collects bounded local Git history when the directory is a non-shallow Git
+  worktree
+- persists derived local data to the Hotpath index
+- prints terminal progress for file and Git processing
 
-## Current State
+There is no current `scan --json`, `scan --summary`, report output, CI gate, or
+stable machine-readable scan schema.
 
-Hotpath is at the beginning of development.
+### `hotpath tui`
 
-The repository currently contains an early Rust CLI with `hotpath scan`,
-`hotpath parse`, `hotpath complexity`, `hotpath graph`, `hotpath doctor`,
-`hotpath explain-git`, `hotpath hotspots`, `hotpath explain`, and
-`hotpath context`, `hotpath report`, and `hotpath ci`, plus early `hotpath diff`
-and `hotpath pr` commands for committed-tree diff risk reports. It also
-contains an early `hotpath tui` terminal UI for local, offline exploration of
-the same repository facts. The TUI is terminal-native and keyboard-first, with
-no mouse required, but it is unstable and not a stable UI contract. The scanner
-reports local file facts and warnings, scan and analysis commands persist
-derived local SQLite index data at
-`.hotpath/index.db`, Git analysis explains local history for requested paths,
-hotspot commands rank and explain current files with the documented
-`hotpath.score.v3` formula, parse commands print an early parser report for
-supported source files, complexity commands summarize parser-derived symbol
-complexity and fan metrics, graph commands expose conservative resolved local
-dependency edges for a selected module scope, and context commands estimate AI
-context cost offline from scanner facts. Repository reports aggregate scan
-summary, local Git analysis, hotspot ranking, and context estimates into
-Markdown, JSON, SARIF, or static HTML output. The CI command can fail a local or
-hosted CI job when the current repository hotspot risk reaches a supplied
-threshold. Diff and PR reports compare committed Git trees locally, use the
-merge base of the requested base and head refs, and do not require GitHub API or
-network access.
+`hotpath tui` opens an early read-only terminal UI over the local Hotpath index.
+It is keyboard-first and unstable. It should not be treated as a stable UI
+contract.
 
-Parser support is currently limited to Rust, Go, TypeScript, and TSX. There is
-no Python parser support yet. `hotpath parse` prints a summary, while
-`hotpath parse --json` prints a machine-readable report with schema identifier
-`hotpath.parse.v1`. Parser output includes modules, packages, namespaces,
-imports, functions, methods, classes and types, symbol ranges, parent/nesting
-metadata, and basic parser-derived function/method complexity approximations.
-`hotpath complexity --json` currently uses schema identifier
-`hotpath.complexity.v1`, and `hotpath graph --module <selector> --json`
-currently uses schema identifier `hotpath.graph.v1`. `hotpath context --json`
-currently uses schema identifier `hotpath.context.v1`. `hotpath diff
-<base>...<head> --json` and `hotpath pr --base <base> --head <head> --json`
-currently use schema identifier `hotpath.diff.v1`. `hotpath report --json`
-currently uses schema identifier `hotpath.report.v1`; `hotpath report --sarif`
-emits SARIF 2.1.0 for hotspot findings.
+## Local Index
 
-There is no released binary, stable CLI contract, stable TUI contract, stable
-index format, stable report compatibility promise, stable Git analysis
-compatibility promise, broad parser/language support, complete dependency
-analysis, or architecture rules yet.
+Scan output is persisted as derived local cache data at:
 
-Expect the crate layout, commands, data model, scoring formulas, output formats, and documentation to change as the product contract and first implementation milestones are built.
+```text
+.hotpath/index.sqlite
+```
 
-## Product Contract
+The index is local working data, not a stable public database format. It may
+contain repository-relative paths, file metadata, parser-derived Go facts, Git
+metrics, source dependency rows, and Go risk score rows. It can be deleted and
+rebuilt from local repository data.
 
-The public contract for Hotpath is documented in:
+Do not commit `.hotpath/`.
 
-- [Product contract](docs/product-contract.md)
-- [Privacy](docs/privacy.md)
-- [Metrics](docs/metrics.md)
-- [Scoring principles](docs/scoring.md)
-- [Git metric semantics](docs/git-metrics.md)
-- [Local index](docs/index.md)
-- [Context estimates](docs/context.md)
-- [Report schema](docs/json-schema.md)
-- [CI usage](docs/ci.md)
-- [Diff and PR risk](docs/diff-risk.md)
-- [Limitations](docs/limitations.md)
+## Language Support
 
-## Product Principles
+Only Go is currently supported for language-aware processing.
+
+Hotpath still scans files in other languages as files, but the default analyzer
+only registers the Go parser. Rust, TypeScript, TSX, Python, and other language
+files are not parsed by the current default pipeline and do not receive
+language-derived metrics or Go file risk scores.
+
+## Go Processing Limits
+
+Current Go processing is intentionally limited:
+
+- Go recognition is extension-based: only paths ending in `.go` are considered.
+- Go files must be readable as UTF-8 text.
+- Files larger than the active content window are not parsed. The default
+  content window is 1 MiB.
+- Truncated text files do not receive line counts from the scanner.
+- Binary files and invalid UTF-8 files are not parsed as Go.
+- The parser is tree-sitter based and may emit a parse-error diagnostic while
+  still collecting partial facts from the recovered syntax tree.
+- Extracted Go symbols are currently compact facts, not a complete semantic
+  model. The parser records top-level functions, methods, type specs, structs,
+  interfaces, and imports.
+- Symbol output does not currently include source ranges, signatures, receiver
+  details, package docs, comments, call sites, or full type information.
+- Import extraction records string-literal import targets.
+- Approximate source coupling is derived from resolved local Go import edges.
+  It is a directional coordination-risk signal, not a complete dependency
+  graph, build graph, runtime graph, or call graph.
+- Go source dependency resolution is conservative and package-path based. It
+  uses the local `go.mod` module prefix when present and active Go file
+  directories as known packages. External imports and imports that cannot be
+  matched to a known local package are left unresolved.
+- Approximate cognitive complexity is derived from parsed Go control-flow
+  syntax. It is a hotspot-ranking signal, not a spec-correct cyclomatic
+  complexity implementation or a complete model of Go execution semantics.
+- Go file risk scoring is currently limited to active rows whose language is
+  `go`.
+- Generated and vendor Go files can still be scored. Their flags are preserved,
+  but they are not excluded by default.
+- Project risk is Go-aware only. Repositories with little or no Go receive low
+  or unavailable scoring coverage rather than broad repository risk analysis.
+
+## Git Processing Limits
+
+Current Git processing is also limited:
+
+- Git processing depends on the local `git` executable.
+- Non-Git directories are scanned for files, but Git history is marked
+  unavailable.
+- Shallow repositories are skipped for Git-derived analysis.
+- The default Git history scan is bounded to at most 50,000 commits.
+- The default Git history scan is bounded to commits from the last 730 days
+  relative to the `HEAD` committer timestamp.
+- Incremental Git scans use the previous indexed `HEAD` when it is an ancestor
+  of the current `HEAD`; otherwise Hotpath falls back to a full bounded scan.
+- Git log and show commands use `--first-parent`, so side-branch history can be
+  missed by the current scan model.
+- Git log and show commands use `--no-renames`, so rename history is not
+  reconstructed across paths.
+- Root commits are included.
+- Merge handling follows the current first-parent command behavior rather than
+  a complete all-parent history analysis.
+- Recent churn uses a fixed 90-day window relative to the `HEAD` committer
+  timestamp, not the machine wall clock.
+- Commit timestamp skew, rebases, imports, rewritten history, and unusual
+  committer dates can distort recency and age metrics.
+- Author identity is the exact Git author string in the form `Name <email>`.
+  `.mailmap`, bot detection, account merging, case folding, and domain
+  normalization are not applied.
+- Binary changes and numstat rows without numeric line counts contribute zero
+  added and deleted lines.
+- Ownership weighting uses changed lines, a bulk-change dampening factor, and a
+  recency half-life. It is an operational heuristic, not a code ownership
+  policy.
+- Commits touching more than 100 files are skipped for co-change pair
+  generation, while their churn and authorship rows can still be recorded.
+- Co-change is file-pair breadth from commits, not semantic coupling.
+- Git metrics are stored as derived cache data and are not a stable public
+  schema.
+
+## Principles
 
 - fully offline by default
 - no telemetry by default
 - no cloud APIs required
 - deterministic results where practical
-- transparent and versioned scoring formulas
 - advisory-only metrics, not automated truth
-- reproducible benchmarks
 - public limitations
-- CI-friendly output
+- cross-platform behavior
 
 ## Who It Is For
 
@@ -118,9 +162,9 @@ Hotpath is intended for:
 - consultants doing codebase audits
 - teams using AI coding tools and watching for code bloat or context growth
 
-## What Hotpath Should Help With
+## Product Direction
 
-Hotpath should make it easier to answer questions such as:
+Hotpath is being built toward answering questions such as:
 
 - which files combine high churn, large size, and concentrated operational ownership
 - which modules are growing fastest
@@ -129,6 +173,8 @@ Hotpath should make it easier to answer questions such as:
 - how much of a repo is expensive to load into AI coding context
 - whether architecture rules are drifting
 - why a hotspot score was assigned
+
+Most of that product direction is not implemented yet.
 
 ## What It Is Not
 
@@ -141,13 +187,14 @@ Hotpath is not intended to be:
 - a replacement for human engineering judgment
 - a source of hidden or opaque quality scores
 
-Scores and reports should be explainable, reproducible, and treated as decision support.
+Scores and reports should be explainable, reproducible, and treated as decision
+support when those surfaces exist.
 
 ## Development
 
 Hotpath is expected to use Rust for the core implementation.
 
-Common Rust checks once the project is initialized:
+Common Rust checks:
 
 ```powershell
 cargo fmt --check
@@ -157,21 +204,13 @@ cargo test
 
 ## Privacy
 
-Hotpath is designed as a local tool. The core workflow should not require network access, telemetry, cloud APIs, hosted services, or uploading repository contents.
+Hotpath is designed as a local tool. The current workflow should not require
+network access, telemetry, cloud APIs, hosted services, or uploading repository
+contents.
 
-Current scans and analysis commands write derived local cache data under
-`.hotpath/`, including `.hotpath/index.db`. The index stores scanner file
-facts, scan run metadata, scan/file warnings, parser-backed symbol rows, Git
-metrics, co-change rows, conservative resolved dependency edges, and hotspot
-score rows using repository-relative paths. Context estimates reuse current scan
-facts and do not add a context-specific index table or schema. Diff and PR
-reports persist the same scan, Git analysis, and hotspot rows used by existing
-commands; they do not add a diff-specific index table. Repository reports and
-CI risk gates persist the same scan, Git analysis, and hotspot rows used by
-existing commands; static HTML reports are written only when requested with
-`hotpath report --html <dir>`. The index does not require a daemon or network
-access, and it can be deleted and rebuilt from local repository data. See
-[Local index](docs/index.md).
+The local index may contain sensitive derived repository information such as
+repository-relative paths, file facts, Git metrics, ownership heuristics,
+dependency rows, and risk scores. Treat `.hotpath/` as local cache data.
 
 ## License
 
