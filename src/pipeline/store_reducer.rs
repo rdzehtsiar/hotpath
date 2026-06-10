@@ -2571,6 +2571,10 @@ fn materialize_project_risk_summary(
                 ('project_risk_score', ?2),
                 ('project_risk_band', ?3),
                 ('project_risk_confidence', ?4),
+                ('project_risk_active_file_count', ?5),
+                ('project_risk_active_go_file_count', ?6),
+                ('project_risk_scored_file_count', ?7),
+                ('project_risk_coverage_percentage', ?8),
                 ('project_risk_scorer_version', '1')
             ",
             params![
@@ -2578,10 +2582,22 @@ fn materialize_project_risk_summary(
                 assessment.score.to_string(),
                 assessment.risk_band,
                 assessment.confidence,
+                assessment.active_file_count.to_string(),
+                assessment.active_go_file_count.to_string(),
+                assessment.scored_file_count.to_string(),
+                project_risk_coverage_percentage(&assessment).to_string(),
             ],
         )
         .map(|_| ())
         .map_err(StoreReducerError::WriteDatabase)
+}
+
+fn project_risk_coverage_percentage(assessment: &RepoRiskAssessment) -> f64 {
+    assessment
+        .go_score_coverage
+        .unwrap_or(assessment.scoring_coverage)
+        .clamp(0.0, 1.0)
+        * 100.0
 }
 
 fn project_risk_input(
@@ -4147,6 +4163,34 @@ mod tests {
                 "SELECT scored_file_count FROM project_risk_summary WHERE formula_id = 'hotpath.project_risk.go.v1'",
             ),
             2
+        );
+        assert_eq!(
+            scalar_text(
+                &connection,
+                "SELECT value FROM stage_metadata WHERE key = 'project_risk_active_file_count'",
+            ),
+            "3"
+        );
+        assert_eq!(
+            scalar_text(
+                &connection,
+                "SELECT value FROM stage_metadata WHERE key = 'project_risk_active_go_file_count'",
+            ),
+            "2"
+        );
+        assert_eq!(
+            scalar_text(
+                &connection,
+                "SELECT value FROM stage_metadata WHERE key = 'project_risk_scored_file_count'",
+            ),
+            "2"
+        );
+        assert_eq!(
+            scalar_text(
+                &connection,
+                "SELECT value FROM stage_metadata WHERE key = 'project_risk_coverage_percentage'",
+            ),
+            "100"
         );
         assert_eq!(
             scalar_text(
