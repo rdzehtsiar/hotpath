@@ -887,7 +887,7 @@ fn load_risk_rows(connection: &Connection) -> rusqlite::Result<Vec<RiskRow>> {
         FROM file_risk_scores score
         LEFT JOIN file_facts facts
             ON facts.relative_path = score.relative_path
-        ORDER BY score.rank ASC
+        ORDER BY score.score DESC, score.relative_path ASC
         ",
     )?;
     let rows = statement.query_map([], |row| {
@@ -1702,6 +1702,31 @@ mod tests {
         assert_eq!(snapshot.rows[0].parser_diagnostics.len(), 1);
         assert_eq!(snapshot.rows[0].parser_diagnostics[0].code, "parse_error");
         assert_eq!(snapshot.rows[0].owners.len(), 1);
+    }
+
+    #[test]
+    fn loads_risk_rows_by_score_descending_then_path_ascending() {
+        let fixture = Fixture::new("risk-sort");
+        create_tui_db(&fixture.db_path());
+        let connection = Connection::open(fixture.db_path()).expect("db should open");
+        connection
+            .execute(
+                "UPDATE file_risk_scores SET rank = 1, score = 0.8, risk_10 = 8.0 WHERE relative_path = 'src/safe.go'",
+                [],
+            )
+            .expect("safe row should update");
+        connection
+            .execute(
+                "UPDATE file_risk_scores SET rank = 2, score = 0.8, risk_10 = 8.0 WHERE relative_path = 'src/risky.go'",
+                [],
+            )
+            .expect("risky row should update");
+
+        let snapshot = TuiDatabaseSnapshot::load_from_dir(&fixture.path);
+
+        assert_eq!(snapshot.rows.len(), 2);
+        assert_eq!(snapshot.rows[0].relative_path, "src/risky.go");
+        assert_eq!(snapshot.rows[1].relative_path, "src/safe.go");
     }
 
     #[test]
