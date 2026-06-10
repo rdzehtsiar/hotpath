@@ -719,8 +719,8 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
                 method_count INTEGER NOT NULL DEFAULT 0,
                 type_count INTEGER NOT NULL DEFAULT 0,
                 import_count INTEGER NOT NULL DEFAULT 0,
-                cognitive_complexity INTEGER,
-                max_function_complexity INTEGER,
+                complexity_pressure INTEGER,
+                max_function_complexity_pressure INTEGER,
                 diagnostics TEXT NOT NULL
             );
 
@@ -883,8 +883,8 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
                 method_count INTEGER NOT NULL DEFAULT 0,
                 type_count INTEGER NOT NULL DEFAULT 0,
                 import_count INTEGER NOT NULL DEFAULT 0,
-                cognitive_complexity INTEGER,
-                max_function_complexity INTEGER,
+                complexity_pressure INTEGER,
+                max_function_complexity_pressure INTEGER,
                 diagnostics TEXT NOT NULL,
                 commits_per_file INTEGER NOT NULL DEFAULT 0,
                 total_added_lines INTEGER NOT NULL DEFAULT 0,
@@ -901,8 +901,8 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
                 dominant_owner TEXT,
                 dominant_owner_share REAL,
                 co_changed_file_count INTEGER NOT NULL DEFAULT 0,
-                source_coupling_in INTEGER,
-                source_coupling_out INTEGER
+                source_coupling_pressure_in INTEGER,
+                source_coupling_pressure_out INTEGER
             );
 
             CREATE INDEX IF NOT EXISTS idx_file_facts_relative_path
@@ -1077,13 +1077,13 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
     add_column_if_missing(
         connection,
         "file_analysis",
-        "cognitive_complexity",
+        "complexity_pressure",
         "INTEGER",
     )?;
     add_column_if_missing(
         connection,
         "file_analysis",
-        "max_function_complexity",
+        "max_function_complexity_pressure",
         "INTEGER",
     )?;
     add_column_if_missing(connection, "file_facts", "language_id", "TEXT")?;
@@ -1117,15 +1117,25 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
         "import_count",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
-    add_column_if_missing(connection, "file_facts", "cognitive_complexity", "INTEGER")?;
+    add_column_if_missing(connection, "file_facts", "complexity_pressure", "INTEGER")?;
     add_column_if_missing(
         connection,
         "file_facts",
-        "max_function_complexity",
+        "max_function_complexity_pressure",
         "INTEGER",
     )?;
-    add_column_if_missing(connection, "file_facts", "source_coupling_in", "INTEGER")?;
-    add_column_if_missing(connection, "file_facts", "source_coupling_out", "INTEGER")?;
+    add_column_if_missing(
+        connection,
+        "file_facts",
+        "source_coupling_pressure_in",
+        "INTEGER",
+    )?;
+    add_column_if_missing(
+        connection,
+        "file_facts",
+        "source_coupling_pressure_out",
+        "INTEGER",
+    )?;
     add_column_if_missing(
         connection,
         "git_chunks",
@@ -1314,8 +1324,8 @@ fn flush_batch(
                     method_count,
                     type_count,
                     import_count,
-                    cognitive_complexity,
-                    max_function_complexity,
+                    complexity_pressure,
+                    max_function_complexity_pressure,
                     diagnostics
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
                 ",
@@ -1349,8 +1359,10 @@ fn flush_batch(
                     result.method_count as i64,
                     result.type_count as i64,
                     result.import_count as i64,
-                    result.cognitive_complexity.map(|value| value as i64),
-                    result.max_function_complexity.map(|value| value as i64),
+                    result.complexity_pressure.map(|value| value as i64),
+                    result
+                        .max_function_complexity_pressure
+                        .map(|value| value as i64),
                     diagnostics_json(result),
                 ])
                 .map_err(StoreReducerError::WriteDatabase)?;
@@ -2182,8 +2194,8 @@ fn materialize_file_facts(
                 method_count,
                 type_count,
                 import_count,
-                cognitive_complexity,
-                max_function_complexity,
+                complexity_pressure,
+                max_function_complexity_pressure,
                 diagnostics,
                 commits_per_file,
                 total_added_lines,
@@ -2200,8 +2212,8 @@ fn materialize_file_facts(
                 dominant_owner,
                 dominant_owner_share,
                 co_changed_file_count,
-                source_coupling_in,
-                source_coupling_out
+                source_coupling_pressure_in,
+                source_coupling_pressure_out
             )
             SELECT
                 file_analysis.path,
@@ -2222,8 +2234,8 @@ fn materialize_file_facts(
                 file_analysis.method_count,
                 file_analysis.type_count,
                 file_analysis.import_count,
-                file_analysis.cognitive_complexity,
-                file_analysis.max_function_complexity,
+                file_analysis.complexity_pressure,
+                file_analysis.max_function_complexity_pressure,
                 file_analysis.diagnostics,
                 COALESCE(git_file_metrics.commits_per_file, 0),
                 COALESCE(git_file_metrics.total_added_lines, 0),
@@ -2240,8 +2252,8 @@ fn materialize_file_facts(
                 git_file_metrics.dominant_owner,
                 git_file_metrics.dominant_owner_share,
                 COALESCE(git_file_metrics.co_changed_file_count, 0),
-                COALESCE(source_in.source_coupling_in, 0),
-                COALESCE(source_out.source_coupling_out, 0)
+                COALESCE(source_in.source_coupling_pressure_in, 0),
+                COALESCE(source_out.source_coupling_pressure_out, 0)
             FROM file_analysis
             LEFT JOIN git_file_metrics
                 ON file_analysis.relative_path = git_file_metrics.path
@@ -2250,7 +2262,7 @@ fn materialize_file_facts(
             LEFT JOIN (
                 SELECT
                     target_package,
-                    COUNT(DISTINCT source_path) AS source_coupling_in
+                    COUNT(DISTINCT source_path) AS source_coupling_pressure_in
                 FROM source_dependency_edges
                 GROUP BY target_package
             ) source_in
@@ -2258,7 +2270,7 @@ fn materialize_file_facts(
             LEFT JOIN (
                 SELECT
                     source_path,
-                    COUNT(DISTINCT target_package) AS source_coupling_out
+                    COUNT(DISTINCT target_package) AS source_coupling_pressure_out
                 FROM source_dependency_edges
                 GROUP BY source_path
             ) source_out
@@ -2307,13 +2319,15 @@ fn materialize_file_risk_scores(
                 dominant_owner_share,
                 co_changed_file_count,
                 file_age_days,
-                source_coupling_in,
-                source_coupling_out,
-                cognitive_complexity,
-                max_function_complexity
+                source_coupling_pressure_in,
+                source_coupling_pressure_out,
+                complexity_pressure,
+                max_function_complexity_pressure
             FROM file_facts
             WHERE language_id = 'go'
                 AND relative_path IS NOT NULL
+                AND is_generated = 0
+                AND is_vendor = 0
             ORDER BY relative_path
             ",
         )
@@ -2331,10 +2345,12 @@ fn materialize_file_risk_scores(
                 dominant_owner_share: row.get::<_, Option<f64>>(10)?,
                 co_changed_file_count: i64_to_u64(row.get::<_, i64>(11)?),
                 file_age_days: optional_i64_to_u64(row.get::<_, Option<i64>>(12)?),
-                source_coupling_in: optional_i64_to_u64(row.get::<_, Option<i64>>(13)?),
-                source_coupling_out: optional_i64_to_u64(row.get::<_, Option<i64>>(14)?),
-                cognitive_complexity: optional_i64_to_u64(row.get::<_, Option<i64>>(15)?),
-                max_function_complexity: optional_i64_to_u64(row.get::<_, Option<i64>>(16)?),
+                source_coupling_pressure_in: optional_i64_to_u64(row.get::<_, Option<i64>>(13)?),
+                source_coupling_pressure_out: optional_i64_to_u64(row.get::<_, Option<i64>>(14)?),
+                complexity_pressure: optional_i64_to_u64(row.get::<_, Option<i64>>(15)?),
+                max_function_complexity_pressure: optional_i64_to_u64(
+                    row.get::<_, Option<i64>>(16)?,
+                ),
             };
             Ok(FileRiskRow {
                 path: row.get(0)?,
@@ -2507,6 +2523,13 @@ fn materialize_file_risk_scores(
             VALUES
                 ('file_risk_formula_id', ?1),
                 ('file_risk_scores_materialized', ?2),
+                ('file_risk_excluded_generated_vendor_go_files', CAST((
+                    SELECT COUNT(*)
+                    FROM file_facts
+                    WHERE language_id = 'go'
+                        AND relative_path IS NOT NULL
+                        AND (is_generated != 0 OR is_vendor != 0)
+                ) AS TEXT)),
                 ('file_risk_scorer_version', '1')
             ",
             params![FORMULA_ID, risk_rows.len().to_string()],
@@ -2546,6 +2569,10 @@ fn materialize_project_risk_summary(
                 ('project_risk_score', ?2),
                 ('project_risk_band', ?3),
                 ('project_risk_confidence', ?4),
+                ('project_risk_active_file_count', ?5),
+                ('project_risk_active_go_file_count', ?6),
+                ('project_risk_scored_file_count', ?7),
+                ('project_risk_coverage_percentage', ?8),
                 ('project_risk_scorer_version', '1')
             ",
             params![
@@ -2553,10 +2580,22 @@ fn materialize_project_risk_summary(
                 assessment.score.to_string(),
                 assessment.risk_band,
                 assessment.confidence,
+                assessment.active_file_count.to_string(),
+                assessment.active_go_file_count.to_string(),
+                assessment.scored_file_count.to_string(),
+                project_risk_coverage_percentage(&assessment).to_string(),
             ],
         )
         .map(|_| ())
         .map_err(StoreReducerError::WriteDatabase)
+}
+
+fn project_risk_coverage_percentage(assessment: &RepoRiskAssessment) -> f64 {
+    assessment
+        .go_score_coverage
+        .unwrap_or(assessment.scoring_coverage)
+        .clamp(0.0, 1.0)
+        * 100.0
 }
 
 fn project_risk_input(
@@ -3715,7 +3754,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_local_go_imports_and_materializes_source_coupling() {
+    fn resolves_local_go_imports_and_materializes_source_coupling_pressure() {
         let fixture = Fixture::new("source-coupling");
         fs::write(fixture.path.join("go.mod"), "module example.com/app\n")
             .expect("go.mod should be written");
@@ -3763,21 +3802,155 @@ mod tests {
         assert_eq!(
             scalar_i64(
                 &connection,
-                "SELECT source_coupling_out FROM file_facts WHERE relative_path = 'src/a.go'",
+                "SELECT source_coupling_pressure_out FROM file_facts WHERE relative_path = 'src/a.go'",
             ),
             2
         );
         assert_eq!(
             scalar_i64(
                 &connection,
-                "SELECT source_coupling_in FROM file_facts WHERE relative_path = 'pkg/service/service.go'",
+                "SELECT source_coupling_pressure_in FROM file_facts WHERE relative_path = 'pkg/service/service.go'",
             ),
             1
         );
         assert_eq!(
             scalar_i64(
                 &connection,
-                "SELECT source_coupling_in FROM file_facts WHERE relative_path = 'pkg/direct/direct.go'",
+                "SELECT source_coupling_pressure_in FROM file_facts WHERE relative_path = 'pkg/direct/direct.go'",
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn resolves_go_import_variants_with_deduplicated_source_coupling_pressure() {
+        let fixture = Fixture::new("source-coupling-variants");
+        fs::write(fixture.path.join("go.mod"), "module example.com/app\n")
+            .expect("go.mod should be written");
+        write_fixture_file(&fixture.path, "cmd/app/main.go");
+        write_fixture_file(&fixture.path, "pkg/service/service.go");
+        write_fixture_file(&fixture.path, "pkg/service/extra.go");
+        write_fixture_file(&fixture.path, "internal/util/util.go");
+
+        let (event_sender, _event_receiver) = mpsc::channel();
+        let reducer =
+            StoreReducer::start(&fixture.path, StoreReducerOptions::default(), event_sender)
+                .expect("reducer should start");
+        let handle = reducer.handle();
+
+        handle
+            .store_file_analysis(file_result_with_imports(
+                fixture.path.join("cmd/app/main.go"),
+                &[
+                    "example.com/app/pkg/service",
+                    "example.com/app/pkg/service",
+                    "internal/util",
+                    "github.com/acme/external",
+                ],
+            ))
+            .expect("source file should enqueue");
+        handle
+            .store_file_analysis(file_result_with_imports(
+                fixture.path.join("pkg/service/service.go"),
+                &[],
+            ))
+            .expect("first service file should enqueue");
+        handle
+            .store_file_analysis(file_result_with_imports(
+                fixture.path.join("pkg/service/extra.go"),
+                &[],
+            ))
+            .expect("second service file should enqueue");
+        handle
+            .store_file_analysis(file_result_with_imports(
+                fixture.path.join("internal/util/util.go"),
+                &[],
+            ))
+            .expect("util file should enqueue");
+
+        reducer.finish().expect("reducer should finish");
+
+        let connection = Connection::open(fixture.db_path()).expect("db should open");
+        assert_eq!(row_count(&connection, "source_dependency_references"), 4);
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT COUNT(*) FROM source_dependency_references WHERE is_resolved = 1",
+            ),
+            3
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT COUNT(*) FROM source_dependency_references WHERE raw_target = 'github.com/acme/external' AND is_resolved = 0",
+            ),
+            1
+        );
+        assert_eq!(row_count(&connection, "source_dependency_edges"), 2);
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT source_coupling_pressure_out FROM file_facts WHERE relative_path = 'cmd/app/main.go'",
+            ),
+            2
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT source_coupling_pressure_in FROM file_facts WHERE relative_path = 'pkg/service/service.go'",
+            ),
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT source_coupling_pressure_in FROM file_facts WHERE relative_path = 'pkg/service/extra.go'",
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn resolves_package_like_go_imports_without_go_mod() {
+        let fixture = Fixture::new("source-coupling-no-module");
+        write_fixture_file(&fixture.path, "src/a.go");
+        write_fixture_file(&fixture.path, "pkg/direct/direct.go");
+
+        let (event_sender, _event_receiver) = mpsc::channel();
+        let reducer =
+            StoreReducer::start(&fixture.path, StoreReducerOptions::default(), event_sender)
+                .expect("reducer should start");
+        let handle = reducer.handle();
+
+        handle
+            .store_file_analysis(file_result_with_imports(
+                fixture.path.join("src/a.go"),
+                &["pkg/direct", "example.com/missing/pkg/direct"],
+            ))
+            .expect("source file should enqueue");
+        handle
+            .store_file_analysis(file_result_with_imports(
+                fixture.path.join("pkg/direct/direct.go"),
+                &[],
+            ))
+            .expect("direct file should enqueue");
+
+        reducer.finish().expect("reducer should finish");
+
+        let connection = Connection::open(fixture.db_path()).expect("db should open");
+        assert_eq!(row_count(&connection, "source_dependency_references"), 2);
+        assert_eq!(row_count(&connection, "source_dependency_edges"), 1);
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT COUNT(*) FROM source_dependency_references WHERE raw_target = 'pkg/direct' AND resolved_package = 'pkg/direct'",
+            ),
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT COUNT(*) FROM source_dependency_references WHERE raw_target = 'example.com/missing/pkg/direct' AND is_resolved = 0",
             ),
             1
         );
@@ -3864,7 +4037,7 @@ mod tests {
         assert_eq!(
             scalar_i64(
                 &connection,
-                "SELECT source_coupling_out FROM file_facts WHERE relative_path = 'src/a.go'",
+                "SELECT source_coupling_pressure_out FROM file_facts WHERE relative_path = 'src/a.go'",
             ),
             1
         );
@@ -3925,7 +4098,7 @@ mod tests {
                 1_200,
                 220,
                 45,
-                true,
+                false,
                 false,
             ))
             .expect("risky go file should enqueue");
@@ -4010,7 +4183,7 @@ mod tests {
                 &connection,
                 "SELECT is_generated FROM file_risk_scores WHERE relative_path = 'risky.go'",
             ),
-            1
+            0
         );
         assert_eq!(
             scalar_i64(
@@ -4065,6 +4238,34 @@ mod tests {
         assert_eq!(
             scalar_text(
                 &connection,
+                "SELECT value FROM stage_metadata WHERE key = 'project_risk_active_file_count'",
+            ),
+            "3"
+        );
+        assert_eq!(
+            scalar_text(
+                &connection,
+                "SELECT value FROM stage_metadata WHERE key = 'project_risk_active_go_file_count'",
+            ),
+            "2"
+        );
+        assert_eq!(
+            scalar_text(
+                &connection,
+                "SELECT value FROM stage_metadata WHERE key = 'project_risk_scored_file_count'",
+            ),
+            "2"
+        );
+        assert_eq!(
+            scalar_text(
+                &connection,
+                "SELECT value FROM stage_metadata WHERE key = 'project_risk_coverage_percentage'",
+            ),
+            "100"
+        );
+        assert_eq!(
+            scalar_text(
+                &connection,
                 "SELECT value FROM stage_metadata WHERE key = 'project_risk_formula_id'",
             ),
             "hotpath.project_risk.go.v1"
@@ -4075,6 +4276,76 @@ mod tests {
                 "SELECT COUNT(*) FROM project_risk_terms WHERE formula_id = 'hotpath.project_risk.go.v1'",
             ),
             5
+        );
+    }
+
+    #[test]
+    fn excludes_generated_and_vendor_go_files_from_risk_scores() {
+        let fixture = Fixture::new("file-risk-generated-vendor");
+        write_fixture_file(&fixture.path, "src/owned.go");
+        write_fixture_file(&fixture.path, "generated/client.go");
+        write_fixture_file(&fixture.path, "vendor/pkg/client.go");
+        let (event_sender, _event_receiver) = mpsc::channel();
+        let reducer =
+            StoreReducer::start(&fixture.path, StoreReducerOptions::default(), event_sender)
+                .expect("reducer should start");
+        let handle = reducer.handle();
+
+        handle
+            .store_file_analysis(go_result_with_metrics(
+                fixture.path.join("src/owned.go"),
+                10,
+                1,
+                1,
+                false,
+                false,
+            ))
+            .expect("owned go file should enqueue");
+        handle
+            .store_file_analysis(go_result_with_metrics(
+                fixture.path.join("generated/client.go"),
+                2_000,
+                500,
+                100,
+                true,
+                false,
+            ))
+            .expect("generated go file should enqueue");
+        handle
+            .store_file_analysis(go_result_with_metrics(
+                fixture.path.join("vendor/pkg/client.go"),
+                2_000,
+                500,
+                100,
+                false,
+                true,
+            ))
+            .expect("vendor go file should enqueue");
+
+        reducer.finish().expect("reducer should finish");
+
+        let connection = Connection::open(fixture.db_path()).expect("db should open");
+        assert_eq!(row_count(&connection, "file_risk_scores"), 1);
+        assert_eq!(
+            scalar_text(
+                &connection,
+                "SELECT relative_path FROM file_risk_scores WHERE rank = 1",
+            ),
+            "src/owned.go"
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT CAST(value AS INTEGER) FROM stage_metadata WHERE key = 'file_risk_scores_materialized'",
+            ),
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT CAST(value AS INTEGER) FROM stage_metadata WHERE key = 'file_risk_excluded_generated_vendor_go_files'",
+            ),
+            2
         );
     }
 
@@ -4176,8 +4447,8 @@ mod tests {
             method_count: 0,
             type_count: 0,
             import_count: 0,
-            cognitive_complexity: None,
-            max_function_complexity: None,
+            complexity_pressure: None,
+            max_function_complexity_pressure: None,
         }
     }
 
@@ -4206,8 +4477,8 @@ mod tests {
     fn go_result_with_metrics(
         path: impl AsRef<Path>,
         line_count: u64,
-        cognitive_complexity: u64,
-        max_function_complexity: u64,
+        complexity_pressure: u64,
+        max_function_complexity_pressure: u64,
         is_generated: bool,
         is_vendor: bool,
     ) -> FileAnalysisResult {
@@ -4216,8 +4487,8 @@ mod tests {
         result.byte_size = Some(line_count * 40);
         result.is_generated = is_generated;
         result.is_vendor = is_vendor;
-        result.cognitive_complexity = Some(cognitive_complexity);
-        result.max_function_complexity = Some(max_function_complexity);
+        result.complexity_pressure = Some(complexity_pressure);
+        result.max_function_complexity_pressure = Some(max_function_complexity_pressure);
         result
     }
 

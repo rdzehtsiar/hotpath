@@ -351,6 +351,28 @@ mod tests {
         }
     }
 
+    fn complexity_for_source(
+        name: &str,
+        source: &str,
+    ) -> crate::pipeline::code_metrics_analyzer::CodeMetricsResult {
+        let fixture = Fixture::new(name);
+        let path = fixture.write("main.go", source);
+        let file = AnalyzedFile::new(
+            path,
+            FileAnalyzerOptions {
+                content_window_bytes: 4096,
+                parsers: Vec::new(),
+            },
+        );
+        let output = GoParser::new().parse(&file);
+        assert!(
+            output.diagnostics.is_empty(),
+            "fixture {name} should parse without diagnostics: {:?}",
+            output.diagnostics
+        );
+        CodeMetricsAnalyzer::new().analyze(&output.metrics_input)
+    }
+
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
@@ -378,6 +400,122 @@ mod tests {
 
         assert_eq!(parser.recognize(&go), ParserRecognition::Recognized);
         assert_eq!(parser.recognize(&rust), ParserRecognition::NotRecognized);
+    }
+
+    #[test]
+    fn go_complexity_pressure_counts_control_flow_approximately() {
+        let cases = [
+            (
+                "if branch",
+                r#"package main
+func f(a bool) {
+    if a {
+    }
+}
+"#,
+                1,
+            ),
+            (
+                "nested if",
+                r#"package main
+func f(a bool, b bool) {
+    if a {
+        if b {
+        }
+    }
+}
+"#,
+                3,
+            ),
+            (
+                "for loop",
+                r#"package main
+func f() {
+    for i := 0; i < 1; i++ {
+    }
+}
+"#,
+                1,
+            ),
+            (
+                "switch cases",
+                r#"package main
+func f(v int) {
+    switch v {
+    case 1:
+    default:
+    }
+}
+"#,
+                5,
+            ),
+            (
+                "select cases",
+                r#"package main
+func f(ch chan int) {
+    select {
+    case <-ch:
+    default:
+    }
+}
+"#,
+                5,
+            ),
+            (
+                "boolean chain",
+                r#"package main
+func f(a bool, b bool) {
+    if a && b {
+    }
+}
+"#,
+                2,
+            ),
+            (
+                "break jump",
+                r#"package main
+func f() {
+    for {
+        break
+    }
+}
+"#,
+                2,
+            ),
+            (
+                "continue jump",
+                r#"package main
+func f() {
+    for {
+        continue
+    }
+}
+"#,
+                2,
+            ),
+            (
+                "goto jump",
+                r#"package main
+func f() {
+    goto end
+end:
+}
+"#,
+                1,
+            ),
+        ];
+
+        for (name, source, expected) in cases {
+            let complexity = complexity_for_source(name, source);
+            assert_eq!(
+                complexity.max_function_complexity_pressure, expected,
+                "{name} approximate max function complexity pressure"
+            );
+            assert_eq!(
+                complexity.complexity_pressure, expected,
+                "{name} approximate file complexity pressure"
+            );
+        }
     }
 
     #[test]
@@ -443,6 +581,6 @@ func (s Service) Run() {
             .symbols
             .iter()
             .any(|symbol| symbol.kind == "interface" && symbol.name == "Runner"));
-        assert!(complexity.cognitive_complexity > 0);
+        assert!(complexity.complexity_pressure > 0);
     }
 }
