@@ -98,8 +98,9 @@ Current Go processing is intentionally limited:
   complexity implementation or a complete model of Go execution semantics.
 - Go file risk scoring is currently limited to active rows whose language is
   `go`.
-- Generated and vendor Go files can still be scored. Their flags are preserved,
-  but they are not excluded by default.
+- Generated and vendor Go files are excluded from Go file risk scoring by
+  default so generated churn or vendored code does not dominate hotspot ranks.
+  Their generated/vendor flags remain stored in file facts for inspection.
 - Project risk is Go-aware only. Repositories with little or no Go receive low
   or unavailable scoring coverage rather than broad repository risk analysis.
 

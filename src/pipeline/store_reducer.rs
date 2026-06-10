@@ -2316,6 +2316,8 @@ fn materialize_file_risk_scores(
             FROM file_facts
             WHERE language_id = 'go'
                 AND relative_path IS NOT NULL
+                AND is_generated = 0
+                AND is_vendor = 0
             ORDER BY relative_path
             ",
         )
@@ -2509,6 +2511,13 @@ fn materialize_file_risk_scores(
             VALUES
                 ('file_risk_formula_id', ?1),
                 ('file_risk_scores_materialized', ?2),
+                ('file_risk_excluded_generated_vendor_go_files', CAST((
+                    SELECT COUNT(*)
+                    FROM file_facts
+                    WHERE language_id = 'go'
+                        AND relative_path IS NOT NULL
+                        AND (is_generated != 0 OR is_vendor != 0)
+                ) AS TEXT)),
                 ('file_risk_scorer_version', '1')
             ",
             params![FORMULA_ID, risk_rows.len().to_string()],
@@ -3854,7 +3863,7 @@ mod tests {
                 1_200,
                 220,
                 45,
-                true,
+                false,
                 false,
             ))
             .expect("risky go file should enqueue");
@@ -3939,7 +3948,7 @@ mod tests {
                 &connection,
                 "SELECT is_generated FROM file_risk_scores WHERE relative_path = 'risky.go'",
             ),
-            1
+            0
         );
         assert_eq!(
             scalar_i64(
@@ -4004,6 +4013,76 @@ mod tests {
                 "SELECT COUNT(*) FROM project_risk_terms WHERE formula_id = 'hotpath.project_risk.go.v1'",
             ),
             5
+        );
+    }
+
+    #[test]
+    fn excludes_generated_and_vendor_go_files_from_risk_scores() {
+        let fixture = Fixture::new("file-risk-generated-vendor");
+        write_fixture_file(&fixture.path, "src/owned.go");
+        write_fixture_file(&fixture.path, "generated/client.go");
+        write_fixture_file(&fixture.path, "vendor/pkg/client.go");
+        let (event_sender, _event_receiver) = mpsc::channel();
+        let reducer =
+            StoreReducer::start(&fixture.path, StoreReducerOptions::default(), event_sender)
+                .expect("reducer should start");
+        let handle = reducer.handle();
+
+        handle
+            .store_file_analysis(go_result_with_metrics(
+                fixture.path.join("src/owned.go"),
+                10,
+                1,
+                1,
+                false,
+                false,
+            ))
+            .expect("owned go file should enqueue");
+        handle
+            .store_file_analysis(go_result_with_metrics(
+                fixture.path.join("generated/client.go"),
+                2_000,
+                500,
+                100,
+                true,
+                false,
+            ))
+            .expect("generated go file should enqueue");
+        handle
+            .store_file_analysis(go_result_with_metrics(
+                fixture.path.join("vendor/pkg/client.go"),
+                2_000,
+                500,
+                100,
+                false,
+                true,
+            ))
+            .expect("vendor go file should enqueue");
+
+        reducer.finish().expect("reducer should finish");
+
+        let connection = Connection::open(fixture.db_path()).expect("db should open");
+        assert_eq!(row_count(&connection, "file_risk_scores"), 1);
+        assert_eq!(
+            scalar_text(
+                &connection,
+                "SELECT relative_path FROM file_risk_scores WHERE rank = 1",
+            ),
+            "src/owned.go"
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT CAST(value AS INTEGER) FROM stage_metadata WHERE key = 'file_risk_scores_materialized'",
+            ),
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT CAST(value AS INTEGER) FROM stage_metadata WHERE key = 'file_risk_excluded_generated_vendor_go_files'",
+            ),
+            2
         );
     }
 
