@@ -70,12 +70,12 @@ impl FileAnalyzer {
             import_count: parser_metrics
                 .as_ref()
                 .map_or(0, |metrics| metrics.import_count),
-            cognitive_complexity: parser_metrics
+            complexity_pressure: parser_metrics
                 .as_ref()
-                .map(|metrics| metrics.cognitive_complexity),
-            max_function_complexity: parser_metrics
+                .map(|metrics| metrics.complexity_pressure),
+            max_function_complexity_pressure: parser_metrics
                 .as_ref()
-                .map(|metrics| metrics.max_function_complexity),
+                .map(|metrics| metrics.max_function_complexity_pressure),
         }
     }
 
@@ -177,8 +177,8 @@ pub struct FileAnalysisResult {
     pub method_count: u64,
     pub type_count: u64,
     pub import_count: u64,
-    pub cognitive_complexity: Option<u64>,
-    pub max_function_complexity: Option<u64>,
+    pub complexity_pressure: Option<u64>,
+    pub max_function_complexity_pressure: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,8 +302,8 @@ struct ParserMetrics {
     method_count: u64,
     type_count: u64,
     import_count: u64,
-    cognitive_complexity: u64,
-    max_function_complexity: u64,
+    complexity_pressure: u64,
+    max_function_complexity_pressure: u64,
 }
 
 fn parser_metrics(output: &ParserOutput) -> ParserMetrics {
@@ -324,8 +324,8 @@ fn parser_metrics(output: &ParserOutput) -> ParserMetrics {
             .iter()
             .filter(|reference| reference.kind == "import")
             .count() as u64,
-        cognitive_complexity: complexity.cognitive_complexity,
-        max_function_complexity: complexity.max_function_complexity,
+        complexity_pressure: complexity.complexity_pressure,
+        max_function_complexity_pressure: complexity.max_function_complexity_pressure,
     }
 }
 
@@ -690,8 +690,8 @@ mod tests {
         assert_eq!(result.type_count, 1);
         assert_eq!(result.import_count, 1);
         assert!(result.symbol_count >= 2);
-        assert_eq!(result.cognitive_complexity, Some(1));
-        assert_eq!(result.max_function_complexity, Some(1));
+        assert_eq!(result.complexity_pressure, Some(1));
+        assert_eq!(result.max_function_complexity_pressure, Some(1));
     }
 
     #[test]

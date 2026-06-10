@@ -5,7 +5,7 @@ use crate::languages::{
 };
 
 #[derive(Debug, Default)]
-/// Computes language-neutral complexity metrics from universal source facts.
+/// Computes approximate language-neutral complexity-pressure signals from universal source facts.
 pub struct CodeMetricsAnalyzer;
 
 impl CodeMetricsAnalyzer {
@@ -14,26 +14,27 @@ impl CodeMetricsAnalyzer {
     }
 
     pub fn analyze(&self, input: &UniversalCodeMetricsInput) -> CodeMetricsResult {
-        let mut cognitive_complexity = 0;
-        let mut max_function_complexity = 0;
+        let mut complexity_pressure = 0;
+        let mut max_function_complexity_pressure = 0;
 
         for function in &input.functions {
             let function_complexity = complexity_for_nodes(&function.control_flow, 0);
-            cognitive_complexity += function_complexity;
-            max_function_complexity = max_function_complexity.max(function_complexity);
+            complexity_pressure += function_complexity;
+            max_function_complexity_pressure =
+                max_function_complexity_pressure.max(function_complexity);
         }
 
         CodeMetricsResult {
-            cognitive_complexity,
-            max_function_complexity,
+            complexity_pressure,
+            max_function_complexity_pressure,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CodeMetricsResult {
-    pub cognitive_complexity: u64,
-    pub max_function_complexity: u64,
+    pub complexity_pressure: u64,
+    pub max_function_complexity_pressure: u64,
 }
 
 fn complexity_for_nodes(nodes: &[UniversalControlFlowNode], nesting: u64) -> u64 {
@@ -73,8 +74,8 @@ mod tests {
     fn empty_input_has_zero_complexity() {
         let result = CodeMetricsAnalyzer::new().analyze(&UniversalCodeMetricsInput::default());
 
-        assert_eq!(result.cognitive_complexity, 0);
-        assert_eq!(result.max_function_complexity, 0);
+        assert_eq!(result.complexity_pressure, 0);
+        assert_eq!(result.max_function_complexity_pressure, 0);
     }
 
     #[test]
@@ -92,8 +93,8 @@ mod tests {
 
         let result = CodeMetricsAnalyzer::new().analyze(&input);
 
-        assert_eq!(result.cognitive_complexity, 3);
-        assert_eq!(result.max_function_complexity, 3);
+        assert_eq!(result.complexity_pressure, 3);
+        assert_eq!(result.max_function_complexity_pressure, 3);
     }
 
     #[test]
@@ -115,8 +116,8 @@ mod tests {
 
         let result = CodeMetricsAnalyzer::new().analyze(&input);
 
-        assert_eq!(result.cognitive_complexity, 2);
-        assert_eq!(result.max_function_complexity, 1);
+        assert_eq!(result.complexity_pressure, 2);
+        assert_eq!(result.max_function_complexity_pressure, 1);
     }
 
     fn node(

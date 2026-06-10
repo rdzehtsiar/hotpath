@@ -86,14 +86,14 @@ Current Go processing is intentionally limited:
 - Symbol output does not currently include source ranges, signatures, receiver
   details, package docs, comments, call sites, or full type information.
 - Import extraction records string-literal import targets.
-- Approximate source coupling is derived from resolved local Go import edges.
+- `source_coupling_pressure` is derived from resolved local Go import edges.
   It is a directional coordination-risk signal, not a complete dependency
   graph, build graph, runtime graph, or call graph.
 - Go source dependency resolution is conservative and package-path based. It
   uses the local `go.mod` module prefix when present and active Go file
   directories as known packages. External imports and imports that cannot be
   matched to a known local package are left unresolved.
-- Approximate cognitive complexity is derived from parsed Go control-flow
+- `complexity_pressure` is derived from parsed Go control-flow
   syntax. It is a hotspot-ranking signal, not a spec-correct cyclomatic
   complexity implementation or a complete model of Go execution semantics.
 - Go file risk scoring is currently limited to active rows whose language is
@@ -137,7 +137,8 @@ Current Git processing is also limited:
   policy.
 - Commits touching more than 100 files are skipped for co-change pair
   generation, while their churn and authorship rows can still be recorded.
-- Co-change is file-pair breadth from commits, not semantic coupling.
+- Co-change is file-pair breadth from commits, not semantic coupling. Hotpath
+  reports co-change pressure and source coupling pressure as advisory signals.
 - Git metrics are stored as derived cache data and are not a stable public
   schema.
 
@@ -168,7 +169,7 @@ Hotpath is being built toward answering questions such as:
 
 - which files combine high churn, large size, and concentrated operational ownership
 - which modules are growing fastest
-- where complexity or coupling is concentrating
+- where complexity pressure or source coupling pressure is concentrating
 - which changes touch known hotspots
 - how much of a repo is expensive to load into AI coding context
 - whether architecture rules are drifting
