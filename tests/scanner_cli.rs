@@ -88,6 +88,53 @@ fn scan_prints_file_and_git_progress_summary() {
 }
 
 #[test]
+fn scan_tags_go_test_files_in_index_facts_and_risk_rows() {
+    let fixture = Fixture::new("scan-go-test-files");
+    fixture.write("service.go", "package main\n\nfunc Service() {}\n");
+    fixture.write("service_test.go", "package main\n\nfunc TestService() {}\n");
+
+    let output = hotpath(&["scan"], &fixture.path);
+
+    assert!(
+        output.status.success(),
+        "hotpath failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let connection =
+        Connection::open(fixture.path.join(".hotpath").join("index.sqlite")).expect("db opens");
+    assert_eq!(
+        scalar_i64(
+            &connection,
+            "SELECT is_test FROM file_analysis WHERE relative_path = 'service_test.go'",
+        ),
+        1
+    );
+    assert_eq!(
+        scalar_i64(
+            &connection,
+            "SELECT is_test FROM file_facts WHERE relative_path = 'service_test.go'",
+        ),
+        1
+    );
+    assert_eq!(
+        scalar_i64(
+            &connection,
+            "SELECT is_test FROM file_risk_scores WHERE relative_path = 'service_test.go'",
+        ),
+        1
+    );
+    assert_eq!(
+        scalar_i64(
+            &connection,
+            "SELECT is_test FROM file_facts WHERE relative_path = 'service.go'",
+        ),
+        0
+    );
+}
+
+#[test]
 fn scan_respects_ignore_rules_in_file_count() {
     let fixture = GitFixture::new("scan-ignore");
     fixture.write(".gitignore", "ignored.go\n");

@@ -73,6 +73,9 @@ language-derived metrics or Go file risk scores.
 Current Go processing is intentionally limited:
 
 - Go recognition is extension-based: only paths ending in `.go` are considered.
+- Go files ending in `_test.go` are tagged as test files in the local index so
+  their churn, size, and complexity can be interpreted separately from
+  production source files.
 - Go files must be readable as UTF-8 text.
 - Files larger than the active content window are not parsed. The default
   content window is 1 MiB.

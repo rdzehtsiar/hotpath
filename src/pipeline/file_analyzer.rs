@@ -37,6 +37,7 @@ impl FileAnalyzer {
         let window = file.first_content_window();
         let mut diagnostics = window.diagnostics.clone();
         let parser = self.parse(&file);
+        append_parser_notes(&mut diagnostics, parser.output.as_ref());
         let line_count = line_count_from_window(&window, &mut diagnostics);
         let parser_metrics = parser.output.as_ref().map(parser_metrics);
 
@@ -48,6 +49,7 @@ impl FileAnalyzer {
             line_count,
             is_generated: is_generated_file(file.path(), &window),
             is_vendor: is_vendor_path(file.path()),
+            is_test: is_test_path(file.path()),
             diagnostics,
             parser_status: parser.status,
             parser_output: parser.output,
@@ -142,7 +144,7 @@ impl Default for FileAnalyzerOptions {
 
 pub fn file_analyzer_options_signature(options: &FileAnalyzerOptions) -> String {
     format!(
-        "file-local-v3-source-refs;content-window={};parsers={}",
+        "file-local-v4-test-files;content-window={};parsers={}",
         options.content_window_bytes,
         options
             .parsers
@@ -167,6 +169,7 @@ pub struct FileAnalysisResult {
     pub line_count: Option<u64>,
     pub is_generated: bool,
     pub is_vendor: bool,
+    pub is_test: bool,
     pub diagnostics: Vec<FileDiagnostic>,
     pub parser_status: FileParserStatus,
     pub parser_output: Option<ParserOutput>,
@@ -306,6 +309,21 @@ struct ParserMetrics {
     max_function_complexity_pressure: u64,
 }
 
+fn append_parser_notes(diagnostics: &mut Vec<FileDiagnostic>, output: Option<&ParserOutput>) {
+    let Some(output) = output else {
+        return;
+    };
+
+    diagnostics.extend(output.diagnostics.iter().map(|diagnostic| FileDiagnostic {
+        code: diagnostic.code.clone(),
+        message: diagnostic.message.clone(),
+    }));
+    diagnostics.extend(output.limitations.iter().map(|limitation| FileDiagnostic {
+        code: limitation.code.clone(),
+        message: limitation.message.clone(),
+    }));
+}
+
 fn parser_metrics(output: &ParserOutput) -> ParserMetrics {
     let complexity = CodeMetricsAnalyzer::new().analyze(&output.metrics_input);
 
@@ -428,6 +446,12 @@ fn is_vendor_path(path: &Path) -> bool {
             ],
         )
     })
+}
+
+fn is_test_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|file_name| file_name.to_str())
+        .is_some_and(|file_name| file_name.to_ascii_lowercase().ends_with("_test.go"))
 }
 
 fn is_generated_file(path: &Path, window: &FileContentWindow) -> bool {
@@ -670,6 +694,48 @@ mod tests {
     }
 
     #[test]
+    fn default_go_parser_surfaces_parser_diagnostics_in_file_result() {
+        let fixture = Fixture::new("go-parser-diagnostics");
+        let invalid_path = fixture.write("bad.go", &[b'a', 0xff]);
+        let truncated_path = fixture.write("large.go", b"package main\nfunc main() {}\n");
+        let invalid_result = FileAnalyzer::new().analyze(FileAnalysisInput { path: invalid_path });
+        let truncated_result = FileAnalyzer::with_options(FileAnalyzerOptions {
+            content_window_bytes: 8,
+            ..FileAnalyzerOptions::default()
+        })
+        .analyze(FileAnalysisInput {
+            path: truncated_path,
+        });
+
+        assert_eq!(invalid_result.parser_status, FileParserStatus::Parsed);
+        assert_eq!(invalid_result.language_id.as_deref(), Some("go"));
+        assert!(invalid_result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "invalid_utf8"));
+        assert!(invalid_result
+            .parser_output
+            .as_ref()
+            .is_some_and(|output| output
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "invalid_utf8")));
+
+        assert_eq!(truncated_result.language_id.as_deref(), Some("go"));
+        assert!(truncated_result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "truncated_source"));
+        assert!(truncated_result
+            .parser_output
+            .as_ref()
+            .is_some_and(|output| output
+                .limitations
+                .iter()
+                .any(|limitation| limitation.code == "truncated_source")));
+    }
+
+    #[test]
     fn analyzer_classifies_generated_and_vendor_files() {
         let fixture = Fixture::new("path-classification");
         let generated_path = fixture.write("generated/client.go", b"package generated\n");
@@ -693,6 +759,25 @@ mod tests {
         assert!(generated_comment.is_generated);
         assert!(!generated_comment.is_vendor);
         assert!(vendor.is_vendor);
+    }
+
+    #[test]
+    fn analyzer_tags_go_test_files() {
+        let fixture = Fixture::new("test-file-classification");
+        let test_path = fixture.write("service_test.go", b"package main\n");
+        let regular_path = fixture.write("service.go", b"package main\n");
+        let similarly_named_path = fixture.write("service_test.rs", b"fn main() {}\n");
+        let analyzer = FileAnalyzer::new();
+
+        let test_file = analyzer.analyze(FileAnalysisInput { path: test_path });
+        let regular_file = analyzer.analyze(FileAnalysisInput { path: regular_path });
+        let similarly_named = analyzer.analyze(FileAnalysisInput {
+            path: similarly_named_path,
+        });
+
+        assert!(test_file.is_test);
+        assert!(!regular_file.is_test);
+        assert!(!similarly_named.is_test);
     }
 
     #[test]

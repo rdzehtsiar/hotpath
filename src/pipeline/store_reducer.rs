@@ -13,9 +13,7 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::pipeline::events::PipelineEvent;
-use crate::pipeline::file_analyzer::{
-    ContentKind, FileAnalysisResult, FileDiagnostic, FileParserStatus,
-};
+use crate::pipeline::file_analyzer::{ContentKind, FileAnalysisResult, FileParserStatus};
 use crate::pipeline::file_risk_assessor::{
     FileRiskAssessment, FileRiskAssessor, FileRiskInput, RepositoryRiskContext, FORMULA_ID,
 };
@@ -713,6 +711,7 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
                 line_count INTEGER,
                 is_generated INTEGER NOT NULL,
                 is_vendor INTEGER NOT NULL,
+                is_test INTEGER NOT NULL DEFAULT 0,
                 parser_status TEXT NOT NULL,
                 parser_recognition_attempts INTEGER NOT NULL,
                 language_id TEXT,
@@ -877,6 +876,7 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
                 line_count INTEGER,
                 is_generated INTEGER NOT NULL,
                 is_vendor INTEGER NOT NULL,
+                is_test INTEGER NOT NULL DEFAULT 0,
                 parser_status TEXT NOT NULL,
                 parser_recognition_attempts INTEGER NOT NULL,
                 language_id TEXT,
@@ -927,6 +927,7 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
                 risk_band TEXT NOT NULL,
                 is_generated INTEGER NOT NULL,
                 is_vendor INTEGER NOT NULL,
+                is_test INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (relative_path, formula_id)
             );
 
@@ -1092,6 +1093,12 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
         "is_active",
         "INTEGER NOT NULL DEFAULT 1",
     )?;
+    add_column_if_missing(
+        connection,
+        "file_analysis",
+        "is_test",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     add_column_if_missing(connection, "file_analysis", "language_id", "TEXT")?;
     add_column_if_missing(
         connection,
@@ -1134,6 +1141,12 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
         "file_analysis",
         "max_function_complexity_pressure",
         "INTEGER",
+    )?;
+    add_column_if_missing(
+        connection,
+        "file_facts",
+        "is_test",
+        "INTEGER NOT NULL DEFAULT 0",
     )?;
     add_column_if_missing(connection, "file_facts", "language_id", "TEXT")?;
     add_column_if_missing(
@@ -1184,6 +1197,12 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
         "file_facts",
         "source_coupling_pressure_out",
         "INTEGER",
+    )?;
+    add_column_if_missing(
+        connection,
+        "file_risk_scores",
+        "is_test",
+        "INTEGER NOT NULL DEFAULT 0",
     )?;
     add_column_if_missing(
         connection,
@@ -1365,6 +1384,7 @@ fn flush_batch(
                     line_count,
                     is_generated,
                     is_vendor,
+                    is_test,
                     parser_status,
                     parser_recognition_attempts,
                     language_id,
@@ -1376,7 +1396,7 @@ fn flush_batch(
                     complexity_pressure,
                     max_function_complexity_pressure,
                     diagnostics
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
                 ",
             )
             .map_err(StoreReducerError::WriteDatabase)?;
@@ -1400,6 +1420,7 @@ fn flush_batch(
                     result.line_count.map(|value| value as i64),
                     bool_to_i64(result.is_generated),
                     bool_to_i64(result.is_vendor),
+                    bool_to_i64(result.is_test),
                     parser_status_name(result.parser_status),
                     result.parser_recognition_attempts as i64,
                     result.language_id.as_deref(),
@@ -1412,7 +1433,7 @@ fn flush_batch(
                     result
                         .max_function_complexity_pressure
                         .map(|value| value as i64),
-                    diagnostics_json(&result.diagnostics),
+                    diagnostics_json(result),
                 ])
                 .map_err(StoreReducerError::WriteDatabase)?;
         }
@@ -2010,6 +2031,7 @@ fn finalize_source_dependencies(
             WHERE is_active = 1
                 AND language_id = 'go'
                 AND relative_path IS NOT NULL
+            ORDER BY relative_path ASC
             ",
         )
         .map_err(StoreReducerError::WriteDatabase)?;
@@ -2236,6 +2258,7 @@ fn materialize_file_facts(
                 line_count,
                 is_generated,
                 is_vendor,
+                is_test,
                 parser_status,
                 parser_recognition_attempts,
                 language_id,
@@ -2276,6 +2299,7 @@ fn materialize_file_facts(
                 file_analysis.line_count,
                 file_analysis.is_generated,
                 file_analysis.is_vendor,
+                file_analysis.is_test,
                 file_analysis.parser_status,
                 file_analysis.parser_recognition_attempts,
                 file_analysis.language_id,
@@ -2325,7 +2349,8 @@ fn materialize_file_facts(
                 GROUP BY source_path
             ) source_out
                 ON file_analysis.relative_path = source_out.source_path
-            WHERE file_analysis.is_active = 1;
+            WHERE file_analysis.is_active = 1
+            ORDER BY file_analysis.relative_path ASC;
 
             INSERT OR REPLACE INTO stage_metadata (key, value)
             VALUES
@@ -2343,6 +2368,7 @@ struct FileRiskRow {
     active_scan_id: i64,
     is_generated: bool,
     is_vendor: bool,
+    is_test: bool,
     input: FileRiskInput,
     assessment: FileRiskAssessment,
 }
@@ -2363,6 +2389,7 @@ fn materialize_file_risk_scores(
                 line_count,
                 is_generated,
                 is_vendor,
+                is_test,
                 total_churn_lines,
                 recent_churn_lines,
                 owner_count,
@@ -2389,17 +2416,17 @@ fn materialize_file_risk_scores(
                 relative_path: relative_path.clone(),
                 line_count: optional_i64_to_u64(row.get::<_, Option<i64>>(4)?),
                 byte_size: optional_i64_to_u64(row.get::<_, Option<i64>>(3)?),
-                total_churn_lines: i64_to_u64(row.get::<_, i64>(7)?),
-                recent_churn_lines: i64_to_u64(row.get::<_, i64>(8)?),
-                owner_count: optional_i64_to_u64(row.get::<_, Option<i64>>(9)?),
-                dominant_owner_share: row.get::<_, Option<f64>>(10)?,
-                co_changed_file_count: i64_to_u64(row.get::<_, i64>(11)?),
-                file_age_days: optional_i64_to_u64(row.get::<_, Option<i64>>(12)?),
-                source_coupling_pressure_in: optional_i64_to_u64(row.get::<_, Option<i64>>(13)?),
-                source_coupling_pressure_out: optional_i64_to_u64(row.get::<_, Option<i64>>(14)?),
-                complexity_pressure: optional_i64_to_u64(row.get::<_, Option<i64>>(15)?),
+                total_churn_lines: i64_to_u64(row.get::<_, i64>(8)?),
+                recent_churn_lines: i64_to_u64(row.get::<_, i64>(9)?),
+                owner_count: optional_i64_to_u64(row.get::<_, Option<i64>>(10)?),
+                dominant_owner_share: row.get::<_, Option<f64>>(11)?,
+                co_changed_file_count: i64_to_u64(row.get::<_, i64>(12)?),
+                file_age_days: optional_i64_to_u64(row.get::<_, Option<i64>>(13)?),
+                source_coupling_pressure_in: optional_i64_to_u64(row.get::<_, Option<i64>>(14)?),
+                source_coupling_pressure_out: optional_i64_to_u64(row.get::<_, Option<i64>>(15)?),
+                complexity_pressure: optional_i64_to_u64(row.get::<_, Option<i64>>(16)?),
                 max_function_complexity_pressure: optional_i64_to_u64(
-                    row.get::<_, Option<i64>>(16)?,
+                    row.get::<_, Option<i64>>(17)?,
                 ),
             };
             Ok(FileRiskRow {
@@ -2408,6 +2435,7 @@ fn materialize_file_risk_scores(
                 active_scan_id: row.get(2)?,
                 is_generated: row.get::<_, i64>(5)? != 0,
                 is_vendor: row.get::<_, i64>(6)? != 0,
+                is_test: row.get::<_, i64>(7)? != 0,
                 input,
                 assessment: FileRiskAssessment {
                     formula_id: FORMULA_ID,
@@ -2461,8 +2489,9 @@ fn materialize_file_risk_scores(
                     risk_10,
                     risk_band,
                     is_generated,
-                    is_vendor
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    is_vendor,
+                    is_test
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                 ",
             )
             .map_err(StoreReducerError::WriteDatabase)?;
@@ -2522,6 +2551,7 @@ fn materialize_file_risk_scores(
                     risk_row.assessment.risk_band,
                     bool_to_i64(risk_row.is_generated),
                     bool_to_i64(risk_row.is_vendor),
+                    bool_to_i64(risk_row.is_test),
                 ])
                 .map_err(StoreReducerError::WriteDatabase)?;
 
@@ -3730,8 +3760,9 @@ fn parser_status_name(status: FileParserStatus) -> &'static str {
     }
 }
 
-fn diagnostics_json(diagnostics: &[FileDiagnostic]) -> String {
-    let diagnostics: Vec<_> = diagnostics
+fn diagnostics_json(result: &FileAnalysisResult) -> String {
+    let mut diagnostics: Vec<_> = result
+        .diagnostics
         .iter()
         .map(|diagnostic| {
             json!({
@@ -3740,7 +3771,33 @@ fn diagnostics_json(diagnostics: &[FileDiagnostic]) -> String {
             })
         })
         .collect();
+
+    if let Some(parser_output) = result.parser_output.as_ref() {
+        for diagnostic in &parser_output.diagnostics {
+            push_diagnostic_json(&mut diagnostics, &diagnostic.code, &diagnostic.message);
+        }
+        for limitation in &parser_output.limitations {
+            push_diagnostic_json(&mut diagnostics, &limitation.code, &limitation.message);
+        }
+    }
+
     serde_json::to_string(&diagnostics).unwrap_or_else(|_| "[]".to_owned())
+}
+
+fn push_diagnostic_json(diagnostics: &mut Vec<serde_json::Value>, code: &str, message: &str) {
+    let exists = diagnostics.iter().any(|diagnostic| {
+        diagnostic.get("code").and_then(serde_json::Value::as_str) == Some(code)
+            && diagnostic
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                == Some(message)
+    });
+    if !exists {
+        diagnostics.push(json!({
+            "code": code,
+            "message": message,
+        }));
+    }
 }
 
 fn bool_to_i64(value: bool) -> i64 {
@@ -3763,7 +3820,10 @@ mod tests {
     use super::{
         GitRepositorySummaryInput, StoreReducer, StoreReducerOptions, DEFAULT_STORE_QUEUE_CAPACITY,
     };
-    use crate::languages::{ParserOutput, UniversalCodeMetricsInput, UniversalReference};
+    use crate::languages::{
+        ParserDiagnostic, ParserLimitation, ParserOutput, UniversalCodeMetricsInput,
+        UniversalReference,
+    };
     use crate::pipeline::events::PipelineEvent;
     use crate::pipeline::file_analyzer::{ContentKind, FileAnalysisResult, FileParserStatus};
     use crate::pipeline::git_history_analyzer::{
@@ -3889,6 +3949,49 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn stores_parser_diagnostics_and_limitations_in_index_diagnostics() {
+        let fixture = Fixture::new("parser-diagnostics");
+        let (event_sender, _event_receiver) = mpsc::channel();
+        let reducer =
+            StoreReducer::start(&fixture.path, StoreReducerOptions::default(), event_sender)
+                .expect("reducer should start");
+        let mut result = file_result("bad.go");
+        result.parser_status = FileParserStatus::Parsed;
+        result.language_id = Some("go".to_owned());
+        result.parser_output = Some(ParserOutput {
+            language_id: "go".to_owned(),
+            symbols: Vec::new(),
+            references: Vec::new(),
+            metrics_input: UniversalCodeMetricsInput::default(),
+            diagnostics: vec![ParserDiagnostic {
+                code: "parse_error".to_owned(),
+                message: "Go source contains syntax errors".to_owned(),
+            }],
+            limitations: vec![ParserLimitation {
+                code: "truncated_source".to_owned(),
+                message: "Go parser skipped content beyond the active file window".to_owned(),
+            }],
+        });
+
+        reducer
+            .handle()
+            .store_file_analysis(result)
+            .expect("file result should enqueue");
+        reducer.finish().expect("reducer should finish");
+
+        let connection = Connection::open(fixture.db_path()).expect("db should open");
+        let diagnostics: String = connection
+            .query_row(
+                "SELECT diagnostics FROM file_analysis WHERE relative_path = 'bad.go'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("diagnostics should be stored");
+        assert!(diagnostics.contains("parse_error"));
+        assert!(diagnostics.contains("truncated_source"));
     }
 
     #[test]
@@ -4459,6 +4562,50 @@ mod tests {
     }
 
     #[test]
+    fn materialized_package_and_file_lists_are_path_sorted() {
+        let fixture = Fixture::new("deterministic-lists");
+        write_fixture_file(&fixture.path, "zeta/z.go");
+        write_fixture_file(&fixture.path, "alpha/a.go");
+
+        let (event_sender, _event_receiver) = mpsc::channel();
+        let reducer =
+            StoreReducer::start(&fixture.path, StoreReducerOptions::default(), event_sender)
+                .expect("reducer should start");
+        let handle = reducer.handle();
+
+        handle
+            .store_file_analysis(file_result_with_imports(
+                fixture.path.join("zeta/z.go"),
+                &[],
+            ))
+            .expect("zeta file should enqueue");
+        handle
+            .store_file_analysis(file_result_with_imports(
+                fixture.path.join("alpha/a.go"),
+                &[],
+            ))
+            .expect("alpha file should enqueue");
+
+        reducer.finish().expect("reducer should finish");
+
+        let connection = Connection::open(fixture.db_path()).expect("db should open");
+        assert_eq!(
+            text_rows(
+                &connection,
+                "SELECT file_path FROM source_file_packages ORDER BY rowid"
+            ),
+            vec!["alpha/a.go".to_owned(), "zeta/z.go".to_owned()]
+        );
+        assert_eq!(
+            text_rows(
+                &connection,
+                "SELECT relative_path FROM file_facts ORDER BY rowid"
+            ),
+            vec!["alpha/a.go".to_owned(), "zeta/z.go".to_owned()]
+        );
+    }
+
+    #[test]
     fn materializes_go_file_risk_scores_with_terms_facts_and_flags() {
         let fixture = Fixture::new("file-risk");
         write_fixture_file(&fixture.path, "risky.go");
@@ -4659,6 +4806,51 @@ mod tests {
     }
 
     #[test]
+    fn materialized_risk_rows_break_score_ties_by_path() {
+        let fixture = Fixture::new("file-risk-tie-sort");
+        write_fixture_file(&fixture.path, "zeta.go");
+        write_fixture_file(&fixture.path, "alpha.go");
+
+        let (event_sender, _event_receiver) = mpsc::channel();
+        let reducer =
+            StoreReducer::start(&fixture.path, StoreReducerOptions::default(), event_sender)
+                .expect("reducer should start");
+        let handle = reducer.handle();
+
+        handle
+            .store_file_analysis(go_result_with_metrics(
+                fixture.path.join("zeta.go"),
+                100,
+                10,
+                3,
+                false,
+                false,
+            ))
+            .expect("zeta go file should enqueue");
+        handle
+            .store_file_analysis(go_result_with_metrics(
+                fixture.path.join("alpha.go"),
+                100,
+                10,
+                3,
+                false,
+                false,
+            ))
+            .expect("alpha go file should enqueue");
+
+        reducer.finish().expect("reducer should finish");
+
+        let connection = Connection::open(fixture.db_path()).expect("db should open");
+        assert_eq!(
+            text_rows(
+                &connection,
+                "SELECT relative_path FROM file_risk_scores ORDER BY rank ASC",
+            ),
+            vec!["alpha.go".to_owned(), "zeta.go".to_owned()]
+        );
+    }
+
+    #[test]
     fn excludes_generated_and_vendor_go_files_from_risk_scores() {
         let fixture = Fixture::new("file-risk-generated-vendor");
         write_fixture_file(&fixture.path, "src/owned.go");
@@ -4816,6 +5008,7 @@ mod tests {
             line_count: Some(1),
             is_generated: false,
             is_vendor: false,
+            is_test: false,
             diagnostics: Vec::new(),
             parser_status: FileParserStatus::Unsupported,
             parser_output: None,
@@ -4900,6 +5093,14 @@ mod tests {
         connection
             .query_row(sql, [], |row| row.get(0))
             .expect("scalar query should run")
+    }
+
+    fn text_rows(connection: &Connection, sql: &str) -> Vec<String> {
+        let mut statement = connection.prepare(sql).expect("text rows should prepare");
+        let rows = statement
+            .query_map([], |row| row.get(0))
+            .expect("text rows should query");
+        rows.map(|row| row.expect("text row should read")).collect()
     }
 
     fn scalar_f64(connection: &Connection, sql: &str) -> f64 {

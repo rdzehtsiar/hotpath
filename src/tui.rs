@@ -151,6 +151,7 @@ pub struct RiskRow {
     pub terms: Vec<RiskTerm>,
     pub facts: Vec<RiskFact>,
     pub limitations: Vec<RiskLimitation>,
+    pub parser_diagnostics: Vec<RiskLimitation>,
     pub owners: Vec<RiskOwner>,
     pub tags: Vec<String>,
 }
@@ -749,6 +750,22 @@ fn inspector_lines(row: &RiskRow, width: u16) -> Vec<Line<'static>> {
         lines.push(Line::styled(tags, style(TuiSeverity::Muted)));
     }
 
+    if !row.parser_diagnostics.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(section_divider(width));
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "Parser diagnostics",
+            style(TuiSeverity::Medium).add_modifier(Modifier::BOLD),
+        ));
+        for diagnostic in &row.parser_diagnostics {
+            lines.push(Line::styled(
+                format!("  - {}: {}", diagnostic.code, diagnostic.message),
+                style(TuiSeverity::Muted),
+            ));
+        }
+    }
+
     lines.push(Line::raw(""));
     lines.push(section_divider(width));
     lines.extend(risk_driver_lines(row));
@@ -865,11 +882,12 @@ fn load_risk_rows(connection: &Connection) -> rusqlite::Result<Vec<RiskRow>> {
             facts.dominant_owner,
             facts.dominant_owner_share,
             facts.owner_count,
-            facts.author_count
+            facts.author_count,
+            facts.diagnostics
         FROM file_risk_scores score
         LEFT JOIN file_facts facts
             ON facts.relative_path = score.relative_path
-        ORDER BY score.rank ASC
+        ORDER BY score.score DESC, score.relative_path ASC
         ",
     )?;
     let rows = statement.query_map([], |row| {
@@ -901,6 +919,7 @@ fn load_risk_rows(connection: &Connection) -> rusqlite::Result<Vec<RiskRow>> {
             terms: Vec::new(),
             facts: Vec::new(),
             limitations: Vec::new(),
+            parser_diagnostics: parse_diagnostics_json(row.get::<_, String>(24)?.as_str()),
             owners: Vec::new(),
             tags: Vec::new(),
         })
@@ -1017,6 +1036,22 @@ fn load_owners(connection: &Connection) -> rusqlite::Result<BTreeMap<String, Vec
     Ok(grouped)
 }
 
+fn parse_diagnostics_json(value: &str) -> Vec<RiskLimitation> {
+    let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(value) else {
+        return Vec::new();
+    };
+
+    items
+        .into_iter()
+        .filter_map(|item| {
+            Some(RiskLimitation {
+                code: item.get("code")?.as_str()?.to_owned(),
+                message: item.get("message")?.as_str()?.to_owned(),
+            })
+        })
+        .collect()
+}
+
 fn find_index_root(current_dir: &Path) -> Option<PathBuf> {
     current_dir
         .ancestors()
@@ -1035,6 +1070,9 @@ fn inspector_tags(row: &RiskRow) -> Vec<String> {
     }
     if row.is_vendor {
         signals.push(("VENDOR", 1.0, 10));
+    }
+    if !row.parser_diagnostics.is_empty() {
+        signals.push(("PARSER", 1.0, 95));
     }
     for term in &row.terms {
         let value = term.normalized_value.unwrap_or_default();
@@ -1661,7 +1699,34 @@ mod tests {
         assert_eq!(snapshot.rows[0].terms.len(), 2);
         assert_eq!(snapshot.rows[0].facts.len(), 1);
         assert_eq!(snapshot.rows[0].limitations.len(), 1);
+        assert_eq!(snapshot.rows[0].parser_diagnostics.len(), 1);
+        assert_eq!(snapshot.rows[0].parser_diagnostics[0].code, "parse_error");
         assert_eq!(snapshot.rows[0].owners.len(), 1);
+    }
+
+    #[test]
+    fn loads_risk_rows_by_score_descending_then_path_ascending() {
+        let fixture = Fixture::new("risk-sort");
+        create_tui_db(&fixture.db_path());
+        let connection = Connection::open(fixture.db_path()).expect("db should open");
+        connection
+            .execute(
+                "UPDATE file_risk_scores SET rank = 1, score = 0.8, risk_10 = 8.0 WHERE relative_path = 'src/safe.go'",
+                [],
+            )
+            .expect("safe row should update");
+        connection
+            .execute(
+                "UPDATE file_risk_scores SET rank = 2, score = 0.8, risk_10 = 8.0 WHERE relative_path = 'src/risky.go'",
+                [],
+            )
+            .expect("risky row should update");
+
+        let snapshot = TuiDatabaseSnapshot::load_from_dir(&fixture.path);
+
+        assert_eq!(snapshot.rows.len(), 2);
+        assert_eq!(snapshot.rows[0].relative_path, "src/risky.go");
+        assert_eq!(snapshot.rows[1].relative_path, "src/safe.go");
     }
 
     #[test]
@@ -1717,6 +1782,8 @@ mod tests {
         assert!(output.contains("Inspector"));
         assert!(output.contains("src/risky.go"));
         assert!(output.contains("CHURN"));
+        assert!(output.contains("Parser diagnostics"));
+        assert!(output.contains("parse_error"));
     }
 
     #[test]
@@ -1785,7 +1852,8 @@ mod tests {
                     dominant_owner TEXT,
                     dominant_owner_share REAL,
                     owner_count INTEGER,
-                    author_count INTEGER NOT NULL
+                    author_count INTEGER NOT NULL,
+                    diagnostics TEXT NOT NULL
                 );
                 CREATE TABLE file_risk_terms (
                     relative_path TEXT NOT NULL,
@@ -1891,7 +1959,8 @@ mod tests {
                     dominant_owner TEXT,
                     dominant_owner_share REAL,
                     owner_count INTEGER,
-                    author_count INTEGER NOT NULL
+                    author_count INTEGER NOT NULL,
+                    diagnostics TEXT NOT NULL
                 );
                 CREATE TABLE file_risk_terms (
                     relative_path TEXT NOT NULL,
@@ -1931,8 +2000,8 @@ mod tests {
                     ('src/risky.go', 'C:/repo/src/risky.go', 1, 'hotpath.score.go.v1', 1, 0.9, 9.0, 'extreme', 1, 0),
                     ('src/safe.go', 'C:/repo/src/safe.go', 1, 'hotpath.score.go.v1', 2, 0.2, 2.0, 'low', 0, 0);
                 INSERT INTO file_facts VALUES
-                    ('src/risky.go', 1200, 48000, 'go', 220, 45, 12, 8, 20, 2300, 1000, 3, 'Alice <a@example.invalid>', 0.9, 1, 1),
-                    ('src/safe.go', 10, 400, 'go', 1, 1, 0, 0, 0, 1, 0, 1, NULL, NULL, NULL, 1);
+                    ('src/risky.go', 1200, 48000, 'go', 220, 45, 12, 8, 20, 2300, 1000, 3, 'Alice <a@example.invalid>', 0.9, 1, 1, '[{\"code\":\"parse_error\",\"message\":\"Go source contains syntax errors\"}]'),
+                    ('src/safe.go', 10, 400, 'go', 1, 1, 0, 0, 0, 1, 0, 1, NULL, NULL, NULL, 1, '[]');
                 INSERT INTO file_risk_terms VALUES
                     ('src/risky.go', 'hotpath.score.go.v1', 'churn', 2300, 1.0, 0.18, 0.18),
                     ('src/risky.go', 'hotpath.score.go.v1', 'complexity_pressure', 220, 1.0, 0.16, 0.16),
