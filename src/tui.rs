@@ -136,10 +136,10 @@ pub struct RiskRow {
     pub line_count: Option<u64>,
     pub byte_size: Option<u64>,
     pub language_id: Option<String>,
-    pub cognitive_complexity: Option<u64>,
-    pub max_function_complexity: Option<u64>,
-    pub source_coupling_in: Option<u64>,
-    pub source_coupling_out: Option<u64>,
+    pub complexity_pressure: Option<u64>,
+    pub max_function_complexity_pressure: Option<u64>,
+    pub source_coupling_pressure_in: Option<u64>,
+    pub source_coupling_pressure_out: Option<u64>,
     pub co_changed_file_count: u64,
     pub total_churn_lines: u64,
     pub recent_churn_lines: u64,
@@ -690,16 +690,17 @@ fn inspector_lines(row: &RiskRow, width: u16) -> Vec<Line<'static>> {
             severity_for_score(ownership_risk(row)),
         ),
         metric_bar_line(
-            "COUPLING",
-            coupling_pressure(row),
-            coupling_severity_label(coupling_pressure(row)).to_owned(),
-            severity_for_score(coupling_pressure(row)),
+            "COORD PRESS",
+            coordination_pressure(row),
+            coordination_severity_label(coordination_pressure(row)).to_owned(),
+            severity_for_score(coordination_pressure(row)),
         ),
         metric_bar_line(
-            "COMPLEXITY",
+            "CMPX PRESS",
             complexity_pressure(row),
-            complexity_severity_label(row.max_function_complexity.unwrap_or(0) as f64).to_owned(),
-            severity_for_complexity_score(row.max_function_complexity.unwrap_or(0) as f64),
+            complexity_severity_label(row.max_function_complexity_pressure.unwrap_or(0) as f64)
+                .to_owned(),
+            severity_for_complexity_score(row.max_function_complexity_pressure.unwrap_or(0) as f64),
         ),
     ];
     if let Some(line_count) = row.line_count {
@@ -827,10 +828,10 @@ fn load_risk_rows(connection: &Connection) -> rusqlite::Result<Vec<RiskRow>> {
             facts.line_count,
             facts.byte_size,
             facts.language_id,
-            facts.cognitive_complexity,
-            facts.max_function_complexity,
-            facts.source_coupling_in,
-            facts.source_coupling_out,
+            facts.complexity_pressure,
+            facts.max_function_complexity_pressure,
+            facts.source_coupling_pressure_in,
+            facts.source_coupling_pressure_out,
             facts.co_changed_file_count,
             facts.total_churn_lines,
             facts.recent_churn_lines,
@@ -859,10 +860,10 @@ fn load_risk_rows(connection: &Connection) -> rusqlite::Result<Vec<RiskRow>> {
             line_count: optional_i64_to_u64(row.get::<_, Option<i64>>(9)?),
             byte_size: optional_i64_to_u64(row.get::<_, Option<i64>>(10)?),
             language_id: row.get(11)?,
-            cognitive_complexity: optional_i64_to_u64(row.get::<_, Option<i64>>(12)?),
-            max_function_complexity: optional_i64_to_u64(row.get::<_, Option<i64>>(13)?),
-            source_coupling_in: optional_i64_to_u64(row.get::<_, Option<i64>>(14)?),
-            source_coupling_out: optional_i64_to_u64(row.get::<_, Option<i64>>(15)?),
+            complexity_pressure: optional_i64_to_u64(row.get::<_, Option<i64>>(12)?),
+            max_function_complexity_pressure: optional_i64_to_u64(row.get::<_, Option<i64>>(13)?),
+            source_coupling_pressure_in: optional_i64_to_u64(row.get::<_, Option<i64>>(14)?),
+            source_coupling_pressure_out: optional_i64_to_u64(row.get::<_, Option<i64>>(15)?),
             co_changed_file_count: i64_to_u64(row.get::<_, i64>(16)?),
             total_churn_lines: i64_to_u64(row.get::<_, i64>(17)?),
             recent_churn_lines: i64_to_u64(row.get::<_, i64>(18)?),
@@ -1019,8 +1020,10 @@ fn inspector_tags(row: &RiskRow) -> Vec<String> {
             "recent_churn" => signals.push(("VOLATILITY", value, 65)),
             "size" => signals.push(("SIZE", value, 75)),
             "ownership_risk" => signals.push(("FRAGILITY", value, 80)),
-            "cochange_coupling" | "source_coupling" => signals.push(("COUPLING", value, 85)),
-            "cognitive_complexity" => signals.push(("COMPLEXITY", value, 70)),
+            "cochange_pressure" | "source_coupling_pressure" => {
+                signals.push(("COORD PRESS", value, 85))
+            }
+            "complexity_pressure" => signals.push(("CMPX PRESS", value, 70)),
             _ => {}
         }
     }
@@ -1318,18 +1321,18 @@ fn ownership_shape_label(row: &RiskRow) -> &'static str {
     }
 }
 
-fn coupling_pressure(row: &RiskRow) -> f64 {
-    let source = term_value(row, "source_coupling").unwrap_or_else(|| {
-        let incoming = row.source_coupling_in.unwrap_or(0) as f64 / 25.0;
-        let outgoing = row.source_coupling_out.unwrap_or(0) as f64 / 15.0;
+fn coordination_pressure(row: &RiskRow) -> f64 {
+    let source = term_value(row, "source_coupling_pressure").unwrap_or_else(|| {
+        let incoming = row.source_coupling_pressure_in.unwrap_or(0) as f64 / 25.0;
+        let outgoing = row.source_coupling_pressure_out.unwrap_or(0) as f64 / 15.0;
         incoming.max(outgoing).clamp(0.0, 1.0)
     });
     let cochange =
-        term_value(row, "cochange_coupling").unwrap_or(row.co_changed_file_count as f64 / 25.0);
+        term_value(row, "cochange_pressure").unwrap_or(row.co_changed_file_count as f64 / 25.0);
     source.max(cochange).clamp(0.0, 1.0)
 }
 
-fn coupling_severity_label(value: f64) -> &'static str {
+fn coordination_severity_label(value: f64) -> &'static str {
     if value >= 0.85 {
         "CENTRAL"
     } else if value >= 0.60 {
@@ -1342,9 +1345,9 @@ fn coupling_severity_label(value: f64) -> &'static str {
 }
 
 fn complexity_pressure(row: &RiskRow) -> f64 {
-    term_value(row, "cognitive_complexity").unwrap_or_else(|| {
-        let file = row.cognitive_complexity.unwrap_or(0) as f64 / 150.0;
-        let function = row.max_function_complexity.unwrap_or(0) as f64 / 30.0;
+    term_value(row, "complexity_pressure").unwrap_or_else(|| {
+        let file = row.complexity_pressure.unwrap_or(0) as f64 / 150.0;
+        let function = row.max_function_complexity_pressure.unwrap_or(0) as f64 / 30.0;
         file.max(function).clamp(0.0, 1.0)
     })
 }
@@ -1365,11 +1368,11 @@ fn risk_driver_lines(row: &RiskRow) -> Vec<Line<'static>> {
     if ownership_risk(row) >= 0.60 {
         messages.push("Concentrated ownership / low maintainer redundancy".to_owned());
     }
-    if coupling_pressure(row) >= 0.60 {
-        messages.push("Central architectural dependency point".to_owned());
+    if coordination_pressure(row) >= 0.60 {
+        messages.push("High source coupling pressure from resolved local imports".to_owned());
     }
     if complexity_pressure(row) >= 0.50 {
-        messages.push("High structural or logical complexity".to_owned());
+        messages.push("High approximate cognitive complexity pressure".to_owned());
     }
     if row
         .line_count
@@ -1740,10 +1743,10 @@ mod tests {
                     line_count INTEGER,
                     byte_size INTEGER,
                     language_id TEXT,
-                    cognitive_complexity INTEGER,
-                    max_function_complexity INTEGER,
-                    source_coupling_in INTEGER,
-                    source_coupling_out INTEGER,
+                    complexity_pressure INTEGER,
+                    max_function_complexity_pressure INTEGER,
+                    source_coupling_pressure_in INTEGER,
+                    source_coupling_pressure_out INTEGER,
                     co_changed_file_count INTEGER NOT NULL,
                     total_churn_lines INTEGER NOT NULL,
                     recent_churn_lines INTEGER NOT NULL,
@@ -1846,10 +1849,10 @@ mod tests {
                     line_count INTEGER,
                     byte_size INTEGER,
                     language_id TEXT,
-                    cognitive_complexity INTEGER,
-                    max_function_complexity INTEGER,
-                    source_coupling_in INTEGER,
-                    source_coupling_out INTEGER,
+                    complexity_pressure INTEGER,
+                    max_function_complexity_pressure INTEGER,
+                    source_coupling_pressure_in INTEGER,
+                    source_coupling_pressure_out INTEGER,
                     co_changed_file_count INTEGER NOT NULL,
                     total_churn_lines INTEGER NOT NULL,
                     recent_churn_lines INTEGER NOT NULL,
@@ -1901,7 +1904,7 @@ mod tests {
                     ('src/safe.go', 10, 400, 'go', 1, 1, 0, 0, 0, 1, 0, 1, NULL, NULL, NULL, 1);
                 INSERT INTO file_risk_terms VALUES
                     ('src/risky.go', 'hotpath.score.go.v1', 'churn', 2300, 1.0, 0.18, 0.18),
-                    ('src/risky.go', 'hotpath.score.go.v1', 'cognitive_complexity', 220, 1.0, 0.16, 0.16),
+                    ('src/risky.go', 'hotpath.score.go.v1', 'complexity_pressure', 220, 1.0, 0.16, 0.16),
                     ('src/safe.go', 'hotpath.score.go.v1', 'churn', 1, 0.0, 0.18, 0.0);
                 INSERT INTO file_risk_facts VALUES
                     ('src/risky.go', 'hotpath.score.go.v1', 0, 'high_churn', 'High total churn');
