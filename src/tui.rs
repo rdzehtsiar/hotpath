@@ -44,6 +44,7 @@ pub struct TuiDatabaseSnapshot {
     pub index_root: Option<PathBuf>,
     pub status: Option<String>,
     pub project: Option<ProjectRiskSummary>,
+    pub git: GitMetadata,
     pub rows: Vec<RiskRow>,
 }
 
@@ -54,6 +55,7 @@ impl TuiDatabaseSnapshot {
                 index_root: None,
                 status: Some("No Hotpath index found. Run hotpath scan first.".to_owned()),
                 project: None,
+                git: GitMetadata::default(),
                 rows: Vec::new(),
             };
         };
@@ -71,6 +73,7 @@ impl TuiDatabaseSnapshot {
                 index_root: Some(index_root),
                 status: Some(format!("Could not read Hotpath index: {error}")),
                 project: None,
+                git: GitMetadata::default(),
                 rows: Vec::new(),
             },
         }
@@ -82,6 +85,7 @@ impl TuiDatabaseSnapshot {
             OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
         let project = load_project_summary(&connection)?;
+        let git = load_git_metadata(&connection)?;
         let mut rows = load_risk_rows(&connection)?;
         let terms = load_terms(&connection)?;
         let facts = load_facts(&connection)?;
@@ -103,9 +107,27 @@ impl TuiDatabaseSnapshot {
             index_root: Some(index_root.to_path_buf()),
             status: None,
             project,
+            git,
             rows,
         })
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitMetadata {
+    pub mode: Option<String>,
+    pub confidence: Option<String>,
+    pub collection_mode: Option<String>,
+    pub max_commits: Option<String>,
+    pub max_age_days: Option<String>,
+    pub first_parent: Option<String>,
+    pub renames: Option<String>,
+    pub cochange_max_files_per_commit: Option<String>,
+    pub recent_churn_window_days: Option<String>,
+    pub head_timestamp: Option<String>,
+    pub warning: Option<String>,
+    pub diagnostic: Option<String>,
+    pub index_action: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -346,7 +368,7 @@ fn render(frame: &mut Frame<'_>, snapshot: &TuiDatabaseSnapshot, state: &TuiStat
     let [header, body, footer] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(5),
             Constraint::Min(8),
             Constraint::Length(1),
         ])
@@ -388,6 +410,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, snapshot: &TuiDatabaseSnapsh
     let formula = project
         .map(|project| project.formula_id.as_str())
         .unwrap_or("none");
+    let git_line = git_status_line(&snapshot.git);
 
     let header = Paragraph::new(vec![
         Line::from(vec![Span::styled(
@@ -411,9 +434,51 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, snapshot: &TuiDatabaseSnapsh
             Span::raw("  "),
             Span::styled(format!("formula {formula}"), muted),
         ]),
+        Line::styled(git_line, muted),
     ]);
 
     frame.render_widget(header, area);
+}
+
+fn git_status_line(git: &GitMetadata) -> String {
+    let Some(confidence) = git.confidence.as_deref() else {
+        return "git confidence none".to_owned();
+    };
+    let mut parts = vec![format!("git confidence {confidence}")];
+    if let Some(mode) = &git.mode {
+        parts.push(format!("mode {mode}"));
+    }
+    if let Some(max_commits) = &git.max_commits {
+        parts.push(format!("max_commits {max_commits}"));
+    }
+    if let Some(max_age_days) = &git.max_age_days {
+        parts.push(format!("max_age_days {max_age_days}"));
+    }
+    if let Some(first_parent) = &git.first_parent {
+        parts.push(format!("first_parent {first_parent}"));
+    }
+    if let Some(renames) = &git.renames {
+        parts.push(format!("renames {renames}"));
+    }
+    if let Some(limit) = &git.cochange_max_files_per_commit {
+        parts.push(format!("cochange_max_files_per_commit {limit}"));
+    }
+    if let Some(window) = &git.recent_churn_window_days {
+        parts.push(format!("recent_churn_window_days {window}"));
+    }
+    if let Some(head_timestamp) = &git.head_timestamp {
+        parts.push(format!("head_timestamp {head_timestamp}"));
+    }
+    if let Some(warning) = &git.warning {
+        parts.push(format!("warning {warning}"));
+    }
+    if let Some(diagnostic) = &git.diagnostic {
+        parts.push(format!("diagnostic {diagnostic}"));
+    }
+    if let Some(index_action) = &git.index_action {
+        parts.push(format!("index_action {index_action}"));
+    }
+    parts.join("  ")
 }
 
 fn render_joined_body(
@@ -853,6 +918,53 @@ fn load_project_summary(connection: &Connection) -> rusqlite::Result<Option<Proj
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+fn load_git_metadata(connection: &Connection) -> rusqlite::Result<GitMetadata> {
+    if !table_exists(connection, "stage_metadata")? {
+        return Ok(GitMetadata::default());
+    }
+
+    let mut statement = connection.prepare(
+        "
+        SELECT key, value
+        FROM stage_metadata
+        WHERE key LIKE 'git_%'
+        ORDER BY key ASC
+        ",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut values = BTreeMap::new();
+    for row in rows {
+        let (key, value) = row?;
+        values.insert(key, value);
+    }
+
+    Ok(GitMetadata {
+        mode: values.get("git_scan_mode").cloned(),
+        confidence: values.get("git_confidence").cloned(),
+        collection_mode: values.get("git_collection_mode").cloned(),
+        max_commits: values.get("git_max_commits").cloned(),
+        max_age_days: values.get("git_max_age_days").cloned(),
+        first_parent: values.get("git_first_parent").cloned(),
+        renames: values.get("git_renames").cloned(),
+        cochange_max_files_per_commit: values.get("git_cochange_max_files_per_commit").cloned(),
+        recent_churn_window_days: values.get("git_recent_churn_window_days").cloned(),
+        head_timestamp: values.get("git_head_timestamp").cloned(),
+        warning: values.get("git_merge_heavy_warning").cloned(),
+        diagnostic: values.get("git_diagnostic").cloned(),
+        index_action: values.get("git_index_action").cloned(),
+    })
+}
+
+fn table_exists(connection: &Connection, table: &str) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |row| Ok(row.get::<_, i64>(0)? > 0),
+    )
 }
 
 fn load_risk_rows(connection: &Connection) -> rusqlite::Result<Vec<RiskRow>> {
@@ -1777,6 +1889,8 @@ mod tests {
         assert!(output.contains("active_go_file_count 2"));
         assert!(output.contains("scored_file_count 2"));
         assert!(output.contains("coverage 100.0%"));
+        assert!(output.contains("git confidence bounded"));
+        assert!(output.contains("max_commits 50000"));
         assert!(output.contains("Go coverage: 100.0%"));
         assert!(output.contains("Top Factor"));
         assert!(output.contains("Inspector"));
@@ -1792,6 +1906,7 @@ mod tests {
             index_root: None,
             status: Some("No Hotpath index found. Run hotpath scan first.".to_owned()),
             project: None,
+            git: GitMetadata::default(),
             rows: Vec::new(),
         };
         let state = TuiState::new();
@@ -1885,6 +2000,10 @@ mod tests {
                     ownership_score REAL NOT NULL,
                     ownership_share REAL NOT NULL,
                     touch_count INTEGER NOT NULL
+                );
+                CREATE TABLE stage_metadata (
+                    key TEXT PRIMARY KEY NOT NULL,
+                    value TEXT NOT NULL
                 );
                 ",
             )
@@ -2012,6 +2131,17 @@ mod tests {
                     ('src/risky.go', 'hotpath.score.go.v1', 0, 'test_limit', 'fixture limitation');
                 INSERT INTO git_file_owners VALUES
                     ('src/risky.go', 1, 'Alice <a@example.invalid>', 10.0, 0.9, 3);
+                INSERT INTO stage_metadata VALUES
+                    ('git_confidence', 'bounded'),
+                    ('git_scan_mode', 'full'),
+                    ('git_collection_mode', 'bounded_recent_stream'),
+                    ('git_max_commits', '50000'),
+                    ('git_max_age_days', '730'),
+                    ('git_first_parent', 'true'),
+                    ('git_renames', 'false'),
+                    ('git_cochange_max_files_per_commit', '100'),
+                    ('git_recent_churn_window_days', '90'),
+                    ('git_head_timestamp', '1700000000');
                 ",
             )
             .expect("fixture schema should be created");

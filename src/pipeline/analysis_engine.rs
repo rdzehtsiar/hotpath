@@ -9,11 +9,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::pipeline::enumerator::{
     enumerate_repository, enumerate_repository_with_callbacks, EnumerationError, EnumerationResult,
 };
-use crate::pipeline::events::{PipelineEvent, PipelineState};
+use crate::pipeline::events::{GitStatus, PipelineEvent, PipelineState};
 use crate::pipeline::file_analyzer::{file_analyzer_options_signature, FileAnalyzerOptions};
 use crate::pipeline::git_history_analyzer::{
     collect_git_plan, git_options_signature, is_ancestor, revision_commit_count,
-    GitHistoryAnalyzerOptions, GitHistoryScan,
+    GitHistoryAnalyzerOptions, GitHistoryScan, RECENT_CHURN_WINDOW_DAYS,
 };
 use crate::pipeline::reporter::{NoopReporter, PipelineReporter};
 use crate::pipeline::scheduler::{
@@ -322,6 +322,20 @@ fn spawn_git_planner(
                 let _ = store_handle.store_metadata("git_mode", "skipped_not_git");
                 let _ = store_handle.store_metadata("git_scan_mode", "skipped_not_git");
                 let _ = store_handle.store_metadata("git_collection_mode", "unavailable");
+                let _ = store_handle.store_metadata("git_confidence", "not_git");
+                let _ = store_handle.store_metadata("git_first_parent", "true");
+                let _ = store_handle.store_metadata("git_renames", "false");
+                let _ = event_sender.send(PipelineEvent::GitStatusUpdated {
+                    status: GitStatus {
+                        mode: Some("skipped_not_git".to_owned()),
+                        confidence: Some("not_git".to_owned()),
+                        collection_mode: Some("unavailable".to_owned()),
+                        first_parent: Some(true),
+                        renames: Some(false),
+                        diagnostic: Some("not a git worktree".to_owned()),
+                        ..GitStatus::default()
+                    },
+                });
                 let _ = store_handle.plan_finalization_records();
                 let _ = event_sender.send(PipelineEvent::GitHistorySkipped {
                     reason: "not a git worktree".to_owned(),
@@ -340,6 +354,21 @@ fn spawn_git_planner(
                 let _ = store_handle.store_metadata("git_mode", "skipped_shallow");
                 let _ = store_handle.store_metadata("git_scan_mode", "skipped_shallow");
                 let _ = store_handle.store_metadata("git_collection_mode", "unavailable");
+                let _ = store_handle.store_metadata("git_confidence", "shallow_skipped");
+                let _ = store_handle.store_metadata("git_first_parent", "true");
+                let _ = store_handle.store_metadata("git_renames", "false");
+                let _ = event_sender.send(PipelineEvent::GitStatusUpdated {
+                    status: GitStatus {
+                        mode: Some("skipped_shallow".to_owned()),
+                        confidence: Some("shallow_skipped".to_owned()),
+                        collection_mode: Some("unavailable".to_owned()),
+                        first_parent: Some(true),
+                        renames: Some(false),
+                        head_timestamp: plan.head_timestamp,
+                        diagnostic: Some("shallow repository".to_owned()),
+                        ..GitStatus::default()
+                    },
+                });
                 let _ = store_handle.plan_finalization_records();
                 let _ = event_sender.send(PipelineEvent::GitHistorySkipped {
                     reason: "shallow repository".to_owned(),
@@ -391,6 +420,18 @@ fn spawn_git_planner(
                 let _ = store_handle.store_metadata("git_mode", git_scan_mode.clone());
                 let _ = store_handle.store_metadata("git_scan_mode", git_scan_mode.clone());
                 let _ = store_handle.store_metadata("git_collection_mode", "bounded_recent_stream");
+                let git_confidence = git_confidence_for_mode(&git_scan_mode, &git_history_options);
+                let _ = store_handle.store_metadata("git_confidence", git_confidence);
+                let _ = store_handle.store_metadata("git_first_parent", "true");
+                let _ = store_handle.store_metadata("git_renames", "false");
+                let _ = store_handle.store_metadata(
+                    "git_recent_churn_window_days",
+                    RECENT_CHURN_WINDOW_DAYS.to_string(),
+                );
+                let _ = store_handle
+                    .store_metadata("git_recent_churn_reference", "head_committer_timestamp");
+                let _ =
+                    store_handle.store_metadata("git_head_timestamp", head_timestamp.to_string());
                 let _ = store_handle.store_metadata(
                     "git_max_commits",
                     git_history_options
@@ -411,6 +452,33 @@ fn spawn_git_planner(
                         .cochange_max_files_per_commit
                         .to_string(),
                 );
+                let _ = event_sender.send(PipelineEvent::GitStatusUpdated {
+                    status: GitStatus {
+                        mode: Some(git_scan_mode.clone()),
+                        confidence: Some(git_confidence.to_owned()),
+                        collection_mode: Some("bounded_recent_stream".to_owned()),
+                        max_commits: Some(
+                            git_history_options
+                                .max_commits
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "unbounded".to_owned()),
+                        ),
+                        max_age_days: Some(
+                            git_history_options
+                                .max_age_days
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "unbounded".to_owned()),
+                        ),
+                        first_parent: Some(true),
+                        renames: Some(false),
+                        cochange_max_files_per_commit: Some(
+                            git_history_options.cochange_max_files_per_commit,
+                        ),
+                        recent_churn_window_days: Some(RECENT_CHURN_WINDOW_DAYS),
+                        head_timestamp: Some(head_timestamp),
+                        ..GitStatus::default()
+                    },
+                });
                 if let Some(total_commits) = planned_git_commits {
                     let _ = event_sender.send(PipelineEvent::GitPlanningCompleted {
                         total_commits,
@@ -466,6 +534,20 @@ fn spawn_git_planner(
                 let _ = store_handle.store_metadata("git_mode", "skipped_error");
                 let _ = store_handle.store_metadata("git_scan_mode", "skipped_error");
                 let _ = store_handle.store_metadata("git_collection_mode", "unavailable");
+                let _ = store_handle.store_metadata("git_confidence", "error_skipped");
+                let _ = store_handle.store_metadata("git_first_parent", "true");
+                let _ = store_handle.store_metadata("git_renames", "false");
+                let _ = event_sender.send(PipelineEvent::GitStatusUpdated {
+                    status: GitStatus {
+                        mode: Some("skipped_error".to_owned()),
+                        confidence: Some("error_skipped".to_owned()),
+                        collection_mode: Some("unavailable".to_owned()),
+                        first_parent: Some(true),
+                        renames: Some(false),
+                        diagnostic: Some(error.to_string()),
+                        ..GitStatus::default()
+                    },
+                });
                 let _ = store_handle.plan_finalization_records();
                 let _ = event_sender.send(PipelineEvent::GitHistorySkipped {
                     reason: error.to_string(),
@@ -473,6 +555,17 @@ fn spawn_git_planner(
             }
         }
     })
+}
+
+fn git_confidence_for_mode(
+    git_scan_mode: &str,
+    options: &GitHistoryAnalyzerOptions,
+) -> &'static str {
+    match git_scan_mode {
+        "incremental" | "up_to_date" => "incremental",
+        _ if options.max_commits.is_some() || options.max_age_days.is_some() => "bounded",
+        _ => "first_parent_only",
+    }
 }
 
 fn spawn_total_counter(

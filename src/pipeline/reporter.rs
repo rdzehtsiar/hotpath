@@ -106,6 +106,14 @@ impl<W: Write> PipelineReporter for StdioReporter<W> {
             self.render_now(state);
         }
         if self.rendered_once && !self.finished {
+            let status_lines = render_git_status_lines(state);
+            for (index, line) in status_lines.iter().enumerate() {
+                if index == 0 {
+                    let _ = writeln!(self.writer, "\n{line}");
+                } else {
+                    let _ = writeln!(self.writer, "{line}");
+                }
+            }
             let _ = writeln!(self.writer);
             let _ = self.writer.flush();
             self.finished = true;
@@ -164,6 +172,57 @@ fn render_progress_row(
 
 fn render_elapsed_row(elapsed: Duration) -> String {
     format!("time  elapsed {}", format_elapsed(elapsed))
+}
+
+pub fn render_git_status_lines(state: &PipelineState) -> Vec<String> {
+    let status = &state.git_status;
+    let Some(confidence) = status.confidence.as_deref() else {
+        return Vec::new();
+    };
+
+    let mut details = Vec::new();
+    if let Some(mode) = &status.mode {
+        details.push(format!("mode {mode}"));
+    }
+    details.push(format!("confidence {confidence}"));
+    if let Some(collection_mode) = &status.collection_mode {
+        details.push(format!("collection {collection_mode}"));
+    }
+    if let Some(max_commits) = &status.max_commits {
+        details.push(format!("max_commits {max_commits}"));
+    }
+    if let Some(max_age_days) = &status.max_age_days {
+        details.push(format!("max_age_days {max_age_days}"));
+    }
+    if let Some(first_parent) = status.first_parent {
+        details.push(format!("first_parent {first_parent}"));
+    }
+    if let Some(renames) = status.renames {
+        details.push(format!("renames {renames}"));
+    }
+    if let Some(limit) = status.cochange_max_files_per_commit {
+        details.push(format!("cochange_max_files_per_commit {limit}"));
+    }
+    if let Some(window) = status.recent_churn_window_days {
+        details.push(format!("recent_churn_window_days {window}"));
+    }
+    if let Some(timestamp) = status.head_timestamp {
+        details.push(format!(
+            "recent_churn_reference head_committer_timestamp:{timestamp}"
+        ));
+    }
+
+    let mut lines = vec![format!("git   {}", details.join("  "))];
+    if let Some(warning) = &status.warning {
+        lines.push(format!("git   warning {warning}"));
+    }
+    if let Some(diagnostic) = &status.diagnostic {
+        lines.push(format!("git   diagnostic {diagnostic}"));
+    }
+    if let Some(action) = &status.index_action {
+        lines.push(format!("git   index_action {action}"));
+    }
+    lines
 }
 
 fn format_elapsed(elapsed: Duration) -> String {
@@ -252,10 +311,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        render_progress_bar, render_progress_row, render_report_lines,
+        render_git_status_lines, render_progress_bar, render_progress_row, render_report_lines,
         render_report_lines_with_style, PipelineReporter, ProgressBarStyle, StdioReporter,
     };
-    use crate::pipeline::events::PipelineState;
+    use crate::pipeline::events::{GitStatus, PipelineState};
 
     #[test]
     fn render_lines_show_estimating_before_totals_are_known() {
@@ -356,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn stdio_reporter_writes_three_lines_and_final_newline() {
+    fn stdio_reporter_writes_three_lines_and_final_newline_without_git_status() {
         let mut output = Vec::new();
         let mut reporter = StdioReporter::new(&mut output);
         let state = PipelineState {
@@ -371,6 +430,37 @@ mod tests {
         let rendered = String::from_utf8(output).expect("reporter output should be UTF-8");
         assert!(rendered.ends_with('\n'));
         assert_eq!(rendered.matches('\n').count(), 3);
+    }
+
+    #[test]
+    fn final_git_status_lines_show_bounds_and_confidence() {
+        let state = PipelineState {
+            git_status: GitStatus {
+                mode: Some("full".to_owned()),
+                confidence: Some("bounded".to_owned()),
+                collection_mode: Some("bounded_recent_stream".to_owned()),
+                max_commits: Some("50000".to_owned()),
+                max_age_days: Some("730".to_owned()),
+                first_parent: Some(true),
+                renames: Some(false),
+                cochange_max_files_per_commit: Some(100),
+                recent_churn_window_days: Some(90),
+                head_timestamp: Some(1_700_000_000),
+                ..GitStatus::default()
+            },
+            ..PipelineState::default()
+        };
+
+        let lines = render_git_status_lines(&state);
+
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("confidence bounded"));
+        assert!(lines[0].contains("max_commits 50000"));
+        assert!(lines[0].contains("max_age_days 730"));
+        assert!(lines[0].contains("first_parent true"));
+        assert!(lines[0].contains("renames false"));
+        assert!(lines[0].contains("cochange_max_files_per_commit 100"));
+        assert!(lines[0].contains("recent_churn_reference head_committer_timestamp:1700000000"));
     }
 
     #[test]

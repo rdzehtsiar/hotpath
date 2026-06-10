@@ -179,11 +179,45 @@ fn scan_reports_git_progress_for_git_repository() {
     assert!(final_lines[1].contains("2/2"));
     assert!(final_lines[1].contains("commits/sec"));
     assert!(final_lines[2].starts_with("time"));
+    assert!(stdout.contains("confidence bounded"));
+    assert!(stdout.contains("max_commits 50000"));
+    assert!(stdout.contains("max_age_days 730"));
+    assert!(stdout.contains("first_parent true"));
+    assert!(stdout.contains("renames false"));
+    assert!(stdout.contains("cochange_max_files_per_commit 100"));
 
     let connection =
         Connection::open(fixture.path().join(".hotpath").join("index.sqlite")).expect("db opens");
     assert_eq!(row_count(&connection, "file_analysis"), 1);
     assert_eq!(row_count(&connection, "git_chunks"), 1);
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_confidence'",
+        ),
+        "bounded"
+    );
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_first_parent'",
+        ),
+        "true"
+    );
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_renames'",
+        ),
+        "false"
+    );
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_recent_churn_window_days'",
+        ),
+        "90"
+    );
 }
 
 #[test]
@@ -332,7 +366,17 @@ fn final_scan_lines(stdout: &str) -> Vec<String> {
         .map(str::to_owned)
         .collect();
 
-    lines[lines.len().saturating_sub(3)..].to_vec()
+    let progress_lines: Vec<_> = lines
+        .iter()
+        .filter(|line| {
+            line.starts_with("files")
+                || line.starts_with("time")
+                || (line.starts_with("git") && line.contains("| speed"))
+        })
+        .cloned()
+        .collect();
+
+    progress_lines[progress_lines.len().saturating_sub(3)..].to_vec()
 }
 
 fn strip_ansi(input: &str) -> String {

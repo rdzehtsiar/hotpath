@@ -5,6 +5,23 @@ use std::time::Duration;
 
 use crate::pipeline::enumerator::EnumerationResult;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitStatus {
+    pub mode: Option<String>,
+    pub confidence: Option<String>,
+    pub collection_mode: Option<String>,
+    pub max_commits: Option<String>,
+    pub max_age_days: Option<String>,
+    pub first_parent: Option<bool>,
+    pub renames: Option<bool>,
+    pub cochange_max_files_per_commit: Option<usize>,
+    pub recent_churn_window_days: Option<i64>,
+    pub head_timestamp: Option<i64>,
+    pub warning: Option<String>,
+    pub diagnostic: Option<String>,
+    pub index_action: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PipelineEvent {
     ScanStarted,
@@ -31,6 +48,9 @@ pub enum PipelineEvent {
     GitPlanningCompleted {
         total_commits: u64,
         total_chunks: u64,
+    },
+    GitStatusUpdated {
+        status: GitStatus,
     },
     GitHistorySkipped {
         reason: String,
@@ -86,6 +106,7 @@ pub struct PipelineState {
     pub total_elapsed: Duration,
     pub git_completed: bool,
     pub git_skipped: bool,
+    pub git_status: GitStatus,
     pub store_completed: bool,
     pub scan_completed: bool,
 }
@@ -110,6 +131,7 @@ impl Default for PipelineState {
             total_elapsed: Duration::ZERO,
             git_completed: false,
             git_skipped: false,
+            git_status: GitStatus::default(),
             store_completed: false,
             scan_completed: false,
         }
@@ -180,6 +202,9 @@ impl PipelineState {
                 if *total_commits == 0 {
                     self.git_completed = true;
                 }
+            }
+            PipelineEvent::GitStatusUpdated { status } => {
+                self.git_status = status.clone();
             }
             PipelineEvent::GitHistorySkipped { .. } => {
                 self.total_git_commits = Some(0);
