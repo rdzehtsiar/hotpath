@@ -48,6 +48,7 @@ impl FileAnalyzer {
             line_count,
             is_generated: is_generated_path(file.path()),
             is_vendor: is_vendor_path(file.path()),
+            is_test: is_test_path(file.path()),
             diagnostics,
             parser_status: parser.status,
             parser_output: parser.output,
@@ -142,7 +143,7 @@ impl Default for FileAnalyzerOptions {
 
 pub fn file_analyzer_options_signature(options: &FileAnalyzerOptions) -> String {
     format!(
-        "file-local-v3-source-refs;content-window={};parsers={}",
+        "file-local-v4-test-files;content-window={};parsers={}",
         options.content_window_bytes,
         options
             .parsers
@@ -167,6 +168,7 @@ pub struct FileAnalysisResult {
     pub line_count: Option<u64>,
     pub is_generated: bool,
     pub is_vendor: bool,
+    pub is_test: bool,
     pub diagnostics: Vec<FileDiagnostic>,
     pub parser_status: FileParserStatus,
     pub parser_output: Option<ParserOutput>,
@@ -430,6 +432,12 @@ fn is_vendor_path(path: &Path) -> bool {
     })
 }
 
+fn is_test_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|file_name| file_name.to_str())
+        .is_some_and(|file_name| file_name.to_ascii_lowercase().ends_with("_test.go"))
+}
+
 fn is_generated_path(path: &Path) -> bool {
     let file_name = path
         .file_name()
@@ -654,6 +662,25 @@ mod tests {
         assert!(generated.is_generated);
         assert!(!generated.is_vendor);
         assert!(vendor.is_vendor);
+    }
+
+    #[test]
+    fn analyzer_tags_go_test_files() {
+        let fixture = Fixture::new("test-file-classification");
+        let test_path = fixture.write("service_test.go", b"package main\n");
+        let regular_path = fixture.write("service.go", b"package main\n");
+        let similarly_named_path = fixture.write("service_test.rs", b"fn main() {}\n");
+        let analyzer = FileAnalyzer::new();
+
+        let test_file = analyzer.analyze(FileAnalysisInput { path: test_path });
+        let regular_file = analyzer.analyze(FileAnalysisInput { path: regular_path });
+        let similarly_named = analyzer.analyze(FileAnalysisInput {
+            path: similarly_named_path,
+        });
+
+        assert!(test_file.is_test);
+        assert!(!regular_file.is_test);
+        assert!(!similarly_named.is_test);
     }
 
     #[test]

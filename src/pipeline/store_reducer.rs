@@ -713,6 +713,7 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
                 line_count INTEGER,
                 is_generated INTEGER NOT NULL,
                 is_vendor INTEGER NOT NULL,
+                is_test INTEGER NOT NULL DEFAULT 0,
                 parser_status TEXT NOT NULL,
                 parser_recognition_attempts INTEGER NOT NULL,
                 language_id TEXT,
@@ -877,6 +878,7 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
                 line_count INTEGER,
                 is_generated INTEGER NOT NULL,
                 is_vendor INTEGER NOT NULL,
+                is_test INTEGER NOT NULL DEFAULT 0,
                 parser_status TEXT NOT NULL,
                 parser_recognition_attempts INTEGER NOT NULL,
                 language_id TEXT,
@@ -927,6 +929,7 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
                 risk_band TEXT NOT NULL,
                 is_generated INTEGER NOT NULL,
                 is_vendor INTEGER NOT NULL,
+                is_test INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (relative_path, formula_id)
             );
 
@@ -1045,6 +1048,12 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
         "is_active",
         "INTEGER NOT NULL DEFAULT 1",
     )?;
+    add_column_if_missing(
+        connection,
+        "file_analysis",
+        "is_test",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     add_column_if_missing(connection, "file_analysis", "language_id", "TEXT")?;
     add_column_if_missing(
         connection,
@@ -1088,6 +1097,12 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
         "max_function_complexity",
         "INTEGER",
     )?;
+    add_column_if_missing(
+        connection,
+        "file_facts",
+        "is_test",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     add_column_if_missing(connection, "file_facts", "language_id", "TEXT")?;
     add_column_if_missing(
         connection,
@@ -1128,6 +1143,12 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
     )?;
     add_column_if_missing(connection, "file_facts", "source_coupling_in", "INTEGER")?;
     add_column_if_missing(connection, "file_facts", "source_coupling_out", "INTEGER")?;
+    add_column_if_missing(
+        connection,
+        "file_risk_scores",
+        "is_test",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     add_column_if_missing(
         connection,
         "git_chunks",
@@ -1308,6 +1329,7 @@ fn flush_batch(
                     line_count,
                     is_generated,
                     is_vendor,
+                    is_test,
                     parser_status,
                     parser_recognition_attempts,
                     language_id,
@@ -1319,7 +1341,7 @@ fn flush_batch(
                     cognitive_complexity,
                     max_function_complexity,
                     diagnostics
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
                 ",
             )
             .map_err(StoreReducerError::WriteDatabase)?;
@@ -1343,6 +1365,7 @@ fn flush_batch(
                     result.line_count.map(|value| value as i64),
                     bool_to_i64(result.is_generated),
                     bool_to_i64(result.is_vendor),
+                    bool_to_i64(result.is_test),
                     parser_status_name(result.parser_status),
                     result.parser_recognition_attempts as i64,
                     result.language_id.as_deref(),
@@ -2176,6 +2199,7 @@ fn materialize_file_facts(
                 line_count,
                 is_generated,
                 is_vendor,
+                is_test,
                 parser_status,
                 parser_recognition_attempts,
                 language_id,
@@ -2216,6 +2240,7 @@ fn materialize_file_facts(
                 file_analysis.line_count,
                 file_analysis.is_generated,
                 file_analysis.is_vendor,
+                file_analysis.is_test,
                 file_analysis.parser_status,
                 file_analysis.parser_recognition_attempts,
                 file_analysis.language_id,
@@ -2283,6 +2308,7 @@ struct FileRiskRow {
     active_scan_id: i64,
     is_generated: bool,
     is_vendor: bool,
+    is_test: bool,
     input: FileRiskInput,
     assessment: FileRiskAssessment,
 }
@@ -2303,6 +2329,7 @@ fn materialize_file_risk_scores(
                 line_count,
                 is_generated,
                 is_vendor,
+                is_test,
                 total_churn_lines,
                 recent_churn_lines,
                 owner_count,
@@ -2327,16 +2354,16 @@ fn materialize_file_risk_scores(
                 relative_path: relative_path.clone(),
                 line_count: optional_i64_to_u64(row.get::<_, Option<i64>>(4)?),
                 byte_size: optional_i64_to_u64(row.get::<_, Option<i64>>(3)?),
-                total_churn_lines: i64_to_u64(row.get::<_, i64>(7)?),
-                recent_churn_lines: i64_to_u64(row.get::<_, i64>(8)?),
-                owner_count: optional_i64_to_u64(row.get::<_, Option<i64>>(9)?),
-                dominant_owner_share: row.get::<_, Option<f64>>(10)?,
-                co_changed_file_count: i64_to_u64(row.get::<_, i64>(11)?),
-                file_age_days: optional_i64_to_u64(row.get::<_, Option<i64>>(12)?),
-                source_coupling_in: optional_i64_to_u64(row.get::<_, Option<i64>>(13)?),
-                source_coupling_out: optional_i64_to_u64(row.get::<_, Option<i64>>(14)?),
-                cognitive_complexity: optional_i64_to_u64(row.get::<_, Option<i64>>(15)?),
-                max_function_complexity: optional_i64_to_u64(row.get::<_, Option<i64>>(16)?),
+                total_churn_lines: i64_to_u64(row.get::<_, i64>(8)?),
+                recent_churn_lines: i64_to_u64(row.get::<_, i64>(9)?),
+                owner_count: optional_i64_to_u64(row.get::<_, Option<i64>>(10)?),
+                dominant_owner_share: row.get::<_, Option<f64>>(11)?,
+                co_changed_file_count: i64_to_u64(row.get::<_, i64>(12)?),
+                file_age_days: optional_i64_to_u64(row.get::<_, Option<i64>>(13)?),
+                source_coupling_in: optional_i64_to_u64(row.get::<_, Option<i64>>(14)?),
+                source_coupling_out: optional_i64_to_u64(row.get::<_, Option<i64>>(15)?),
+                cognitive_complexity: optional_i64_to_u64(row.get::<_, Option<i64>>(16)?),
+                max_function_complexity: optional_i64_to_u64(row.get::<_, Option<i64>>(17)?),
             };
             Ok(FileRiskRow {
                 path: row.get(0)?,
@@ -2344,6 +2371,7 @@ fn materialize_file_risk_scores(
                 active_scan_id: row.get(2)?,
                 is_generated: row.get::<_, i64>(5)? != 0,
                 is_vendor: row.get::<_, i64>(6)? != 0,
+                is_test: row.get::<_, i64>(7)? != 0,
                 input,
                 assessment: FileRiskAssessment {
                     formula_id: FORMULA_ID,
@@ -2397,8 +2425,9 @@ fn materialize_file_risk_scores(
                     risk_10,
                     risk_band,
                     is_generated,
-                    is_vendor
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    is_vendor,
+                    is_test
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                 ",
             )
             .map_err(StoreReducerError::WriteDatabase)?;
@@ -2458,6 +2487,7 @@ fn materialize_file_risk_scores(
                     risk_row.assessment.risk_band,
                     bool_to_i64(risk_row.is_generated),
                     bool_to_i64(risk_row.is_vendor),
+                    bool_to_i64(risk_row.is_test),
                 ])
                 .map_err(StoreReducerError::WriteDatabase)?;
 
@@ -4095,6 +4125,7 @@ mod tests {
             line_count: Some(1),
             is_generated: false,
             is_vendor: false,
+            is_test: false,
             diagnostics: Vec::new(),
             parser_status: FileParserStatus::Unsupported,
             parser_output: None,
