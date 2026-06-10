@@ -104,6 +104,101 @@ Current Go processing is intentionally limited:
 - Project risk is Go-aware only. Repositories with little or no Go receive low
   or unavailable scoring coverage rather than broad repository risk analysis.
 
+## Go Metric Formulas
+
+The Go metric formulas below describe the current `hotpath.score.go.v1` inputs.
+They are approximate, parser-backed signals for hotspot ranking rather than Go
+language specifications or stable public APIs. All normalized values are clamped
+to the `0.0..=1.0` range.
+
+### Approximate cognitive complexity
+
+Hotpath computes Go cognitive complexity from the tree-sitter syntax tree after
+extracting each parsed top-level function or method body. File cognitive
+complexity is the sum of per-function complexity. Maximum function complexity is
+the largest per-function value in that file.
+
+For the current Go parser, these syntax constructs add complexity:
+
+| Go syntax matched by the parser | Metric kind | Points added | Nesting effect |
+| --- | --- | --- | --- |
+| `if` statements | branch | `1 + current_nesting` | Child control flow is nested one level deeper. |
+| `for` statements, including range loops | loop | `1 + current_nesting` | Child control flow is nested one level deeper. |
+| expression switches, type switches, and `select` statements | switch | `1 + current_nesting` | Child control flow is nested one level deeper. |
+| expression cases, type cases, communication cases, and default cases | case | `1 + current_nesting` | Child control flow is nested one level deeper. |
+| binary expressions whose source text contains `&&` or `||` | boolean chain | `1` | Child control flow keeps the same nesting level. |
+| `break`, `continue`, and `goto` statements | jump | `1` | No child nesting is added. |
+
+The generic complexity reducer can score an `else if` node as `1 +
+current_nesting` if a parser emits that metric kind, but the current Go parser
+does not emit a distinct `else if` kind. It walks the recovered syntax tree and
+scores the nested `if` statements it finds. `return`, `defer`, `go`,
+`fallthrough`, calls, boolean expressions without `&&` or `||`, and package
+initialization order do not currently add complexity by themselves.
+
+The normalized cognitive-complexity score used by the file risk formula is:
+
+```text
+file_complexity_score = min(file_cognitive_complexity / 150, 1.0)
+function_complexity_score = min(max_function_complexity / 30, 1.0)
+normalized_cognitive_complexity = max(file_complexity_score, function_complexity_score)
+```
+
+If both parser-backed complexity values are unavailable, the complexity term is
+omitted from that file's risk contribution and a `missing_cognitive_complexity`
+limitation is recorded. If one value is unavailable, it is treated as zero while
+the other value is still normalized.
+
+### Approximate source coupling
+
+Source coupling is derived from local Go import references that resolve to known
+local Go package paths. The parser records string-literal import targets. During
+index finalization, Hotpath treats every active Go file directory as a known
+package path; files in the repository root use `.` as their package path. Package
+paths come from file locations, not from Go package declarations.
+
+Local import resolution is conservative and deterministic:
+
+1. Read the first non-empty `module ...` directive from the repository-root
+   `go.mod`, when present.
+2. For each Go import target, trim surrounding whitespace.
+3. If the import exactly equals the module prefix, try resolving it to `.`.
+4. If the import starts with `module_prefix/`, strip that prefix and try the
+   remaining path.
+5. Also try the import target as written after trimming leading/trailing slashes
+   and normalizing backslashes to `/`.
+6. Resolve to the first candidate that matches an active Go file directory.
+   Imports that do not match a known local package remain unresolved.
+
+External packages, generated build graphs, test-only variants, build tags,
+workspace files, vendored module semantics, package declarations, type
+information, call sites, and runtime behavior are not used by the current source
+coupling calculation.
+
+For each resolved local import edge, Hotpath stores the source file path, the
+source file's package path, and the target package path. Duplicate edges from
+the same source file to the same target package and reference kind are collapsed.
+The materialized coupling values are:
+
+```text
+source_coupling_in = count(distinct source files importing this file's package path)
+source_coupling_out = count(distinct resolved target package paths imported by this file)
+```
+
+Inbound coupling is package-level and then attached to each file in the target
+package. Outbound coupling is file-level. The normalized source-coupling score
+used by the file risk formula is:
+
+```text
+inbound_score = min(source_coupling_in / 25, 1.0)
+outbound_score = min(source_coupling_out / 15, 1.0)
+normalized_source_coupling = max(inbound_score, outbound_score)
+```
+
+The raw source-coupling term shown in score explanations is the larger of
+`source_coupling_in` and `source_coupling_out`, while the normalized term uses
+the separate inbound and outbound thresholds above.
+
 ## Git Processing Limits
 
 Current Git processing is also limited:
