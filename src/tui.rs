@@ -374,12 +374,16 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, snapshot: &TuiDatabaseSnapsh
     let confidence = project
         .map(|project| project.confidence.as_str())
         .unwrap_or("none");
-    let files = project
+    let active_files = project
         .map(|project| project.active_file_count)
         .unwrap_or(0);
-    let hotspots = project
+    let active_go_files = project
+        .map(|project| project.active_go_file_count)
+        .unwrap_or(0);
+    let scored_files = project
         .map(|project| project.scored_file_count)
         .unwrap_or(0);
+    let coverage = project.map(project_coverage_percentage).unwrap_or(0.0);
     let formula = project
         .map(|project| project.formula_id.as_str())
         .unwrap_or("none");
@@ -401,7 +405,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, snapshot: &TuiDatabaseSnapsh
             Span::styled("Hotpath", style(TuiSeverity::Medium)),
             Span::raw(" / "),
             Span::raw(format!(
-                "{files} files  {hotspots} hotspots  confidence {confidence}"
+                "active_file_count {active_files}  active_go_file_count {active_go_files}  scored_file_count {scored_files}  coverage {coverage:.1}%  confidence {confidence}"
             )),
             Span::raw("  "),
             Span::styled(format!("formula {formula}"), muted),
@@ -487,6 +491,14 @@ fn render_main(
     frame.render_widget(Paragraph::new(lines), content);
 }
 
+fn project_coverage_percentage(project: &ProjectRiskSummary) -> f64 {
+    project
+        .go_score_coverage
+        .unwrap_or(project.scoring_coverage)
+        .clamp(0.0, 1.0)
+        * 100.0
+}
+
 fn hotpath_kpi_lines(snapshot: &TuiDatabaseSnapshot) -> Vec<Line<'static>> {
     let score = snapshot
         .project
@@ -494,15 +506,29 @@ fn hotpath_kpi_lines(snapshot: &TuiDatabaseSnapshot) -> Vec<Line<'static>> {
         .map(|project| project.score)
         .or_else(|| snapshot.rows.first().map(|row| row.score))
         .unwrap_or(0.0);
-    vec![
-        metric_bar_line(
-            "Repo Risk",
-            score,
-            format!("{} {:.1}", severity_label(score), score * 10.0),
-            severity_for_score(score),
-        ),
-        Line::raw(""),
-    ]
+    let coverage_line = snapshot.project.as_ref().map(|project| {
+        Line::styled(
+            format!(
+                "Go coverage: {:.1}% (scored_file_count {} / active_go_file_count {}, active_file_count {})",
+                project_coverage_percentage(project),
+                project.scored_file_count,
+                project.active_go_file_count,
+                project.active_file_count
+            ),
+            style(TuiSeverity::Muted),
+        )
+    });
+    let mut lines = vec![metric_bar_line(
+        "Repo Risk",
+        score,
+        format!("{} {:.1}", severity_label(score), score * 10.0),
+        severity_for_score(score),
+    )];
+    if let Some(coverage_line) = coverage_line {
+        lines.push(coverage_line);
+    }
+    lines.push(Line::raw(""));
+    lines
 }
 
 fn render_inspector(
@@ -1679,6 +1705,11 @@ mod tests {
 
         assert!(output.contains("Hotpath"));
         assert!(output.contains("Repo Risk"));
+        assert!(output.contains("active_file_count 2"));
+        assert!(output.contains("active_go_file_count 2"));
+        assert!(output.contains("scored_file_count 2"));
+        assert!(output.contains("coverage 100.0%"));
+        assert!(output.contains("Go coverage: 100.0%"));
         assert!(output.contains("Top Factor"));
         assert!(output.contains("Inspector"));
         assert!(output.contains("src/risky.go"));
