@@ -18,15 +18,15 @@ impl FileRiskAssessor {
         let size = normalize_size(facts, &mut limitations);
         let churn = normalized_u64(facts.total_churn_lines, 2_000);
         let recent_churn = normalize_recent_churn(facts, &mut limitations);
-        let cochange_coupling = normalized_u64(facts.co_changed_file_count, 25);
-        let source_coupling = normalize_source_coupling(facts);
-        let cognitive_complexity = normalize_complexity(facts, &mut limitations);
+        let cochange_pressure = normalized_u64(facts.co_changed_file_count, 25);
+        let source_coupling_pressure = normalize_source_coupling_pressure(facts);
+        let complexity_pressure = normalize_complexity_pressure(facts, &mut limitations);
         let ownership_risk = normalize_ownership_risk(
             facts,
             repository,
             churn,
             recent_churn,
-            cochange_coupling,
+            cochange_pressure,
             size,
             &mut limitations,
         );
@@ -52,28 +52,28 @@ impl FileRiskAssessor {
                 WEIGHT_OWNERSHIP,
             ),
             weighted_term(
-                "cochange_coupling",
+                "cochange_pressure",
                 Some(facts.co_changed_file_count as f64),
-                cochange_coupling,
+                cochange_pressure,
                 WEIGHT_COCHANGE,
             ),
             weighted_term(
-                "source_coupling",
+                "source_coupling_pressure",
                 Some(
                     facts
-                        .source_coupling_in
+                        .source_coupling_pressure_in
                         .unwrap_or_default()
-                        .max(facts.source_coupling_out.unwrap_or_default())
+                        .max(facts.source_coupling_pressure_out.unwrap_or_default())
                         as f64,
                 ),
-                source_coupling,
-                WEIGHT_SOURCE_COUPLING,
+                source_coupling_pressure,
+                WEIGHT_SOURCE_COUPLING_PRESSURE,
             ),
             weighted_term(
-                "cognitive_complexity",
-                Some(facts.cognitive_complexity.unwrap_or_default() as f64),
-                cognitive_complexity,
-                WEIGHT_COMPLEXITY,
+                "complexity_pressure",
+                Some(facts.complexity_pressure.unwrap_or_default() as f64),
+                complexity_pressure,
+                WEIGHT_COMPLEXITY_PRESSURE,
             ),
         ];
 
@@ -102,8 +102,8 @@ const WEIGHT_RECENT_CHURN: f64 = 0.14;
 const WEIGHT_SIZE: f64 = 0.12;
 const WEIGHT_OWNERSHIP: f64 = 0.14;
 const WEIGHT_COCHANGE: f64 = 0.10;
-const WEIGHT_SOURCE_COUPLING: f64 = 0.16;
-const WEIGHT_COMPLEXITY: f64 = 0.16;
+const WEIGHT_SOURCE_COUPLING_PRESSURE: f64 = 0.16;
+const WEIGHT_COMPLEXITY_PRESSURE: f64 = 0.16;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileRiskInput {
@@ -116,10 +116,10 @@ pub struct FileRiskInput {
     pub dominant_owner_share: Option<f64>,
     pub co_changed_file_count: u64,
     pub file_age_days: Option<u64>,
-    pub source_coupling_in: Option<u64>,
-    pub source_coupling_out: Option<u64>,
-    pub cognitive_complexity: Option<u64>,
-    pub max_function_complexity: Option<u64>,
+    pub source_coupling_pressure_in: Option<u64>,
+    pub source_coupling_pressure_out: Option<u64>,
+    pub complexity_pressure: Option<u64>,
+    pub max_function_complexity_pressure: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -218,22 +218,22 @@ fn normalize_recent_churn(
     Some((facts.recent_churn_lines as f64 / line_count as f64).clamp(0.0, 1.0))
 }
 
-fn normalize_source_coupling(facts: &FileRiskInput) -> Option<f64> {
-    let inbound = normalized_u64(facts.source_coupling_in.unwrap_or_default(), 25)?;
-    let outbound = normalized_u64(facts.source_coupling_out.unwrap_or_default(), 15)?;
+fn normalize_source_coupling_pressure(facts: &FileRiskInput) -> Option<f64> {
+    let inbound = normalized_u64(facts.source_coupling_pressure_in.unwrap_or_default(), 25)?;
+    let outbound = normalized_u64(facts.source_coupling_pressure_out.unwrap_or_default(), 15)?;
     Some(inbound.max(outbound))
 }
 
-fn normalize_complexity(
+fn normalize_complexity_pressure(
     facts: &FileRiskInput,
     limitations: &mut Vec<FileRiskLimitation>,
 ) -> Option<f64> {
-    let file_complexity = facts.cognitive_complexity;
-    let function_complexity = facts.max_function_complexity;
+    let file_complexity = facts.complexity_pressure;
+    let function_complexity = facts.max_function_complexity_pressure;
     if file_complexity.is_none() && function_complexity.is_none() {
         limitations.push(FileRiskLimitation {
-            code: "missing_cognitive_complexity",
-            message: "Parser-backed cognitive complexity is unavailable.",
+            code: "missing_complexity_pressure",
+            message: "Parser-backed approximate complexity pressure is unavailable.",
         });
         return None;
     }
@@ -248,7 +248,7 @@ fn normalize_ownership_risk(
     repository: &RepositoryRiskContext,
     churn: Option<f64>,
     recent_churn: Option<f64>,
-    cochange_coupling: Option<f64>,
+    cochange_pressure: Option<f64>,
     size: Option<f64>,
     limitations: &mut Vec<FileRiskLimitation>,
 ) -> f64 {
@@ -298,7 +298,7 @@ fn normalize_ownership_risk(
     let repository_maturity = repository_maturity(facts, repository, limitations);
     let file_pressure = 0.35 * churn.unwrap_or_default()
         + 0.25 * recent_churn.unwrap_or_default()
-        + 0.25 * cochange_coupling.unwrap_or_default()
+        + 0.25 * cochange_pressure.unwrap_or_default()
         + 0.15 * size.unwrap_or_default();
 
     (base_concentration * (0.20 + 0.80 * repository_maturity) * (0.30 + 0.70 * file_pressure))
@@ -397,34 +397,34 @@ fn driver_facts(facts: &FileRiskInput, score: f64) -> Vec<FileRiskFact> {
         });
     }
     if facts
-        .max_function_complexity
+        .max_function_complexity_pressure
         .is_some_and(|complexity| complexity >= 20)
     {
         drivers.push(FileRiskFact {
-            kind: "high_complexity",
+            kind: "high_complexity_pressure",
             message: format!(
-                "High function complexity: {}",
-                facts.max_function_complexity.unwrap_or_default()
+                "High approximate cognitive complexity pressure: max function {}",
+                facts.max_function_complexity_pressure.unwrap_or_default()
             ),
         });
     }
-    if facts.source_coupling_in.unwrap_or_default() >= 10
-        || facts.source_coupling_out.unwrap_or_default() >= 10
+    if facts.source_coupling_pressure_in.unwrap_or_default() >= 10
+        || facts.source_coupling_pressure_out.unwrap_or_default() >= 10
     {
         drivers.push(FileRiskFact {
-            kind: "source_coupling",
+            kind: "source_coupling_pressure",
             message: format!(
-                "High source coupling: {} inbound, {} outbound",
-                facts.source_coupling_in.unwrap_or_default(),
-                facts.source_coupling_out.unwrap_or_default()
+                "High source coupling pressure: {} inbound resolved local imports, {} outbound resolved local imports",
+                facts.source_coupling_pressure_in.unwrap_or_default(),
+                facts.source_coupling_pressure_out.unwrap_or_default()
             ),
         });
     }
     if facts.co_changed_file_count >= 15 {
         drivers.push(FileRiskFact {
-            kind: "cochange_coupling",
+            kind: "cochange_pressure",
             message: format!(
-                "High co-change breadth: {} files",
+                "High co-change pressure: {} files",
                 facts.co_changed_file_count
             ),
         });
@@ -436,7 +436,7 @@ fn driver_facts(facts: &FileRiskInput, score: f64) -> Vec<FileRiskFact> {
         drivers.push(FileRiskFact {
             kind: "ownership",
             message: format!(
-                "Concentrated ownership: dominant owner share {:.2}",
+                "High ownership concentration: dominant owner share {:.2}",
                 facts.dominant_owner_share.unwrap_or_default()
             ),
         });
@@ -445,7 +445,7 @@ fn driver_facts(facts: &FileRiskInput, score: f64) -> Vec<FileRiskFact> {
         drivers.push(FileRiskFact {
             kind: "summary",
             message: format!(
-                "Advisory risk score {:.3} from local file, Git, coupling, and complexity signals",
+                "Advisory risk score {:.3} from local file, Git, source coupling pressure, and complexity pressure signals",
                 score
             ),
         });
@@ -470,10 +470,10 @@ mod tests {
                 dominant_owner_share: Some(0.95),
                 co_changed_file_count: 100,
                 file_age_days: Some(500),
-                source_coupling_in: Some(40),
-                source_coupling_out: Some(20),
-                cognitive_complexity: Some(500),
-                max_function_complexity: Some(80),
+                source_coupling_pressure_in: Some(40),
+                source_coupling_pressure_out: Some(20),
+                complexity_pressure: Some(500),
+                max_function_complexity_pressure: Some(80),
             },
             &RepositoryRiskContext {
                 repository_age_days: Some(1_000),
@@ -488,7 +488,62 @@ mod tests {
         assert!(assessment
             .facts
             .iter()
-            .any(|fact| fact.kind == "high_complexity"));
+            .any(|fact| fact.kind == "high_complexity_pressure"));
+    }
+
+    #[test]
+    fn risky_go_file_explains_approximation_drivers() {
+        let assessment = FileRiskAssessor::new().assess(
+            &FileRiskInput {
+                relative_path: "src/risky.go".to_owned(),
+                line_count: Some(1_200),
+                byte_size: Some(120_000),
+                total_churn_lines: 2_500,
+                recent_churn_lines: 1_300,
+                owner_count: Some(1),
+                dominant_owner_share: Some(0.82),
+                co_changed_file_count: 4,
+                file_age_days: Some(400),
+                source_coupling_pressure_in: Some(12),
+                source_coupling_pressure_out: Some(3),
+                complexity_pressure: Some(180),
+                max_function_complexity_pressure: Some(24),
+            },
+            &RepositoryRiskContext {
+                repository_age_days: Some(600),
+                repository_author_count: Some(8),
+                repository_file_count: 120,
+            },
+        );
+
+        let messages = assessment
+            .facts
+            .iter()
+            .map(|fact| fact.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("High total churn")));
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("Recent churn is high")));
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("High approximate cognitive complexity pressure")));
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("resolved local imports")));
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("High ownership concentration")));
+        assert!(assessment
+            .terms
+            .iter()
+            .any(|term| term.name == "complexity_pressure"));
+        assert!(assessment
+            .terms
+            .iter()
+            .any(|term| term.name == "source_coupling_pressure"));
     }
 
     #[test]
@@ -504,10 +559,10 @@ mod tests {
                 dominant_owner_share: None,
                 co_changed_file_count: 0,
                 file_age_days: None,
-                source_coupling_in: None,
-                source_coupling_out: None,
-                cognitive_complexity: None,
-                max_function_complexity: None,
+                source_coupling_pressure_in: None,
+                source_coupling_pressure_out: None,
+                complexity_pressure: None,
+                max_function_complexity_pressure: None,
             },
             &RepositoryRiskContext::default(),
         );
@@ -519,7 +574,7 @@ mod tests {
         assert!(assessment
             .limitations
             .iter()
-            .any(|limitation| limitation.code == "missing_cognitive_complexity"));
+            .any(|limitation| limitation.code == "missing_complexity_pressure"));
         assert!(assessment
             .terms
             .iter()
@@ -539,10 +594,10 @@ mod tests {
                 dominant_owner_share: Some(0.5),
                 co_changed_file_count: 0,
                 file_age_days: Some(10),
-                source_coupling_in: Some(0),
-                source_coupling_out: Some(0),
-                cognitive_complexity: Some(0),
-                max_function_complexity: Some(0),
+                source_coupling_pressure_in: Some(0),
+                source_coupling_pressure_out: Some(0),
+                complexity_pressure: Some(0),
+                max_function_complexity_pressure: Some(0),
             },
             &RepositoryRiskContext::default(),
         );
