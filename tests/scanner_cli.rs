@@ -140,6 +140,96 @@ fn scan_reports_git_progress_for_git_repository() {
 }
 
 #[test]
+fn scan_materializes_go_package_risk_scores() {
+    let fixture = Fixture::new("scan-package-risk");
+    fixture.write("go.mod", "module example.test/hotpath\n");
+    fixture.write(
+        "cmd/app/main.go",
+        r#"package main
+
+import "example.test/hotpath/internal/service"
+
+func main() {
+	service.Run(true)
+}
+"#,
+    );
+    fixture.write(
+        "internal/service/a.go",
+        r#"package service
+
+func Run(enabled bool) int {
+	if enabled {
+		return 1
+	}
+	return 0
+}
+"#,
+    );
+    fixture.write(
+        "internal/service/b.go",
+        r#"package service
+
+func Stop(enabled bool) int {
+	if enabled {
+		return 2
+	}
+	return 0
+}
+"#,
+    );
+
+    let output = hotpath(&["scan"], &fixture.path);
+
+    assert!(
+        output.status.success(),
+        "hotpath failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let connection =
+        Connection::open(fixture.path.join(".hotpath").join("index.sqlite")).expect("db opens");
+    assert_eq!(row_count(&connection, "package_risk_scores"), 2);
+    assert_eq!(row_count(&connection, "package_risk_terms"), 10);
+    assert_eq!(row_count(&connection, "package_risk_facts"), 4);
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'package_risk_formula_id'",
+        ),
+        "hotpath.package_risk.go.v1"
+    );
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'package_risk_scores_materialized'",
+        ),
+        "2"
+    );
+    assert_eq!(
+        scalar_i64(
+            &connection,
+            "SELECT file_count FROM package_risk_scores WHERE package_path = 'internal/service'",
+        ),
+        2
+    );
+    assert_eq!(
+        scalar_i64(
+            &connection,
+            "SELECT source_coupling_in FROM package_risk_scores WHERE package_path = 'internal/service'",
+        ),
+        2
+    );
+    assert!(
+        scalar_f64(
+            &connection,
+            "SELECT score FROM package_risk_scores WHERE package_path = 'internal/service'",
+        ) > 0.0
+    );
+}
+
+#[test]
 fn second_scan_skips_git_when_head_is_unchanged() {
     let fixture = GitFixture::new("scan-git-incremental-skip");
     let author = GitIdentity::new("Hotpath Test", "hotpath.test@example.invalid");
@@ -325,6 +415,18 @@ fn row_count_where(connection: &Connection, table: &str, condition: &str) -> i64
 }
 
 fn scalar_text(connection: &Connection, sql: &str) -> String {
+    connection
+        .query_row(sql, [], |row| row.get(0))
+        .expect("scalar query should run")
+}
+
+fn scalar_i64(connection: &Connection, sql: &str) -> i64 {
+    connection
+        .query_row(sql, [], |row| row.get(0))
+        .expect("scalar query should run")
+}
+
+fn scalar_f64(connection: &Connection, sql: &str) -> f64 {
     connection
         .query_row(sql, [], |row| row.get(0))
         .expect("scalar query should run")
