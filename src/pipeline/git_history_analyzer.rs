@@ -23,6 +23,7 @@ const SECONDS_PER_DAY: i64 = 86_400;
 pub struct GitHistoryAnalyzerOptions {
     pub max_commits: Option<usize>,
     pub max_age_days: Option<i64>,
+    pub detect_renames: bool,
     pub cochange_max_files_per_commit: usize,
     pub delta_batch_size: usize,
 }
@@ -32,6 +33,7 @@ impl Default for GitHistoryAnalyzerOptions {
         Self {
             max_commits: Some(DEFAULT_GIT_MAX_COMMITS),
             max_age_days: Some(DEFAULT_GIT_MAX_AGE_DAYS),
+            detect_renames: true,
             cochange_max_files_per_commit: DEFAULT_GIT_COCHANGE_MAX_FILES_PER_COMMIT,
             delta_batch_size: DEFAULT_GIT_DELTA_BATCH_SIZE,
         }
@@ -85,10 +87,14 @@ impl GitHistoryAnalyzer {
             .arg("--reverse")
             .arg("--format=format:%x1e%H%x1f%P%x1f%an <%ae>%x1f%ct")
             .arg("--numstat")
-            .arg("--no-renames")
             .arg("--no-ext-diff")
             .arg("--first-parent")
             .arg("--root");
+        if self.options.detect_renames {
+            command.arg("--find-renames");
+        } else {
+            command.arg("--no-renames");
+        }
         if let Some(revision) = &input.revision {
             command.arg(revision);
         }
@@ -176,13 +182,17 @@ impl GitHistoryAnalyzer {
             .arg("--stdin")
             .arg("--format=format:%x1e%H%x1f%P%x1f%an <%ae>%x1f%ct")
             .arg("--numstat")
-            .arg("--no-renames")
             .arg("--no-ext-diff")
             .arg("--first-parent")
             .arg("--root")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if self.options.detect_renames {
+            command.arg("--find-renames");
+        } else {
+            command.arg("--no-renames");
+        }
         let mut child = command
             .spawn()
             .map_err(|source| GitHistoryError::CommandStart {
@@ -256,6 +266,7 @@ pub struct GitHistoryScan {
     pub head_timestamp: i64,
     pub max_commits: Option<usize>,
     pub max_age_days: Option<i64>,
+    pub detect_renames: bool,
     pub cochange_max_files_per_commit: usize,
     pub delta_batch_size: usize,
 }
@@ -334,9 +345,10 @@ pub struct GitRepositoryPlan {
 
 pub fn git_options_signature(options: &GitHistoryAnalyzerOptions) -> String {
     format!(
-        "max_commits={:?};max_age_days={:?};cochange_max_files_per_commit={};delta_batch_size={}",
+        "max_commits={:?};max_age_days={:?};detect_renames={};cochange_max_files_per_commit={};delta_batch_size={}",
         options.max_commits,
         options.max_age_days,
+        options.detect_renames,
         options.cochange_max_files_per_commit,
         options.delta_batch_size
     )
@@ -654,19 +666,13 @@ where
         broadest_commit: None,
     };
     let mut current = None;
+    let mut commits = Vec::new();
 
     for line in reader.lines() {
         let line = line.map_err(GitHistoryError::ReadStream)?;
         if let Some(header) = line.strip_prefix(RECORD_SEPARATOR) {
             if let Some(commit) = current.take() {
-                let delta = process_commit(
-                    commit,
-                    head_timestamp,
-                    cochange_max_files_per_commit,
-                    sink,
-                    &mut summary,
-                )?;
-                progress(delta);
+                commits.push(commit);
             }
             current = parse_commit_header(header);
         } else if let Some(commit) = &mut current {
@@ -677,6 +683,12 @@ where
     }
 
     if let Some(commit) = current.take() {
+        commits.push(commit);
+    }
+
+    let rename_aliases = rename_aliases(&commits);
+    for mut commit in commits {
+        commit.apply_rename_aliases(&rename_aliases);
         let delta = process_commit(
             commit,
             head_timestamp,
@@ -794,13 +806,43 @@ fn parse_numstat_line(line: &str) -> Option<ParsedFileChange> {
     let mut fields = line.split('\t');
     let added = fields.next()?.trim();
     let deleted = fields.next()?.trim();
-    let path = normalize_git_path(fields.next()?.trim())?;
+    let raw_path = fields.next()?.trim();
+    let (old_path, path) = parse_numstat_path(raw_path)?;
 
     Some(ParsedFileChange {
         path,
+        old_path,
         added_lines: parse_numstat_count(added),
         deleted_lines: parse_numstat_count(deleted),
     })
+}
+
+fn parse_numstat_path(raw_path: &str) -> Option<(Option<String>, String)> {
+    if let Some((old_path, new_path)) = parse_rename_path(raw_path) {
+        return Some((
+            Some(normalize_git_path(&old_path)?),
+            normalize_git_path(&new_path)?,
+        ));
+    }
+
+    Some((None, normalize_git_path(raw_path)?))
+}
+
+fn parse_rename_path(raw_path: &str) -> Option<(String, String)> {
+    let (before, after) = raw_path.split_once(" => ")?;
+    if let Some(open_index) = before.rfind('{') {
+        let prefix = &before[..open_index];
+        let old_part = &before[open_index + 1..];
+        let close_index = after.find('}')?;
+        let new_part = &after[..close_index];
+        let suffix = &after[close_index + 1..];
+        return Some((
+            format!("{prefix}{old_part}{suffix}"),
+            format!("{prefix}{new_part}{suffix}"),
+        ));
+    }
+
+    Some((before.to_owned(), after.to_owned()))
 }
 
 fn parse_numstat_count(value: &str) -> u64 {
@@ -835,13 +877,63 @@ impl ParsedCommit {
             })
             .or_insert(change);
     }
+
+    fn apply_rename_aliases(&mut self, aliases: &BTreeMap<String, String>) {
+        let mut rekeyed = BTreeMap::new();
+        for mut change in std::mem::take(&mut self.changes_by_path).into_values() {
+            if let Some(new_path) = resolve_rename_alias(aliases, &change.path) {
+                change.path = new_path;
+            }
+            rekeyed
+                .entry(change.path.clone())
+                .and_modify(|existing: &mut ParsedFileChange| {
+                    existing.added_lines += change.added_lines;
+                    existing.deleted_lines += change.deleted_lines;
+                })
+                .or_insert(change);
+        }
+        self.changes_by_path = rekeyed;
+    }
 }
 
 #[derive(Debug)]
 struct ParsedFileChange {
     path: String,
+    old_path: Option<String>,
     added_lines: u64,
     deleted_lines: u64,
+}
+
+fn rename_aliases(commits: &[ParsedCommit]) -> BTreeMap<String, String> {
+    let mut aliases = BTreeMap::new();
+    for commit in commits {
+        for change in commit.changes_by_path.values() {
+            if let Some(old_path) = &change.old_path {
+                let new_path = resolve_rename_alias(&aliases, &change.path)
+                    .unwrap_or_else(|| change.path.clone());
+                aliases.insert(old_path.clone(), new_path.clone());
+                for aliased_path in aliases.values_mut() {
+                    if *aliased_path == *old_path {
+                        *aliased_path = new_path.clone();
+                    }
+                }
+            }
+        }
+    }
+    aliases
+}
+
+fn resolve_rename_alias(aliases: &BTreeMap<String, String>, path: &str) -> Option<String> {
+    let mut current = path;
+    let mut resolved = None;
+    for _ in 0..aliases.len() {
+        let Some(next) = aliases.get(current) else {
+            break;
+        };
+        resolved = Some(next.clone());
+        current = next;
+    }
+    resolved
 }
 
 struct GitBatchingSink<'a, S> {
@@ -1158,6 +1250,7 @@ mod tests {
 
         assert_eq!(options.max_commits, Some(DEFAULT_GIT_MAX_COMMITS));
         assert_eq!(options.max_age_days, Some(DEFAULT_GIT_MAX_AGE_DAYS));
+        assert!(options.detect_renames);
         assert_eq!(
             options.cochange_max_files_per_commit,
             DEFAULT_GIT_COCHANGE_MAX_FILES_PER_COMMIT
@@ -1298,6 +1391,54 @@ mod tests {
             .sum::<u64>();
         assert_eq!(total_added, 3);
         assert_eq!(recent_added, 2);
+    }
+
+    #[test]
+    fn parses_git_rename_numstat_paths_to_new_path() {
+        let simple =
+            super::parse_numstat_line("0\t0\told.go => new.go").expect("rename row should parse");
+        assert_eq!(simple.old_path.as_deref(), Some("old.go"));
+        assert_eq!(simple.path, "new.go");
+
+        let braced = super::parse_numstat_line("0\t0\tsrc/{old.go => new.go}")
+            .expect("braced rename row should parse");
+        assert_eq!(braced.old_path.as_deref(), Some("src/old.go"));
+        assert_eq!(braced.path, "src/new.go");
+    }
+
+    #[test]
+    fn rename_aliases_attribute_pre_rename_metrics_to_new_path() {
+        let parsed = parse_git_history_stream(
+            0,
+            300,
+            "\x1ea\x1f\x1fAlice <alice@example.invalid>\x1f100\n\
+             5\t1\told.go\n\
+             \x1eb\x1fa\x1fAlice <alice@example.invalid>\x1f200\n\
+             0\t0\told.go => new.go\n\
+             \x1ec\x1fb\x1fAlice <alice@example.invalid>\x1f300\n\
+             2\t0\tnew.go\n",
+        );
+
+        assert!(parsed
+            .file_metrics
+            .iter()
+            .all(|metric| metric.path == "new.go"));
+        assert_eq!(
+            parsed
+                .file_metrics
+                .iter()
+                .map(|metric| metric.total_added_lines)
+                .sum::<u64>(),
+            7
+        );
+        assert_eq!(
+            parsed
+                .file_metrics
+                .iter()
+                .map(|metric| metric.commits)
+                .sum::<u64>(),
+            3
+        );
     }
 
     #[test]

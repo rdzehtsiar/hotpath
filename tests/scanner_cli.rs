@@ -232,7 +232,7 @@ fn scan_reports_git_progress_for_git_repository() {
     assert!(stdout.contains("max_commits 50000"));
     assert!(stdout.contains("max_age_days 730"));
     assert!(stdout.contains("first_parent true"));
-    assert!(stdout.contains("renames false"));
+    assert!(stdout.contains("renames true"));
     assert!(stdout.contains("cochange_max_files_per_commit 100"));
 
     let connection =
@@ -258,7 +258,7 @@ fn scan_reports_git_progress_for_git_repository() {
             &connection,
             "SELECT value FROM stage_metadata WHERE key = 'git_renames'",
         ),
-        "false"
+        "true"
     );
     assert_eq!(
         scalar_text(
@@ -266,6 +266,148 @@ fn scan_reports_git_progress_for_git_repository() {
             "SELECT value FROM stage_metadata WHERE key = 'git_recent_churn_window_days'",
         ),
         "90"
+    );
+}
+
+#[test]
+fn scan_follows_basic_git_renames_for_file_metrics() {
+    let fixture = GitFixture::new("scan-git-rename");
+    let author = GitIdentity::new("Hotpath Test", "hotpath.test@example.invalid");
+    fixture.write("old.go", "package main\n\nfunc oldName() {}\n");
+    fixture.commit(CommitOptions::new(
+        "Add old path",
+        author.clone(),
+        "2024-01-01T00:00:00Z",
+    ));
+    std::fs::rename(fixture.path().join("old.go"), fixture.path().join("new.go"))
+        .expect("fixture file should rename");
+    fixture.commit(CommitOptions::new(
+        "Rename path",
+        author.clone(),
+        "2024-01-02T00:00:00Z",
+    ));
+    fixture.write("new.go", "package main\n\nfunc newName() {}\n");
+    fixture.commit(CommitOptions::new(
+        "Update new path",
+        author,
+        "2024-01-03T00:00:00Z",
+    ));
+
+    let output = hotpath(&["scan"], fixture.path());
+
+    assert!(output.status.success());
+    let connection =
+        Connection::open(fixture.path().join(".hotpath").join("index.sqlite")).expect("db opens");
+    assert_eq!(
+        scalar_i64(
+            &connection,
+            "SELECT COUNT(*) FROM git_file_metrics WHERE path = 'old.go'",
+        ),
+        0
+    );
+    assert_eq!(
+        scalar_i64(
+            &connection,
+            "SELECT commits_per_file FROM git_file_metrics WHERE path = 'new.go'",
+        ),
+        3
+    );
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_renames'",
+        ),
+        "true"
+    );
+}
+
+#[test]
+fn scan_materializes_go_package_risk_scores() {
+    let fixture = Fixture::new("scan-package-risk");
+    fixture.write("go.mod", "module example.test/hotpath\n");
+    fixture.write(
+        "cmd/app/main.go",
+        r#"package main
+
+import "example.test/hotpath/internal/service"
+
+func main() {
+	service.Run(true)
+}
+"#,
+    );
+    fixture.write(
+        "internal/service/a.go",
+        r#"package service
+
+func Run(enabled bool) int {
+	if enabled {
+		return 1
+	}
+	return 0
+}
+"#,
+    );
+    fixture.write(
+        "internal/service/b.go",
+        r#"package service
+
+func Stop(enabled bool) int {
+	if enabled {
+		return 2
+	}
+	return 0
+}
+"#,
+    );
+
+    let output = hotpath(&["scan"], &fixture.path);
+
+    assert!(
+        output.status.success(),
+        "hotpath failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let connection =
+        Connection::open(fixture.path.join(".hotpath").join("index.sqlite")).expect("db opens");
+    assert_eq!(row_count(&connection, "package_risk_scores"), 2);
+    assert_eq!(row_count(&connection, "package_risk_terms"), 10);
+    assert_eq!(row_count(&connection, "package_risk_facts"), 4);
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'package_risk_formula_id'",
+        ),
+        "hotpath.package_risk.go.v1"
+    );
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'package_risk_scores_materialized'",
+        ),
+        "2"
+    );
+    assert_eq!(
+        scalar_i64(
+            &connection,
+            "SELECT file_count FROM package_risk_scores WHERE package_path = 'internal/service'",
+        ),
+        2
+    );
+    assert_eq!(
+        scalar_i64(
+            &connection,
+            "SELECT source_coupling_in FROM package_risk_scores WHERE package_path = 'internal/service'",
+        ),
+        2
+    );
+    assert!(
+        scalar_f64(
+            &connection,
+            "SELECT score FROM package_risk_scores WHERE package_path = 'internal/service'",
+        ) > 0.0
     );
 }
 

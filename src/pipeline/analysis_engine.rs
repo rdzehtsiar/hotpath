@@ -329,14 +329,17 @@ fn spawn_git_planner(
                     "Git analysis skipped: current directory is not a Git worktree.",
                 );
                 let _ = store_handle.store_metadata("git_first_parent", "true");
-                let _ = store_handle.store_metadata("git_renames", "false");
+                let _ = store_handle.store_metadata(
+                    "git_renames",
+                    git_history_options.detect_renames.to_string(),
+                );
                 let _ = event_sender.send(PipelineEvent::GitStatusUpdated {
                     status: GitStatus {
                         mode: Some("skipped_not_git".to_owned()),
                         confidence: Some("not_git".to_owned()),
                         collection_mode: Some("unavailable".to_owned()),
                         first_parent: Some(true),
-                        renames: Some(false),
+                        renames: Some(git_history_options.detect_renames),
                         diagnostic: Some(
                             "not_git: current directory is not a Git worktree".to_owned(),
                         ),
@@ -368,14 +371,17 @@ fn spawn_git_planner(
                     "Git analysis skipped: repository is shallow. Fetch full history to enable Git metrics.",
                 );
                 let _ = store_handle.store_metadata("git_first_parent", "true");
-                let _ = store_handle.store_metadata("git_renames", "false");
+                let _ = store_handle.store_metadata(
+                    "git_renames",
+                    git_history_options.detect_renames.to_string(),
+                );
                 let _ = event_sender.send(PipelineEvent::GitStatusUpdated {
                     status: GitStatus {
                         mode: Some("skipped_shallow".to_owned()),
                         confidence: Some("shallow_skipped".to_owned()),
                         collection_mode: Some("unavailable".to_owned()),
                         first_parent: Some(true),
-                        renames: Some(false),
+                        renames: Some(git_history_options.detect_renames),
                         head_timestamp: plan.head_timestamp,
                         diagnostic: Some(
                             "shallow_repository: fetch full history to enable Git metrics"
@@ -438,7 +444,10 @@ fn spawn_git_planner(
                 let git_confidence = git_confidence_for_mode(&git_scan_mode, &git_history_options);
                 let _ = store_handle.store_metadata("git_confidence", git_confidence);
                 let _ = store_handle.store_metadata("git_first_parent", "true");
-                let _ = store_handle.store_metadata("git_renames", "false");
+                let _ = store_handle.store_metadata(
+                    "git_renames",
+                    git_history_options.detect_renames.to_string(),
+                );
                 let _ = store_handle.store_metadata(
                     "git_recent_churn_window_days",
                     RECENT_CHURN_WINDOW_DAYS.to_string(),
@@ -485,7 +494,7 @@ fn spawn_git_planner(
                                 .unwrap_or_else(|| "unbounded".to_owned()),
                         ),
                         first_parent: Some(true),
-                        renames: Some(false),
+                        renames: Some(git_history_options.detect_renames),
                         cochange_max_files_per_commit: Some(
                             git_history_options.cochange_max_files_per_commit,
                         ),
@@ -516,6 +525,7 @@ fn spawn_git_planner(
                         } else {
                             git_history_options.max_age_days
                         },
+                        detect_renames: git_history_options.detect_renames,
                         cochange_max_files_per_commit: git_history_options
                             .cochange_max_files_per_commit,
                         delta_batch_size: git_history_options.delta_batch_size,
@@ -554,14 +564,17 @@ fn spawn_git_planner(
                 let _ = store_handle.store_metadata("git_diagnostic", diagnostic.code);
                 let _ = store_handle.store_metadata("git_diagnostic_message", diagnostic.message);
                 let _ = store_handle.store_metadata("git_first_parent", "true");
-                let _ = store_handle.store_metadata("git_renames", "false");
+                let _ = store_handle.store_metadata(
+                    "git_renames",
+                    git_history_options.detect_renames.to_string(),
+                );
                 let _ = event_sender.send(PipelineEvent::GitStatusUpdated {
                     status: GitStatus {
                         mode: Some("skipped_error".to_owned()),
                         confidence: Some("error_skipped".to_owned()),
                         collection_mode: Some("unavailable".to_owned()),
                         first_parent: Some(true),
-                        renames: Some(false),
+                        renames: Some(git_history_options.detect_renames),
                         diagnostic: Some(format!("{}: {}", diagnostic.code, diagnostic.message)),
                         ..GitStatus::default()
                     },

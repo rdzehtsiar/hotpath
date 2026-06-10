@@ -2141,7 +2141,7 @@ mod tests {
                     ('git_max_commits', '50000'),
                     ('git_max_age_days', '730'),
                     ('git_first_parent', 'true'),
-                    ('git_renames', 'false'),
+                    ('git_renames', 'true'),
                     ('git_cochange_max_files_per_commit', '100'),
                     ('git_recent_churn_window_days', '90'),
                     ('git_head_timestamp', '1700000000');

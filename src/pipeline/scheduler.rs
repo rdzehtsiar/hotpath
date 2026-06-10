@@ -626,6 +626,7 @@ mod tests {
                 head_timestamp: 0,
                 max_commits: Some(0),
                 max_age_days: None,
+                detect_renames: true,
                 cochange_max_files_per_commit: 100,
                 delta_batch_size: 10_000,
             }))
