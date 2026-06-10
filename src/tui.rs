@@ -128,7 +128,14 @@ pub struct GitMetadata {
     pub first_parent_commit_count: Option<String>,
     pub all_reachable_commit_count: Option<String>,
     pub merge_commit_count: Option<String>,
+    pub broad_commits_skipped_for_cochange: Option<String>,
+    pub max_touched_files_in_commit: Option<String>,
+    pub broadest_commit: Option<String>,
+    pub likely_automated_author_count: Option<String>,
+    pub top_author_touch_share_percent: Option<String>,
     pub warning: Option<String>,
+    pub broad_commit_warning: Option<String>,
+    pub author_concentration_warning: Option<String>,
     pub diagnostic: Option<String>,
     pub index_action: Option<String>,
 }
@@ -481,8 +488,30 @@ fn git_status_line(git: &GitMetadata) -> String {
     if let Some(merge_count) = &git.merge_commit_count {
         parts.push(format!("merge_commits {merge_count}"));
     }
+    if let Some(broad_count) = &git.broad_commits_skipped_for_cochange {
+        parts.push(format!("broad_commits_skipped {broad_count}"));
+    }
+    if let Some(max_touched) = &git.max_touched_files_in_commit {
+        parts.push(format!("max_touched_files {max_touched}"));
+    }
+    if let Some(bot_count) = &git.likely_automated_author_count {
+        parts.push(format!("likely_automated_authors {bot_count}"));
+    }
+    if let Some(top_share) = &git.top_author_touch_share_percent {
+        parts.push(format!("top_author_touch_share_percent {top_share}"));
+    }
     if let Some(warning) = &git.warning {
         parts.push(format!("warning {warning}"));
+    }
+    if let Some(warning) = &git.broad_commit_warning {
+        if !warning.is_empty() {
+            parts.push(format!("warning {warning}"));
+        }
+    }
+    if let Some(warning) = &git.author_concentration_warning {
+        if !warning.is_empty() {
+            parts.push(format!("warning {warning}"));
+        }
     }
     if let Some(diagnostic) = &git.diagnostic {
         parts.push(format!("diagnostic {diagnostic}"));
@@ -968,7 +997,16 @@ fn load_git_metadata(connection: &Connection) -> rusqlite::Result<GitMetadata> {
         first_parent_commit_count: values.get("git_first_parent_commit_count").cloned(),
         all_reachable_commit_count: values.get("git_all_reachable_commit_count").cloned(),
         merge_commit_count: values.get("git_merge_commit_count").cloned(),
+        broad_commits_skipped_for_cochange: values
+            .get("git_broad_commits_skipped_for_cochange")
+            .cloned(),
+        max_touched_files_in_commit: values.get("git_max_touched_files_in_commit").cloned(),
+        broadest_commit: values.get("git_broadest_commit").cloned(),
+        likely_automated_author_count: values.get("git_likely_automated_author_count").cloned(),
+        top_author_touch_share_percent: values.get("git_top_author_touch_share_percent").cloned(),
         warning: values.get("git_merge_heavy_warning").cloned(),
+        broad_commit_warning: values.get("git_broad_commit_warning").cloned(),
+        author_concentration_warning: values.get("git_author_concentration_warning").cloned(),
         diagnostic: values
             .get("git_diagnostic_message")
             .or_else(|| values.get("git_diagnostic"))
@@ -1911,6 +1949,8 @@ mod tests {
         assert!(output.contains("max_commits 50000"));
         assert!(output.contains("all_reachable_commits 7"));
         assert!(output.contains("undercount side-branch work"));
+        assert!(output.contains("broad_commits_skipped 1"));
+        assert!(output.contains("likely_automated_authors 1"));
         assert!(output.contains("Go coverage: 100.0%"));
         assert!(output.contains("Top Factor"));
         assert!(output.contains("Inspector"));
@@ -2165,7 +2205,14 @@ mod tests {
                     ('git_first_parent_commit_count', '4'),
                     ('git_all_reachable_commit_count', '7'),
                     ('git_merge_commit_count', '1'),
-                    ('git_merge_heavy_warning', 'all reachable history is much larger than first-parent history; Git metrics may undercount side-branch work');
+                    ('git_merge_heavy_warning', 'all reachable history is much larger than first-parent history; Git metrics may undercount side-branch work'),
+                    ('git_broad_commits_skipped_for_cochange', '1'),
+                    ('git_max_touched_files_in_commit', '101'),
+                    ('git_broadest_commit', 'abc123'),
+                    ('git_broad_commit_warning', 'commits over the co-change file limit skipped co-change pair generation but still counted churn and ownership'),
+                    ('git_likely_automated_author_count', '1'),
+                    ('git_top_author_touch_share_percent', '84'),
+                    ('git_author_concentration_warning', 'one author accounts for at least 80 percent of Git file touches; ownership may be distorted by bulk or automated changes');
                 ",
             )
             .expect("fixture schema should be created");

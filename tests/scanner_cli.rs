@@ -398,6 +398,58 @@ fn scan_warns_when_first_parent_history_hides_side_branch_work() {
 }
 
 #[test]
+fn broad_commits_skip_cochange_but_keep_churn_and_ownership() {
+    let fixture = GitFixture::new("scan-broad-commit");
+    let author = GitIdentity::new("Build Bot", "build.bot@example.invalid");
+    for index in 0..101 {
+        fixture.write(
+            format!("file-{index}.go"),
+            &format!("package main\n\nfunc file{index}() {{}}\n"),
+        );
+    }
+    fixture.commit(CommitOptions::new(
+        "Add broad generated surface",
+        author,
+        "2025-01-01T00:00:00Z",
+    ));
+
+    let output = hotpath(&["scan"], fixture.path());
+
+    assert!(output.status.success());
+    let connection =
+        Connection::open(fixture.path().join(".hotpath").join("index.sqlite")).expect("db opens");
+    assert_eq!(row_count(&connection, "git_cochanges"), 0);
+    assert_eq!(row_count(&connection, "git_file_metrics"), 101);
+    assert_eq!(row_count(&connection, "git_file_owners"), 101);
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_broad_commits_skipped_for_cochange'",
+        ),
+        "1"
+    );
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_max_touched_files_in_commit'",
+        ),
+        "101"
+    );
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_likely_automated_author_count'",
+        ),
+        "1"
+    );
+    assert!(scalar_text(
+        &connection,
+        "SELECT value FROM stage_metadata WHERE key = 'git_broad_commit_warning'",
+    )
+    .contains("still counted churn and ownership"));
+}
+
+#[test]
 fn scan_materializes_go_package_risk_scores() {
     let fixture = Fixture::new("scan-package-risk");
     fixture.write("go.mod", "module example.test/hotpath\n");

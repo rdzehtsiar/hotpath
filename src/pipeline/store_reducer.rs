@@ -1956,15 +1956,74 @@ fn finalize_git_broad_commit_metadata(
     transaction: &rusqlite::Transaction<'_>,
 ) -> Result<(), StoreReducerError> {
     transaction
-        .execute(
+        .execute_batch(
             "
             INSERT OR REPLACE INTO stage_metadata (key, value)
             SELECT
                 'git_broad_commits_skipped_for_cochange',
                 CAST(COALESCE(SUM(broad_commits_skipped_for_cochange), 0) AS TEXT)
-            FROM git_chunks
+            FROM git_chunks;
+
+            INSERT OR REPLACE INTO stage_metadata (key, value)
+            SELECT
+                'git_max_touched_files_in_commit',
+                CAST(COALESCE(MAX(max_touched_files), 0) AS TEXT)
+            FROM git_chunks;
+
+            INSERT OR REPLACE INTO stage_metadata (key, value)
+            SELECT
+                'git_broadest_commit',
+                COALESCE((
+                    SELECT broadest_commit
+                    FROM git_chunks
+                    WHERE broadest_commit IS NOT NULL
+                    ORDER BY max_touched_files DESC, broadest_commit ASC
+                    LIMIT 1
+                ), '');
+
+            INSERT OR REPLACE INTO stage_metadata (key, value)
+            SELECT
+                'git_broad_commit_warning',
+                CASE
+                    WHEN COALESCE(SUM(broad_commits_skipped_for_cochange), 0) > 0
+                    THEN 'commits over the co-change file limit skipped co-change pair generation but still counted churn and ownership'
+                    ELSE ''
+                END
+            FROM git_chunks;
+
+            INSERT OR REPLACE INTO stage_metadata (key, value)
+            SELECT
+                'git_likely_automated_author_count',
+                CAST(COUNT(*) AS TEXT)
+            FROM git_repository_authors
+            WHERE lower(author) LIKE '%bot%'
+                OR lower(author) LIKE '%automation%'
+                OR lower(author) LIKE '%noreply%';
+
+            INSERT OR REPLACE INTO stage_metadata (key, value)
+            SELECT
+                'git_top_author_touch_share_percent',
+                COALESCE(CAST(ROUND(100.0 * MAX(touches) / NULLIF(SUM(touches), 0)) AS TEXT), '0')
+            FROM (
+                SELECT author, SUM(touch_count) AS touches
+                FROM git_file_author_accumulators
+                GROUP BY author
+            );
+
+            INSERT OR REPLACE INTO stage_metadata (key, value)
+            SELECT
+                'git_author_concentration_warning',
+                CASE
+                    WHEN COALESCE(MAX(touches) * 100.0 / NULLIF(SUM(touches), 0), 0) >= 80
+                    THEN 'one author accounts for at least 80 percent of Git file touches; ownership may be distorted by bulk or automated changes'
+                    ELSE ''
+                END
+            FROM (
+                SELECT author, SUM(touch_count) AS touches
+                FROM git_file_author_accumulators
+                GROUP BY author
+            );
             ",
-            [],
         )
         .map(|_| ())
         .map_err(StoreReducerError::WriteDatabase)
@@ -3694,6 +3753,39 @@ mod tests {
                 "SELECT CAST(value AS INTEGER) FROM stage_metadata WHERE key = 'git_broad_commits_skipped_for_cochange'",
             ),
             1
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT CAST(value AS INTEGER) FROM stage_metadata WHERE key = 'git_max_touched_files_in_commit'",
+            ),
+            2
+        );
+        assert_eq!(
+            scalar_text(
+                &connection,
+                "SELECT value FROM stage_metadata WHERE key = 'git_broadest_commit'",
+            ),
+            "abc"
+        );
+        assert!(scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_broad_commit_warning'",
+        )
+        .contains("still counted churn and ownership"));
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT CAST(value AS INTEGER) FROM stage_metadata WHERE key = 'git_likely_automated_author_count'",
+            ),
+            0
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT CAST(value AS INTEGER) FROM stage_metadata WHERE key = 'git_top_author_touch_share_percent'",
+            ),
+            67
         );
     }
 
