@@ -323,6 +323,7 @@ fn spawn_git_planner(
                 let _ = store_handle.store_metadata("git_scan_mode", "skipped_not_git");
                 let _ = store_handle.store_metadata("git_collection_mode", "unavailable");
                 let _ = store_handle.store_metadata("git_confidence", "not_git");
+                let _ = store_handle.store_metadata("git_index_action", "cleared_not_git");
                 let _ = store_handle.store_metadata("git_diagnostic", "not_git");
                 let _ = store_handle.store_metadata(
                     "git_diagnostic_message",
@@ -343,6 +344,7 @@ fn spawn_git_planner(
                         diagnostic: Some(
                             "not_git: current directory is not a Git worktree".to_owned(),
                         ),
+                        index_action: Some("cleared_not_git".to_owned()),
                         ..GitStatus::default()
                     },
                 });
@@ -365,6 +367,7 @@ fn spawn_git_planner(
                 let _ = store_handle.store_metadata("git_scan_mode", "skipped_shallow");
                 let _ = store_handle.store_metadata("git_collection_mode", "unavailable");
                 let _ = store_handle.store_metadata("git_confidence", "shallow_skipped");
+                let _ = store_handle.store_metadata("git_index_action", "cleared_shallow");
                 let _ = store_handle.store_metadata("git_diagnostic", "shallow_repository");
                 let _ = store_handle.store_metadata(
                     "git_diagnostic_message",
@@ -387,6 +390,7 @@ fn spawn_git_planner(
                             "shallow_repository: fetch full history to enable Git metrics"
                                 .to_owned(),
                         ),
+                        index_action: Some("cleared_shallow".to_owned()),
                         ..GitStatus::default()
                     },
                 });
@@ -402,6 +406,7 @@ fn spawn_git_planner(
                 let mut revision = None;
                 let mut planned_git_commits = plan.total_commits;
                 let mut should_run_git = true;
+                let mut git_index_action = "fully_rebuilt".to_owned();
                 let previous_head = previous_state.last_indexed_head.as_deref();
                 let options_match = previous_state.git_options_signature.as_deref()
                     == Some(options_signature.as_str());
@@ -412,21 +417,28 @@ fn spawn_git_planner(
                     {
                         if previous_head == current_head {
                             git_scan_mode = "up_to_date".to_owned();
+                            git_index_action = "reused".to_owned();
                             should_run_git = false;
                         } else if is_ancestor(&root, previous_head, current_head).unwrap_or(false) {
                             git_scan_mode = "incremental".to_owned();
+                            git_index_action = "incrementally_updated".to_owned();
                             let range = format!("{previous_head}..{current_head}");
                             planned_git_commits = revision_commit_count(&root, &range).ok();
                             revision = Some(range);
                         } else {
                             git_scan_mode = "fallback_full".to_owned();
+                            git_index_action = "fully_rebuilt".to_owned();
                             let _ = store_handle.clear_git_data();
                         }
                     } else {
                         git_scan_mode = "fallback_full".to_owned();
+                        git_index_action = "fully_rebuilt".to_owned();
                         let _ = store_handle.clear_git_data();
                     }
                 } else {
+                    if previous_state.completed && !options_match {
+                        git_index_action = "cleared_options_changed".to_owned();
+                    }
                     let _ = store_handle.clear_git_data();
                 }
 
@@ -440,6 +452,7 @@ fn spawn_git_planner(
                 });
                 let _ = store_handle.store_metadata("git_mode", git_scan_mode.clone());
                 let _ = store_handle.store_metadata("git_scan_mode", git_scan_mode.clone());
+                let _ = store_handle.store_metadata("git_index_action", git_index_action.clone());
                 let _ = store_handle.store_metadata("git_collection_mode", "bounded_recent_stream");
                 let git_confidence = git_confidence_for_mode(&git_scan_mode, &git_history_options);
                 let _ = store_handle.store_metadata("git_confidence", git_confidence);
@@ -533,6 +546,7 @@ fn spawn_git_planner(
                         recent_churn_window_days: Some(RECENT_CHURN_WINDOW_DAYS),
                         head_timestamp: Some(head_timestamp),
                         warning: merge_warning.map(str::to_owned),
+                        index_action: Some(git_index_action.clone()),
                         ..GitStatus::default()
                     },
                 });
@@ -594,6 +608,7 @@ fn spawn_git_planner(
                 let _ = store_handle.store_metadata("git_scan_mode", "skipped_error");
                 let _ = store_handle.store_metadata("git_collection_mode", "unavailable");
                 let _ = store_handle.store_metadata("git_confidence", "error_skipped");
+                let _ = store_handle.store_metadata("git_index_action", "cleared_error");
                 let _ = store_handle.store_metadata("git_diagnostic", diagnostic.code);
                 let _ = store_handle.store_metadata("git_diagnostic_message", diagnostic.message);
                 let _ = store_handle.store_metadata("git_first_parent", "true");
@@ -609,6 +624,7 @@ fn spawn_git_planner(
                         first_parent: Some(true),
                         renames: Some(git_history_options.detect_renames),
                         diagnostic: Some(format!("{}: {}", diagnostic.code, diagnostic.message)),
+                        index_action: Some("cleared_error".to_owned()),
                         ..GitStatus::default()
                     },
                 });

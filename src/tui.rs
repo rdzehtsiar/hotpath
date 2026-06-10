@@ -1972,6 +1972,7 @@ mod tests {
         assert!(output.contains("likely_automated_authors 1"));
         assert!(output.contains("author_identity exact_author_string_name_email"));
         assert!(output.contains("mailmap ignored"));
+        assert!(output.contains("index_action fully_rebuilt"));
         assert!(output.contains("Go coverage: 100.0%"));
         assert!(output.contains("Top Factor"));
         assert!(output.contains("Inspector"));
@@ -2238,6 +2239,7 @@ mod tests {
                     ('git_ownership_weighting', 'changed_lines_with_recency_half_life_bulk_change_dampening_sustained_activity_and_others_grouping'),
                     ('git_ownership_recency_half_life_days', '730'),
                     ('git_ownership_others_grouping', 'authors outside top retained contributors are grouped as others'),
+                    ('git_index_action', 'fully_rebuilt'),
                     ('git_author_concentration_warning', 'one author accounts for at least 80 percent of Git file touches; ownership may be distorted by bulk or automated changes');
                 ",
             )

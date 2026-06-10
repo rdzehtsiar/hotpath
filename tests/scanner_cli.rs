@@ -172,6 +172,13 @@ fn scan_reports_actionable_non_git_diagnostic() {
         ),
         "not_git"
     );
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_index_action'",
+        ),
+        "cleared_not_git"
+    );
     assert!(scalar_text(
         &connection,
         "SELECT value FROM stage_metadata WHERE key = 'git_diagnostic_message'",
@@ -198,6 +205,13 @@ fn scan_reports_actionable_empty_git_repository_diagnostic() {
             "SELECT value FROM stage_metadata WHERE key = 'git_diagnostic'",
         ),
         "no_head"
+    );
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_index_action'",
+        ),
+        "cleared_error"
     );
 }
 
@@ -266,6 +280,13 @@ fn scan_reports_git_progress_for_git_repository() {
             "SELECT value FROM stage_metadata WHERE key = 'git_recent_churn_window_days'",
         ),
         "90"
+    );
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_index_action'",
+        ),
+        "fully_rebuilt"
     );
     assert_eq!(
         scalar_text(
@@ -621,6 +642,13 @@ fn second_scan_skips_git_when_head_is_unchanged() {
     assert_eq!(
         scalar_text(
             &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_index_action'",
+        ),
+        "reused"
+    );
+    assert_eq!(
+        scalar_text(
+            &connection,
             "SELECT value FROM scan_state WHERE key = 'last_scan_completed'",
         ),
         "1"
@@ -658,6 +686,13 @@ fn second_scan_processes_only_new_git_commits_when_head_advances() {
             "SELECT value FROM stage_metadata WHERE key = 'git_mode'",
         ),
         "incremental"
+    );
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_index_action'",
+        ),
+        "incrementally_updated"
     );
     assert_eq!(
         row_count_where(
