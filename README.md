@@ -54,8 +54,8 @@ Scan output is persisted as derived local cache data at:
 
 The index is local working data, not a stable public database format. It may
 contain repository-relative paths, file metadata, parser-derived Go facts, Git
-metrics, source dependency rows, and Go risk score rows. It can be deleted and
-rebuilt from local repository data.
+metrics, source dependency rows, and Go file, package, and project risk score
+rows. It can be deleted and rebuilt from local repository data.
 
 Do not commit `.hotpath/`.
 
@@ -101,6 +101,9 @@ Current Go processing is intentionally limited:
   complexity implementation or a complete model of Go execution semantics.
 - Go file risk scoring is currently limited to active rows whose language is
   `go`.
+- Go package risk is an approximate aggregation over scored Go files in the same
+  repository-relative directory. It uses package paths derived from file
+  locations, not full Go build metadata.
 - Generated and vendor Go files are excluded from Go file risk scoring by
   default so generated churn or vendored code does not dominate hotspot ranks.
   Their generated/vendor flags remain stored in file facts for inspection.

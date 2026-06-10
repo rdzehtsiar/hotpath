@@ -978,6 +978,53 @@ fn initialize_database(connection: &Connection) -> Result<(), StoreReducerError>
             CREATE INDEX IF NOT EXISTS idx_file_risk_facts_relative_path
                 ON file_risk_facts(relative_path);
 
+            CREATE TABLE IF NOT EXISTS package_risk_scores (
+                package_path TEXT NOT NULL,
+                active_scan_id INTEGER NOT NULL,
+                formula_id TEXT NOT NULL,
+                rank INTEGER NOT NULL,
+                score REAL NOT NULL,
+                risk_10 REAL NOT NULL,
+                risk_band TEXT NOT NULL,
+                file_count INTEGER NOT NULL,
+                generated_file_count INTEGER NOT NULL,
+                vendor_file_count INTEGER NOT NULL,
+                max_file_score REAL NOT NULL,
+                mean_file_score REAL NOT NULL,
+                top_3_mean_score REAL NOT NULL,
+                total_churn_lines INTEGER NOT NULL,
+                recent_churn_lines INTEGER NOT NULL,
+                cognitive_complexity INTEGER NOT NULL,
+                source_coupling_in INTEGER NOT NULL,
+                source_coupling_out INTEGER NOT NULL,
+                PRIMARY KEY (package_path, formula_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_package_risk_scores_rank
+                ON package_risk_scores(formula_id, rank);
+            CREATE INDEX IF NOT EXISTS idx_package_risk_scores_score
+                ON package_risk_scores(formula_id, score);
+
+            CREATE TABLE IF NOT EXISTS package_risk_terms (
+                package_path TEXT NOT NULL,
+                formula_id TEXT NOT NULL,
+                term_name TEXT NOT NULL,
+                raw_value REAL NOT NULL,
+                normalized_value REAL NOT NULL,
+                weight REAL NOT NULL,
+                contribution REAL NOT NULL,
+                PRIMARY KEY (package_path, formula_id, term_name)
+            );
+
+            CREATE TABLE IF NOT EXISTS package_risk_facts (
+                package_path TEXT NOT NULL,
+                formula_id TEXT NOT NULL,
+                fact_index INTEGER NOT NULL,
+                fact_kind TEXT NOT NULL,
+                message TEXT NOT NULL,
+                PRIMARY KEY (package_path, formula_id, fact_index)
+            );
+
             CREATE TABLE IF NOT EXISTS project_risk_summary (
                 formula_id TEXT PRIMARY KEY NOT NULL,
                 active_scan_id INTEGER NOT NULL,
@@ -1888,6 +1935,7 @@ fn finalize_git_tables(
     finalize_source_dependencies(root, &transaction)?;
     materialize_file_facts(&transaction)?;
     materialize_file_risk_scores(&transaction)?;
+    materialize_package_risk_scores(&transaction)?;
     materialize_project_risk_summary(&transaction)?;
     transaction
         .commit()
@@ -2568,6 +2616,405 @@ fn materialize_file_risk_scores(
         )
         .map(|_| ())
         .map_err(StoreReducerError::WriteDatabase)
+}
+
+const PACKAGE_RISK_FORMULA_ID: &str = "hotpath.package_risk.go.v1";
+const PACKAGE_WEIGHT_MAX_FILE_SCORE: f64 = 0.45;
+const PACKAGE_WEIGHT_MEAN_FILE_SCORE: f64 = 0.25;
+const PACKAGE_WEIGHT_TOP_3_MEAN_SCORE: f64 = 0.20;
+const PACKAGE_WEIGHT_FILE_COUNT: f64 = 0.05;
+const PACKAGE_WEIGHT_SOURCE_COUPLING: f64 = 0.05;
+
+#[derive(Debug, Clone)]
+struct PackageRiskRow {
+    package_path: String,
+    active_scan_id: i64,
+    file_count: u64,
+    generated_file_count: u64,
+    vendor_file_count: u64,
+    max_file_score: f64,
+    mean_file_score: f64,
+    top_3_mean_score: f64,
+    total_churn_lines: u64,
+    recent_churn_lines: u64,
+    cognitive_complexity: u64,
+    source_coupling_in: u64,
+    source_coupling_out: u64,
+    score: f64,
+    terms: Vec<PackageRiskTerm>,
+    facts: Vec<PackageRiskFact>,
+}
+
+#[derive(Debug, Clone)]
+struct PackageRiskTerm {
+    name: &'static str,
+    raw_value: f64,
+    normalized_value: f64,
+    weight: f64,
+    contribution: f64,
+}
+
+#[derive(Debug, Clone)]
+struct PackageRiskFact {
+    kind: &'static str,
+    message: String,
+}
+
+#[derive(Debug, Default)]
+struct PackageRiskAccumulator {
+    package_path: String,
+    active_scan_id: i64,
+    file_count: u64,
+    generated_file_count: u64,
+    vendor_file_count: u64,
+    scores: Vec<f64>,
+    total_churn_lines: u64,
+    recent_churn_lines: u64,
+    cognitive_complexity: u64,
+    source_coupling_in: u64,
+    source_coupling_out: u64,
+}
+
+fn materialize_package_risk_scores(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), StoreReducerError> {
+    let mut statement = transaction
+        .prepare(
+            "
+            SELECT
+                facts.relative_path,
+                facts.active_scan_id,
+                facts.is_generated,
+                facts.is_vendor,
+                score.score,
+                facts.total_churn_lines,
+                facts.recent_churn_lines,
+                facts.cognitive_complexity,
+                facts.source_coupling_in,
+                facts.source_coupling_out
+            FROM file_facts facts
+            INNER JOIN file_risk_scores score
+                ON score.relative_path = facts.relative_path
+                AND score.formula_id = ?1
+            WHERE facts.language_id = 'go'
+                AND facts.relative_path IS NOT NULL
+            ORDER BY facts.relative_path
+            ",
+        )
+        .map_err(StoreReducerError::WriteDatabase)?;
+    let rows = statement
+        .query_map([FORMULA_ID], |row| {
+            let relative_path: String = row.get(0)?;
+            Ok((
+                package_path(&relative_path),
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)? != 0,
+                row.get::<_, i64>(3)? != 0,
+                row.get::<_, f64>(4)?,
+                i64_to_u64(row.get::<_, i64>(5)?),
+                i64_to_u64(row.get::<_, i64>(6)?),
+                optional_i64_to_u64(row.get::<_, Option<i64>>(7)?).unwrap_or_default(),
+                optional_i64_to_u64(row.get::<_, Option<i64>>(8)?).unwrap_or_default(),
+                optional_i64_to_u64(row.get::<_, Option<i64>>(9)?).unwrap_or_default(),
+            ))
+        })
+        .map_err(StoreReducerError::WriteDatabase)?;
+
+    let mut accumulators: BTreeMap<String, PackageRiskAccumulator> = BTreeMap::new();
+    for row in rows {
+        let (
+            package_path,
+            active_scan_id,
+            is_generated,
+            is_vendor,
+            score,
+            total_churn_lines,
+            recent_churn_lines,
+            cognitive_complexity,
+            source_coupling_in,
+            source_coupling_out,
+        ) = row.map_err(StoreReducerError::WriteDatabase)?;
+        let accumulator =
+            accumulators
+                .entry(package_path.clone())
+                .or_insert_with(|| PackageRiskAccumulator {
+                    package_path,
+                    active_scan_id,
+                    ..PackageRiskAccumulator::default()
+                });
+        accumulator.active_scan_id = accumulator.active_scan_id.max(active_scan_id);
+        accumulator.file_count += 1;
+        accumulator.generated_file_count += u64::from(is_generated);
+        accumulator.vendor_file_count += u64::from(is_vendor);
+        accumulator.scores.push(score);
+        accumulator.total_churn_lines += total_churn_lines;
+        accumulator.recent_churn_lines += recent_churn_lines;
+        accumulator.cognitive_complexity += cognitive_complexity;
+        accumulator.source_coupling_in += source_coupling_in;
+        accumulator.source_coupling_out += source_coupling_out;
+    }
+
+    let mut package_rows = accumulators
+        .into_values()
+        .map(package_risk_row)
+        .collect::<Vec<_>>();
+    package_rows.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.package_path.cmp(&right.package_path))
+    });
+
+    transaction
+        .execute_batch(
+            "
+            DELETE FROM package_risk_scores;
+            DELETE FROM package_risk_terms;
+            DELETE FROM package_risk_facts;
+            ",
+        )
+        .map_err(StoreReducerError::WriteDatabase)?;
+
+    let mut score_statement = transaction
+        .prepare(
+            "
+            INSERT INTO package_risk_scores (
+                package_path,
+                active_scan_id,
+                formula_id,
+                rank,
+                score,
+                risk_10,
+                risk_band,
+                file_count,
+                generated_file_count,
+                vendor_file_count,
+                max_file_score,
+                mean_file_score,
+                top_3_mean_score,
+                total_churn_lines,
+                recent_churn_lines,
+                cognitive_complexity,
+                source_coupling_in,
+                source_coupling_out
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+            ",
+        )
+        .map_err(StoreReducerError::WriteDatabase)?;
+    let mut term_statement = transaction
+        .prepare(
+            "
+            INSERT INTO package_risk_terms (
+                package_path,
+                formula_id,
+                term_name,
+                raw_value,
+                normalized_value,
+                weight,
+                contribution
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ",
+        )
+        .map_err(StoreReducerError::WriteDatabase)?;
+    let mut fact_statement = transaction
+        .prepare(
+            "
+            INSERT INTO package_risk_facts (
+                package_path,
+                formula_id,
+                fact_index,
+                fact_kind,
+                message
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            ",
+        )
+        .map_err(StoreReducerError::WriteDatabase)?;
+
+    for (index, package) in package_rows.iter().enumerate() {
+        score_statement
+            .execute(params![
+                package.package_path,
+                package.active_scan_id,
+                PACKAGE_RISK_FORMULA_ID,
+                index as i64 + 1,
+                package.score,
+                package.score * 10.0,
+                package_risk_band(package.score),
+                package.file_count as i64,
+                package.generated_file_count as i64,
+                package.vendor_file_count as i64,
+                package.max_file_score,
+                package.mean_file_score,
+                package.top_3_mean_score,
+                package.total_churn_lines as i64,
+                package.recent_churn_lines as i64,
+                package.cognitive_complexity as i64,
+                package.source_coupling_in as i64,
+                package.source_coupling_out as i64,
+            ])
+            .map_err(StoreReducerError::WriteDatabase)?;
+
+        for term in &package.terms {
+            term_statement
+                .execute(params![
+                    package.package_path,
+                    PACKAGE_RISK_FORMULA_ID,
+                    term.name,
+                    term.raw_value,
+                    term.normalized_value,
+                    term.weight,
+                    term.contribution,
+                ])
+                .map_err(StoreReducerError::WriteDatabase)?;
+        }
+
+        for (fact_index, fact) in package.facts.iter().enumerate() {
+            fact_statement
+                .execute(params![
+                    package.package_path,
+                    PACKAGE_RISK_FORMULA_ID,
+                    fact_index as i64,
+                    fact.kind,
+                    fact.message,
+                ])
+                .map_err(StoreReducerError::WriteDatabase)?;
+        }
+    }
+
+    transaction
+        .execute(
+            "
+            INSERT OR REPLACE INTO stage_metadata (key, value)
+            VALUES
+                ('package_risk_formula_id', ?1),
+                ('package_risk_scores_materialized', ?2),
+                ('package_risk_scorer_version', '1')
+            ",
+            params![PACKAGE_RISK_FORMULA_ID, package_rows.len().to_string()],
+        )
+        .map(|_| ())
+        .map_err(StoreReducerError::WriteDatabase)
+}
+
+fn package_risk_row(mut accumulator: PackageRiskAccumulator) -> PackageRiskRow {
+    accumulator
+        .scores
+        .sort_by(|left, right| right.total_cmp(left));
+    let file_count = accumulator.file_count.max(1);
+    let max_file_score = accumulator.scores.first().copied().unwrap_or_default();
+    let mean_file_score = accumulator.scores.iter().sum::<f64>() / file_count as f64;
+    let top_3_count = accumulator.scores.len().clamp(1, 3);
+    let top_3_mean_score =
+        accumulator.scores.iter().take(top_3_count).sum::<f64>() / top_3_count as f64;
+    let source_coupling = accumulator
+        .source_coupling_in
+        .max(accumulator.source_coupling_out);
+    let terms = vec![
+        package_risk_term(
+            "max_file_score",
+            max_file_score,
+            max_file_score,
+            PACKAGE_WEIGHT_MAX_FILE_SCORE,
+        ),
+        package_risk_term(
+            "mean_file_score",
+            mean_file_score,
+            mean_file_score,
+            PACKAGE_WEIGHT_MEAN_FILE_SCORE,
+        ),
+        package_risk_term(
+            "top_3_mean_score",
+            top_3_mean_score,
+            top_3_mean_score,
+            PACKAGE_WEIGHT_TOP_3_MEAN_SCORE,
+        ),
+        package_risk_term(
+            "file_count",
+            accumulator.file_count as f64,
+            normalized_package_value(accumulator.file_count, 10),
+            PACKAGE_WEIGHT_FILE_COUNT,
+        ),
+        package_risk_term(
+            "source_coupling",
+            source_coupling as f64,
+            normalized_package_value(source_coupling, 10),
+            PACKAGE_WEIGHT_SOURCE_COUPLING,
+        ),
+    ];
+    let score = terms
+        .iter()
+        .map(|term| term.contribution)
+        .sum::<f64>()
+        .clamp(0.0, 1.0);
+    let facts = vec![
+        PackageRiskFact {
+            kind: "package_file_count",
+            message: format!(
+                "Package {} contains {} scored Go file(s)",
+                accumulator.package_path, accumulator.file_count
+            ),
+        },
+        PackageRiskFact {
+            kind: "package_file_scores",
+            message: format!(
+                "Package risk uses max {:.3}, mean {:.3}, and top-three mean {:.3} file scores",
+                max_file_score, mean_file_score, top_3_mean_score
+            ),
+        },
+    ];
+
+    PackageRiskRow {
+        package_path: accumulator.package_path,
+        active_scan_id: accumulator.active_scan_id,
+        file_count,
+        generated_file_count: accumulator.generated_file_count,
+        vendor_file_count: accumulator.vendor_file_count,
+        max_file_score,
+        mean_file_score,
+        top_3_mean_score,
+        total_churn_lines: accumulator.total_churn_lines,
+        recent_churn_lines: accumulator.recent_churn_lines,
+        cognitive_complexity: accumulator.cognitive_complexity,
+        source_coupling_in: accumulator.source_coupling_in,
+        source_coupling_out: accumulator.source_coupling_out,
+        score,
+        terms,
+        facts,
+    }
+}
+
+fn package_risk_term(
+    name: &'static str,
+    raw_value: f64,
+    normalized_value: f64,
+    weight: f64,
+) -> PackageRiskTerm {
+    PackageRiskTerm {
+        name,
+        raw_value,
+        normalized_value,
+        weight,
+        contribution: normalized_value * weight,
+    }
+}
+
+fn normalized_package_value(value: u64, saturation: u64) -> f64 {
+    if saturation == 0 {
+        return 0.0;
+    }
+    (value as f64 / saturation as f64).clamp(0.0, 1.0)
+}
+
+fn package_risk_band(score: f64) -> &'static str {
+    if score >= 0.85 {
+        "extreme"
+    } else if score >= 0.70 {
+        "high"
+    } else if score >= 0.40 {
+        "medium"
+    } else {
+        "low"
+    }
 }
 
 fn materialize_project_risk_summary(
@@ -3447,6 +3894,9 @@ mod tests {
         assert_eq!(table_count(&connection, "file_risk_terms"), 1);
         assert_eq!(table_count(&connection, "file_risk_limitations"), 1);
         assert_eq!(table_count(&connection, "file_risk_facts"), 1);
+        assert_eq!(table_count(&connection, "package_risk_scores"), 1);
+        assert_eq!(table_count(&connection, "package_risk_terms"), 1);
+        assert_eq!(table_count(&connection, "package_risk_facts"), 1);
         assert_eq!(table_count(&connection, "project_risk_summary"), 1);
         assert_eq!(table_count(&connection, "project_risk_terms"), 1);
         assert_eq!(table_count(&connection, "project_risk_limitations"), 1);
