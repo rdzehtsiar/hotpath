@@ -213,12 +213,26 @@ Current Git processing is also limited:
 - The default Git history scan is bounded to at most 50,000 commits.
 - The default Git history scan is bounded to commits from the last 730 days
   relative to the `HEAD` committer timestamp.
+- Scan output and the local index expose the active Git collection bounds:
+  `max_commits`, `max_age_days`, `first_parent`, rename detection,
+  co-change file limit, and the recent-churn reference window.
+- Git confidence metadata is advisory and may be `bounded`, `full`,
+  `incremental`, `first_parent_only`, `shallow_skipped`, `not_git`, or
+  `error_skipped`.
 - Incremental Git scans use the previous indexed `HEAD` when it is an ancestor
   of the current `HEAD`; otherwise Hotpath falls back to a full bounded scan.
+- The index records whether Git data was reused, incrementally updated,
+  fully rebuilt, cleared because options changed, or cleared because Git
+  analysis was unavailable.
 - Git log and show commands use `--first-parent`, so side-branch history can be
   missed by the current scan model.
-- Git log and show commands use `--no-renames`, so rename history is not
-  reconstructed across paths.
+- Hotpath compares bounded first-parent and all-reachable commit counts. If
+  side-branch history is much larger, or if many first-parent commits are
+  merges, it records a merge-heavy warning because Git metrics may undercount
+  side-branch work.
+- Git log and show commands use basic Git rename detection. Rename following is
+  path-based and heuristic: detected rename rows are attributed to the
+  post-rename path, but unusual rename/copy histories may still be approximate.
 - Root commits are included.
 - Merge handling follows the current first-parent command behavior rather than
   a complete all-parent history analysis.
@@ -228,14 +242,23 @@ Current Git processing is also limited:
   committer dates can distort recency and age metrics.
 - Author identity is the exact Git author string in the form `Name <email>`.
   `.mailmap`, bot detection, account merging, case folding, and domain
-  normalization are not applied.
+  normalization are not applied. The index explicitly records that `.mailmap`
+  is ignored.
 - Binary changes and numstat rows without numeric line counts contribute zero
   added and deleted lines.
-- Ownership weighting uses changed lines, a bulk-change dampening factor, and a
-  recency half-life. It is an operational heuristic, not a code ownership
+- Ownership weighting uses changed lines, a 730-day recency half-life,
+  bulk-change dampening, sustained-activity weighting, and an `others` grouping
+  for low-share authors. It is an operational heuristic, not a code ownership
   policy.
 - Commits touching more than 100 files are skipped for co-change pair
   generation, while their churn and authorship rows can still be recorded.
+- Hotpath records distortion metadata for broad commits, the broadest commit,
+  likely automated authors, and high author concentration. These signals are
+  visible limitations; Hotpath does not normalize bot or bulk-change authors in
+  the current scoring model.
+- Non-Git directories, shallow repositories, empty repositories with no `HEAD`,
+  missing `git`, permission failures, and unsupported Git command failures are
+  reported as actionable Git diagnostics while file scanning continues.
 - Co-change is file-pair breadth from commits, not semantic coupling. Hotpath
   reports co-change pressure and source coupling pressure as advisory signals.
 - Git metrics are stored as derived cache data and are not a stable public
