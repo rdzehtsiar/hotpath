@@ -153,6 +153,55 @@ fn scan_respects_ignore_rules_in_file_count() {
 }
 
 #[test]
+fn scan_reports_actionable_non_git_diagnostic() {
+    let fixture = Fixture::new("scan-non-git-diagnostic");
+    fixture.write("main.go", "package main\n");
+
+    let output = hotpath(&["scan"], &fixture.path);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.contains("diagnostic not_git"));
+
+    let connection =
+        Connection::open(fixture.path.join(".hotpath").join("index.sqlite")).expect("db opens");
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_diagnostic'",
+        ),
+        "not_git"
+    );
+    assert!(scalar_text(
+        &connection,
+        "SELECT value FROM stage_metadata WHERE key = 'git_diagnostic_message'",
+    )
+    .contains("not a Git worktree"));
+}
+
+#[test]
+fn scan_reports_actionable_empty_git_repository_diagnostic() {
+    let fixture = GitFixture::new("scan-empty-git-diagnostic");
+    fixture.write("main.go", "package main\n");
+
+    let output = hotpath(&["scan"], fixture.path());
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.contains("diagnostic no_head"));
+
+    let connection =
+        Connection::open(fixture.path().join(".hotpath").join("index.sqlite")).expect("db opens");
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_diagnostic'",
+        ),
+        "no_head"
+    );
+}
+
+#[test]
 fn scan_reports_git_progress_for_git_repository() {
     let fixture = GitFixture::new("scan-git-progress");
     let author = GitIdentity::new("Hotpath Test", "hotpath.test@example.invalid");

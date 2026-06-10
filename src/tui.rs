@@ -954,7 +954,10 @@ fn load_git_metadata(connection: &Connection) -> rusqlite::Result<GitMetadata> {
         recent_churn_window_days: values.get("git_recent_churn_window_days").cloned(),
         head_timestamp: values.get("git_head_timestamp").cloned(),
         warning: values.get("git_merge_heavy_warning").cloned(),
-        diagnostic: values.get("git_diagnostic").cloned(),
+        diagnostic: values
+            .get("git_diagnostic_message")
+            .or_else(|| values.get("git_diagnostic"))
+            .cloned(),
         index_action: values.get("git_index_action").cloned(),
     })
 }

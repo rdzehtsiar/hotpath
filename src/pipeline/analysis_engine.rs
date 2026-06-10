@@ -13,7 +13,7 @@ use crate::pipeline::events::{GitStatus, PipelineEvent, PipelineState};
 use crate::pipeline::file_analyzer::{file_analyzer_options_signature, FileAnalyzerOptions};
 use crate::pipeline::git_history_analyzer::{
     collect_git_plan, git_options_signature, is_ancestor, revision_commit_count,
-    GitHistoryAnalyzerOptions, GitHistoryScan, RECENT_CHURN_WINDOW_DAYS,
+    GitHistoryAnalyzerOptions, GitHistoryError, GitHistoryScan, RECENT_CHURN_WINDOW_DAYS,
 };
 use crate::pipeline::reporter::{NoopReporter, PipelineReporter};
 use crate::pipeline::scheduler::{
@@ -323,6 +323,11 @@ fn spawn_git_planner(
                 let _ = store_handle.store_metadata("git_scan_mode", "skipped_not_git");
                 let _ = store_handle.store_metadata("git_collection_mode", "unavailable");
                 let _ = store_handle.store_metadata("git_confidence", "not_git");
+                let _ = store_handle.store_metadata("git_diagnostic", "not_git");
+                let _ = store_handle.store_metadata(
+                    "git_diagnostic_message",
+                    "Git analysis skipped: current directory is not a Git worktree.",
+                );
                 let _ = store_handle.store_metadata("git_first_parent", "true");
                 let _ = store_handle.store_metadata("git_renames", "false");
                 let _ = event_sender.send(PipelineEvent::GitStatusUpdated {
@@ -332,7 +337,9 @@ fn spawn_git_planner(
                         collection_mode: Some("unavailable".to_owned()),
                         first_parent: Some(true),
                         renames: Some(false),
-                        diagnostic: Some("not a git worktree".to_owned()),
+                        diagnostic: Some(
+                            "not_git: current directory is not a Git worktree".to_owned(),
+                        ),
                         ..GitStatus::default()
                     },
                 });
@@ -355,6 +362,11 @@ fn spawn_git_planner(
                 let _ = store_handle.store_metadata("git_scan_mode", "skipped_shallow");
                 let _ = store_handle.store_metadata("git_collection_mode", "unavailable");
                 let _ = store_handle.store_metadata("git_confidence", "shallow_skipped");
+                let _ = store_handle.store_metadata("git_diagnostic", "shallow_repository");
+                let _ = store_handle.store_metadata(
+                    "git_diagnostic_message",
+                    "Git analysis skipped: repository is shallow. Fetch full history to enable Git metrics.",
+                );
                 let _ = store_handle.store_metadata("git_first_parent", "true");
                 let _ = store_handle.store_metadata("git_renames", "false");
                 let _ = event_sender.send(PipelineEvent::GitStatusUpdated {
@@ -365,7 +377,10 @@ fn spawn_git_planner(
                         first_parent: Some(true),
                         renames: Some(false),
                         head_timestamp: plan.head_timestamp,
-                        diagnostic: Some("shallow repository".to_owned()),
+                        diagnostic: Some(
+                            "shallow_repository: fetch full history to enable Git metrics"
+                                .to_owned(),
+                        ),
                         ..GitStatus::default()
                     },
                 });
@@ -525,16 +540,19 @@ fn spawn_git_planner(
                 let _ = store_handle.store_scan_state("git_options_signature", options_signature);
             }
             Err(error) => {
+                let diagnostic = classify_git_error(&error);
                 let _ = store_handle.clear_git_data();
                 let _ = store_handle.store_git_repository_summary(GitRepositorySummaryInput {
                     is_skipped: true,
-                    skip_reason: Some(error.to_string()),
+                    skip_reason: Some(diagnostic.message.to_owned()),
                     ..GitRepositorySummaryInput::default()
                 });
                 let _ = store_handle.store_metadata("git_mode", "skipped_error");
                 let _ = store_handle.store_metadata("git_scan_mode", "skipped_error");
                 let _ = store_handle.store_metadata("git_collection_mode", "unavailable");
                 let _ = store_handle.store_metadata("git_confidence", "error_skipped");
+                let _ = store_handle.store_metadata("git_diagnostic", diagnostic.code);
+                let _ = store_handle.store_metadata("git_diagnostic_message", diagnostic.message);
                 let _ = store_handle.store_metadata("git_first_parent", "true");
                 let _ = store_handle.store_metadata("git_renames", "false");
                 let _ = event_sender.send(PipelineEvent::GitStatusUpdated {
@@ -544,7 +562,7 @@ fn spawn_git_planner(
                         collection_mode: Some("unavailable".to_owned()),
                         first_parent: Some(true),
                         renames: Some(false),
-                        diagnostic: Some(error.to_string()),
+                        diagnostic: Some(format!("{}: {}", diagnostic.code, diagnostic.message)),
                         ..GitStatus::default()
                     },
                 });
@@ -555,6 +573,76 @@ fn spawn_git_planner(
             }
         }
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GitDiagnostic<'a> {
+    code: &'a str,
+    message: &'a str,
+}
+
+fn classify_git_error(error: &GitHistoryError) -> GitDiagnostic<'static> {
+    match error {
+        GitHistoryError::CommandStart { source, .. } => {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                GitDiagnostic {
+                    code: "missing_git",
+                    message: "Git analysis skipped: git executable was not found on PATH.",
+                }
+            } else if source.kind() == std::io::ErrorKind::PermissionDenied {
+                GitDiagnostic {
+                    code: "permission_denied",
+                    message: "Git analysis skipped: permission denied while starting git.",
+                }
+            } else {
+                GitDiagnostic {
+                    code: "git_command_start_failed",
+                    message: "Git analysis skipped: failed to start git command.",
+                }
+            }
+        }
+        GitHistoryError::CommandFailed { stderr, .. } => {
+            let lower = stderr.to_ascii_lowercase();
+            if lower.contains("not a git repository") {
+                GitDiagnostic {
+                    code: "invalid_repository",
+                    message: "Git analysis skipped: directory is not a valid Git repository.",
+                }
+            } else if lower.contains("ambiguous argument 'head'")
+                || lower.contains("unknown revision or path not in the working tree")
+                || lower.contains("needed a single revision")
+                || lower.contains("bad revision 'head'")
+            {
+                GitDiagnostic {
+                    code: "no_head",
+                    message: "Git analysis skipped: repository has no HEAD commit yet.",
+                }
+            } else if lower.contains("permission denied") {
+                GitDiagnostic {
+                    code: "permission_denied",
+                    message:
+                        "Git analysis skipped: permission denied while reading repository data.",
+                }
+            } else {
+                GitDiagnostic {
+                    code: "git_command_failed",
+                    message: "Git analysis skipped: git command failed for this repository.",
+                }
+            }
+        }
+        GitHistoryError::MissingPipe { .. } => GitDiagnostic {
+            code: "unsupported_repository_state",
+            message: "Git analysis skipped: git command did not provide expected output.",
+        },
+        GitHistoryError::ReadStream(_) => GitDiagnostic {
+            code: "git_output_read_failed",
+            message: "Git analysis skipped: failed to read git command output.",
+        },
+        GitHistoryError::Sink(_) => GitDiagnostic {
+            code: "git_index_write_failed",
+            message: "Git analysis skipped: failed to store Git metrics in the local index.",
+        },
+    }
 }
 
 fn git_confidence_for_mode(
@@ -642,7 +730,7 @@ mod tests {
 
     use rusqlite::Connection;
 
-    use super::{AnalysisEngine, AnalysisEngineOptions};
+    use super::{classify_git_error, AnalysisEngine, AnalysisEngineOptions, GitHistoryError};
     use crate::pipeline::events::PipelineEvent;
     use crate::pipeline::file_analyzer::FileAnalyzerOptions;
     use crate::pipeline::git_history_analyzer::GitHistoryAnalyzerOptions;
@@ -910,6 +998,31 @@ mod tests {
 
         assert_eq!(result.files_detected, 1);
         assert!(saw_git_skipped);
+    }
+
+    #[test]
+    fn classifies_missing_head_git_error() {
+        let diagnostic = classify_git_error(&GitHistoryError::CommandFailed {
+            root: PathBuf::from("."),
+            status: Some(128),
+            stderr:
+                "fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree"
+                    .to_owned(),
+        });
+
+        assert_eq!(diagnostic.code, "no_head");
+        assert!(diagnostic.message.contains("no HEAD commit"));
+    }
+
+    #[test]
+    fn classifies_missing_git_executable_error() {
+        let diagnostic = classify_git_error(&GitHistoryError::CommandStart {
+            root: PathBuf::from("."),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "not found"),
+        });
+
+        assert_eq!(diagnostic.code, "missing_git");
+        assert!(diagnostic.message.contains("not found"));
     }
 
     fn row_count(connection: &Connection, table: &str) -> i64 {
