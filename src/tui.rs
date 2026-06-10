@@ -133,6 +133,10 @@ pub struct GitMetadata {
     pub broadest_commit: Option<String>,
     pub likely_automated_author_count: Option<String>,
     pub top_author_touch_share_percent: Option<String>,
+    pub author_identity_rule: Option<String>,
+    pub mailmap: Option<String>,
+    pub ownership_weighting: Option<String>,
+    pub ownership_recency_half_life_days: Option<String>,
     pub warning: Option<String>,
     pub broad_commit_warning: Option<String>,
     pub author_concentration_warning: Option<String>,
@@ -499,6 +503,15 @@ fn git_status_line(git: &GitMetadata) -> String {
     }
     if let Some(top_share) = &git.top_author_touch_share_percent {
         parts.push(format!("top_author_touch_share_percent {top_share}"));
+    }
+    if let Some(author_rule) = &git.author_identity_rule {
+        parts.push(format!("author_identity {author_rule}"));
+    }
+    if let Some(mailmap) = &git.mailmap {
+        parts.push(format!("mailmap {mailmap}"));
+    }
+    if let Some(half_life) = &git.ownership_recency_half_life_days {
+        parts.push(format!("ownership_half_life_days {half_life}"));
     }
     if let Some(warning) = &git.warning {
         parts.push(format!("warning {warning}"));
@@ -1004,6 +1017,12 @@ fn load_git_metadata(connection: &Connection) -> rusqlite::Result<GitMetadata> {
         broadest_commit: values.get("git_broadest_commit").cloned(),
         likely_automated_author_count: values.get("git_likely_automated_author_count").cloned(),
         top_author_touch_share_percent: values.get("git_top_author_touch_share_percent").cloned(),
+        author_identity_rule: values.get("git_author_identity_rule").cloned(),
+        mailmap: values.get("git_mailmap").cloned(),
+        ownership_weighting: values.get("git_ownership_weighting").cloned(),
+        ownership_recency_half_life_days: values
+            .get("git_ownership_recency_half_life_days")
+            .cloned(),
         warning: values.get("git_merge_heavy_warning").cloned(),
         broad_commit_warning: values.get("git_broad_commit_warning").cloned(),
         author_concentration_warning: values.get("git_author_concentration_warning").cloned(),
@@ -1951,6 +1970,8 @@ mod tests {
         assert!(output.contains("undercount side-branch work"));
         assert!(output.contains("broad_commits_skipped 1"));
         assert!(output.contains("likely_automated_authors 1"));
+        assert!(output.contains("author_identity exact_author_string_name_email"));
+        assert!(output.contains("mailmap ignored"));
         assert!(output.contains("Go coverage: 100.0%"));
         assert!(output.contains("Top Factor"));
         assert!(output.contains("Inspector"));
@@ -2212,6 +2233,11 @@ mod tests {
                     ('git_broad_commit_warning', 'commits over the co-change file limit skipped co-change pair generation but still counted churn and ownership'),
                     ('git_likely_automated_author_count', '1'),
                     ('git_top_author_touch_share_percent', '84'),
+                    ('git_author_identity_rule', 'exact_author_string_name_email'),
+                    ('git_mailmap', 'ignored'),
+                    ('git_ownership_weighting', 'changed_lines_with_recency_half_life_bulk_change_dampening_sustained_activity_and_others_grouping'),
+                    ('git_ownership_recency_half_life_days', '730'),
+                    ('git_ownership_others_grouping', 'authors outside top retained contributors are grouped as others'),
                     ('git_author_concentration_warning', 'one author accounts for at least 80 percent of Git file touches; ownership may be distorted by bulk or automated changes');
                 ",
             )

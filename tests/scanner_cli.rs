@@ -267,6 +267,32 @@ fn scan_reports_git_progress_for_git_repository() {
         ),
         "90"
     );
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_recent_churn_reference'",
+        ),
+        "head_committer_timestamp"
+    );
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_author_identity_rule'",
+        ),
+        "exact_author_string_name_email"
+    );
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_mailmap'",
+        ),
+        "ignored"
+    );
+    assert!(scalar_text(
+        &connection,
+        "SELECT value FROM stage_metadata WHERE key = 'git_ownership_weighting'",
+    )
+    .contains("bulk_change_dampening"));
 }
 
 #[test]

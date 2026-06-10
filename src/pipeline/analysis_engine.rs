@@ -454,6 +454,18 @@ fn spawn_git_planner(
                 );
                 let _ = store_handle
                     .store_metadata("git_recent_churn_reference", "head_committer_timestamp");
+                let _ = store_handle
+                    .store_metadata("git_author_identity_rule", "exact_author_string_name_email");
+                let _ = store_handle.store_metadata("git_mailmap", "ignored");
+                let _ = store_handle.store_metadata(
+                    "git_ownership_weighting",
+                    "changed_lines_with_recency_half_life_bulk_change_dampening_sustained_activity_and_others_grouping",
+                );
+                let _ = store_handle.store_metadata("git_ownership_recency_half_life_days", "730");
+                let _ = store_handle.store_metadata(
+                    "git_ownership_others_grouping",
+                    "authors outside top retained contributors are grouped as others",
+                );
                 let _ =
                     store_handle.store_metadata("git_head_timestamp", head_timestamp.to_string());
                 if let Some(first_parent_count) = plan.first_parent_commit_count {
