@@ -37,6 +37,7 @@ impl FileAnalyzer {
         let window = file.first_content_window();
         let mut diagnostics = window.diagnostics.clone();
         let parser = self.parse(&file);
+        append_parser_notes(&mut diagnostics, parser.output.as_ref());
         let line_count = line_count_from_window(&window, &mut diagnostics);
         let parser_metrics = parser.output.as_ref().map(parser_metrics);
 
@@ -304,6 +305,21 @@ struct ParserMetrics {
     import_count: u64,
     cognitive_complexity: u64,
     max_function_complexity: u64,
+}
+
+fn append_parser_notes(diagnostics: &mut Vec<FileDiagnostic>, output: Option<&ParserOutput>) {
+    let Some(output) = output else {
+        return;
+    };
+
+    diagnostics.extend(output.diagnostics.iter().map(|diagnostic| FileDiagnostic {
+        code: diagnostic.code.clone(),
+        message: diagnostic.message.clone(),
+    }));
+    diagnostics.extend(output.limitations.iter().map(|limitation| FileDiagnostic {
+        code: limitation.code.clone(),
+        message: limitation.message.clone(),
+    }));
 }
 
 fn parser_metrics(output: &ParserOutput) -> ParserMetrics {
@@ -637,6 +653,48 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "line_count_skipped"));
+    }
+
+    #[test]
+    fn default_go_parser_surfaces_parser_diagnostics_in_file_result() {
+        let fixture = Fixture::new("go-parser-diagnostics");
+        let invalid_path = fixture.write("bad.go", &[b'a', 0xff]);
+        let truncated_path = fixture.write("large.go", b"package main\nfunc main() {}\n");
+        let invalid_result = FileAnalyzer::new().analyze(FileAnalysisInput { path: invalid_path });
+        let truncated_result = FileAnalyzer::with_options(FileAnalyzerOptions {
+            content_window_bytes: 8,
+            ..FileAnalyzerOptions::default()
+        })
+        .analyze(FileAnalysisInput {
+            path: truncated_path,
+        });
+
+        assert_eq!(invalid_result.parser_status, FileParserStatus::Parsed);
+        assert_eq!(invalid_result.language_id.as_deref(), Some("go"));
+        assert!(invalid_result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "invalid_utf8"));
+        assert!(invalid_result
+            .parser_output
+            .as_ref()
+            .is_some_and(|output| output
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "invalid_utf8")));
+
+        assert_eq!(truncated_result.language_id.as_deref(), Some("go"));
+        assert!(truncated_result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "truncated_source"));
+        assert!(truncated_result
+            .parser_output
+            .as_ref()
+            .is_some_and(|output| output
+                .limitations
+                .iter()
+                .any(|limitation| limitation.code == "truncated_source")));
     }
 
     #[test]

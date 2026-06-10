@@ -13,9 +13,7 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::pipeline::events::PipelineEvent;
-use crate::pipeline::file_analyzer::{
-    ContentKind, FileAnalysisResult, FileDiagnostic, FileParserStatus,
-};
+use crate::pipeline::file_analyzer::{ContentKind, FileAnalysisResult, FileParserStatus};
 use crate::pipeline::file_risk_assessor::{
     FileRiskAssessment, FileRiskAssessor, FileRiskInput, RepositoryRiskContext, FORMULA_ID,
 };
@@ -1353,7 +1351,7 @@ fn flush_batch(
                     result.import_count as i64,
                     result.cognitive_complexity.map(|value| value as i64),
                     result.max_function_complexity.map(|value| value as i64),
-                    diagnostics_json(&result.diagnostics),
+                    diagnostics_json(result),
                 ])
                 .map_err(StoreReducerError::WriteDatabase)?;
         }
@@ -3244,8 +3242,9 @@ fn parser_status_name(status: FileParserStatus) -> &'static str {
     }
 }
 
-fn diagnostics_json(diagnostics: &[FileDiagnostic]) -> String {
-    let diagnostics: Vec<_> = diagnostics
+fn diagnostics_json(result: &FileAnalysisResult) -> String {
+    let mut diagnostics: Vec<_> = result
+        .diagnostics
         .iter()
         .map(|diagnostic| {
             json!({
@@ -3254,7 +3253,33 @@ fn diagnostics_json(diagnostics: &[FileDiagnostic]) -> String {
             })
         })
         .collect();
+
+    if let Some(parser_output) = result.parser_output.as_ref() {
+        for diagnostic in &parser_output.diagnostics {
+            push_diagnostic_json(&mut diagnostics, &diagnostic.code, &diagnostic.message);
+        }
+        for limitation in &parser_output.limitations {
+            push_diagnostic_json(&mut diagnostics, &limitation.code, &limitation.message);
+        }
+    }
+
     serde_json::to_string(&diagnostics).unwrap_or_else(|_| "[]".to_owned())
+}
+
+fn push_diagnostic_json(diagnostics: &mut Vec<serde_json::Value>, code: &str, message: &str) {
+    let exists = diagnostics.iter().any(|diagnostic| {
+        diagnostic.get("code").and_then(serde_json::Value::as_str) == Some(code)
+            && diagnostic
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                == Some(message)
+    });
+    if !exists {
+        diagnostics.push(json!({
+            "code": code,
+            "message": message,
+        }));
+    }
 }
 
 fn bool_to_i64(value: bool) -> i64 {
@@ -3277,7 +3302,10 @@ mod tests {
     use super::{
         GitRepositorySummaryInput, StoreReducer, StoreReducerOptions, DEFAULT_STORE_QUEUE_CAPACITY,
     };
-    use crate::languages::{ParserOutput, UniversalCodeMetricsInput, UniversalReference};
+    use crate::languages::{
+        ParserDiagnostic, ParserLimitation, ParserOutput, UniversalCodeMetricsInput,
+        UniversalReference,
+    };
     use crate::pipeline::events::PipelineEvent;
     use crate::pipeline::file_analyzer::{ContentKind, FileAnalysisResult, FileParserStatus};
     use crate::pipeline::git_history_analyzer::{
@@ -3400,6 +3428,49 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn stores_parser_diagnostics_and_limitations_in_index_diagnostics() {
+        let fixture = Fixture::new("parser-diagnostics");
+        let (event_sender, _event_receiver) = mpsc::channel();
+        let reducer =
+            StoreReducer::start(&fixture.path, StoreReducerOptions::default(), event_sender)
+                .expect("reducer should start");
+        let mut result = file_result("bad.go");
+        result.parser_status = FileParserStatus::Parsed;
+        result.language_id = Some("go".to_owned());
+        result.parser_output = Some(ParserOutput {
+            language_id: "go".to_owned(),
+            symbols: Vec::new(),
+            references: Vec::new(),
+            metrics_input: UniversalCodeMetricsInput::default(),
+            diagnostics: vec![ParserDiagnostic {
+                code: "parse_error".to_owned(),
+                message: "Go source contains syntax errors".to_owned(),
+            }],
+            limitations: vec![ParserLimitation {
+                code: "truncated_source".to_owned(),
+                message: "Go parser skipped content beyond the active file window".to_owned(),
+            }],
+        });
+
+        reducer
+            .handle()
+            .store_file_analysis(result)
+            .expect("file result should enqueue");
+        reducer.finish().expect("reducer should finish");
+
+        let connection = Connection::open(fixture.db_path()).expect("db should open");
+        let diagnostics: String = connection
+            .query_row(
+                "SELECT diagnostics FROM file_analysis WHERE relative_path = 'bad.go'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("diagnostics should be stored");
+        assert!(diagnostics.contains("parse_error"));
+        assert!(diagnostics.contains("truncated_source"));
     }
 
     #[test]

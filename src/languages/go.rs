@@ -31,12 +31,7 @@ impl LanguageParser for GoParser {
             return ParserRecognition::NotRecognized;
         }
 
-        let window = file.first_content_window();
-        if window.content_kind == ContentKind::Text && !window.truncated {
-            ParserRecognition::Recognized
-        } else {
-            ParserRecognition::NotRecognized
-        }
+        ParserRecognition::Recognized
     }
 
     fn parse(&self, file: &AnalyzedFile) -> ParserOutput {
@@ -61,6 +56,17 @@ impl LanguageParser for GoParser {
                 return output;
             }
         };
+
+        if window.content_kind != ContentKind::Text {
+            output.diagnostics.push(ParserDiagnostic {
+                code: "unsupported_content_kind".to_owned(),
+                message: format!(
+                    "Go parser requires text source, found {}",
+                    content_kind_label(window.content_kind)
+                ),
+            });
+            return output;
+        }
 
         let mut parser = tree_sitter::Parser::new();
         if let Err(source) = parser.set_language(&tree_sitter_go::LANGUAGE.into()) {
@@ -96,6 +102,14 @@ fn has_go_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("go"))
+}
+
+fn content_kind_label(kind: ContentKind) -> &'static str {
+    match kind {
+        ContentKind::Text => "text",
+        ContentKind::Binary => "binary",
+        ContentKind::Unknown => "unknown",
+    }
 }
 
 fn empty_output(language_id: &str) -> ParserOutput {
