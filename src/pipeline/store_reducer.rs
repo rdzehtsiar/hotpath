@@ -1950,6 +1950,7 @@ fn finalize_source_dependencies(
             WHERE is_active = 1
                 AND language_id = 'go'
                 AND relative_path IS NOT NULL
+            ORDER BY relative_path ASC
             ",
         )
         .map_err(StoreReducerError::WriteDatabase)?;
@@ -2265,7 +2266,8 @@ fn materialize_file_facts(
                 GROUP BY source_path
             ) source_out
                 ON file_analysis.relative_path = source_out.source_path
-            WHERE file_analysis.is_active = 1;
+            WHERE file_analysis.is_active = 1
+            ORDER BY file_analysis.relative_path ASC;
 
             INSERT OR REPLACE INTO stage_metadata (key, value)
             VALUES
@@ -3836,6 +3838,50 @@ mod tests {
     }
 
     #[test]
+    fn materialized_package_and_file_lists_are_path_sorted() {
+        let fixture = Fixture::new("deterministic-lists");
+        write_fixture_file(&fixture.path, "zeta/z.go");
+        write_fixture_file(&fixture.path, "alpha/a.go");
+
+        let (event_sender, _event_receiver) = mpsc::channel();
+        let reducer =
+            StoreReducer::start(&fixture.path, StoreReducerOptions::default(), event_sender)
+                .expect("reducer should start");
+        let handle = reducer.handle();
+
+        handle
+            .store_file_analysis(file_result_with_imports(
+                fixture.path.join("zeta/z.go"),
+                &[],
+            ))
+            .expect("zeta file should enqueue");
+        handle
+            .store_file_analysis(file_result_with_imports(
+                fixture.path.join("alpha/a.go"),
+                &[],
+            ))
+            .expect("alpha file should enqueue");
+
+        reducer.finish().expect("reducer should finish");
+
+        let connection = Connection::open(fixture.db_path()).expect("db should open");
+        assert_eq!(
+            text_rows(
+                &connection,
+                "SELECT file_path FROM source_file_packages ORDER BY rowid"
+            ),
+            vec!["alpha/a.go".to_owned(), "zeta/z.go".to_owned()]
+        );
+        assert_eq!(
+            text_rows(
+                &connection,
+                "SELECT relative_path FROM file_facts ORDER BY rowid"
+            ),
+            vec!["alpha/a.go".to_owned(), "zeta/z.go".to_owned()]
+        );
+    }
+
+    #[test]
     fn materializes_go_file_risk_scores_with_terms_facts_and_flags() {
         let fixture = Fixture::new("file-risk");
         write_fixture_file(&fixture.path, "risky.go");
@@ -4004,6 +4050,51 @@ mod tests {
                 "SELECT COUNT(*) FROM project_risk_terms WHERE formula_id = 'hotpath.project_risk.go.v1'",
             ),
             5
+        );
+    }
+
+    #[test]
+    fn materialized_risk_rows_break_score_ties_by_path() {
+        let fixture = Fixture::new("file-risk-tie-sort");
+        write_fixture_file(&fixture.path, "zeta.go");
+        write_fixture_file(&fixture.path, "alpha.go");
+
+        let (event_sender, _event_receiver) = mpsc::channel();
+        let reducer =
+            StoreReducer::start(&fixture.path, StoreReducerOptions::default(), event_sender)
+                .expect("reducer should start");
+        let handle = reducer.handle();
+
+        handle
+            .store_file_analysis(go_result_with_metrics(
+                fixture.path.join("zeta.go"),
+                100,
+                10,
+                3,
+                false,
+                false,
+            ))
+            .expect("zeta go file should enqueue");
+        handle
+            .store_file_analysis(go_result_with_metrics(
+                fixture.path.join("alpha.go"),
+                100,
+                10,
+                3,
+                false,
+                false,
+            ))
+            .expect("alpha go file should enqueue");
+
+        reducer.finish().expect("reducer should finish");
+
+        let connection = Connection::open(fixture.db_path()).expect("db should open");
+        assert_eq!(
+            text_rows(
+                &connection,
+                "SELECT relative_path FROM file_risk_scores ORDER BY rank ASC",
+            ),
+            vec!["alpha.go".to_owned(), "zeta.go".to_owned()]
         );
     }
 
@@ -4179,6 +4270,14 @@ mod tests {
         connection
             .query_row(sql, [], |row| row.get(0))
             .expect("scalar query should run")
+    }
+
+    fn text_rows(connection: &Connection, sql: &str) -> Vec<String> {
+        let mut statement = connection.prepare(sql).expect("text rows should prepare");
+        let rows = statement
+            .query_map([], |row| row.get(0))
+            .expect("text rows should query");
+        rows.map(|row| row.expect("text row should read")).collect()
     }
 
     fn scalar_f64(connection: &Connection, sql: &str) -> f64 {
