@@ -1962,6 +1962,7 @@ fn finalize_source_dependencies(
             WHERE is_active = 1
                 AND language_id = 'go'
                 AND relative_path IS NOT NULL
+            ORDER BY relative_path
             ",
         )
         .map_err(StoreReducerError::WriteDatabase)?;
@@ -2277,7 +2278,8 @@ fn materialize_file_facts(
                 GROUP BY source_path
             ) source_out
                 ON file_analysis.relative_path = source_out.source_path
-            WHERE file_analysis.is_active = 1;
+            WHERE file_analysis.is_active = 1
+            ORDER BY file_analysis.relative_path;
 
             INSERT OR REPLACE INTO stage_metadata (key, value)
             VALUES
@@ -3645,6 +3647,44 @@ mod tests {
                 "SELECT CAST(value AS INTEGER) FROM stage_metadata WHERE key = 'file_facts_materialized'",
             ),
             1
+        );
+    }
+
+    #[test]
+    fn materializes_source_packages_and_file_facts_in_relative_path_order() {
+        let fixture = Fixture::new("deterministic-file-lists");
+        write_fixture_file(&fixture.path, "b.go");
+        write_fixture_file(&fixture.path, "a.go");
+
+        let (event_sender, _event_receiver) = mpsc::channel();
+        let reducer =
+            StoreReducer::start(&fixture.path, StoreReducerOptions::default(), event_sender)
+                .expect("reducer should start");
+        let handle = reducer.handle();
+
+        handle
+            .store_file_analysis(file_result_with_imports(fixture.path.join("b.go"), &[]))
+            .expect("b file should enqueue");
+        handle
+            .store_file_analysis(file_result_with_imports(fixture.path.join("a.go"), &[]))
+            .expect("a file should enqueue");
+
+        reducer.finish().expect("reducer should finish");
+
+        let connection = Connection::open(fixture.db_path()).expect("db should open");
+        assert_eq!(
+            scalar_text(
+                &connection,
+                "SELECT GROUP_CONCAT(file_path, ',') FROM source_file_packages",
+            ),
+            "a.go,b.go"
+        );
+        assert_eq!(
+            scalar_text(
+                &connection,
+                "SELECT GROUP_CONCAT(relative_path, ',') FROM file_facts",
+            ),
+            "a.go,b.go"
         );
     }
 

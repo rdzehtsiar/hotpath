@@ -869,7 +869,7 @@ fn load_risk_rows(connection: &Connection) -> rusqlite::Result<Vec<RiskRow>> {
         FROM file_risk_scores score
         LEFT JOIN file_facts facts
             ON facts.relative_path = score.relative_path
-        ORDER BY score.rank ASC
+        ORDER BY score.score DESC, score.relative_path ASC
         ",
     )?;
     let rows = statement.query_map([], |row| {
@@ -1662,6 +1662,34 @@ mod tests {
         assert_eq!(snapshot.rows[0].facts.len(), 1);
         assert_eq!(snapshot.rows[0].limitations.len(), 1);
         assert_eq!(snapshot.rows[0].owners.len(), 1);
+    }
+
+    #[test]
+    fn loads_risk_rows_by_score_desc_then_path_asc() {
+        let fixture = Fixture::new("risk-sort");
+        create_tui_db(&fixture.db_path());
+        let connection = Connection::open(fixture.db_path()).expect("db should open");
+        connection
+            .execute_batch(
+                "
+                UPDATE file_risk_scores
+                SET rank = 2, score = 0.9
+                WHERE relative_path = 'src/risky.go';
+                UPDATE file_risk_scores
+                SET rank = 1, score = 0.9
+                WHERE relative_path = 'src/safe.go';
+                ",
+            )
+            .expect("fixture rows should update");
+
+        let snapshot = TuiDatabaseSnapshot::load_from_dir(&fixture.path);
+
+        let paths = snapshot
+            .rows
+            .iter()
+            .map(|row| row.relative_path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["src/risky.go", "src/safe.go"]);
     }
 
     #[test]
