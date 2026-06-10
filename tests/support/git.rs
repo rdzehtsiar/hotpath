@@ -122,7 +122,7 @@ impl GitFixture {
         self.path.join(relative_path)
     }
 
-    fn git_ok<I, S>(&self, args: I)
+    pub fn git_ok<I, S>(&self, args: I)
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,

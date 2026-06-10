@@ -341,6 +341,9 @@ pub struct GitRepositoryPlan {
     pub head_commit: Option<String>,
     pub head_timestamp: Option<i64>,
     pub is_shallow: bool,
+    pub first_parent_commit_count: Option<u64>,
+    pub all_reachable_commit_count: Option<u64>,
+    pub merge_commit_count: Option<u64>,
 }
 
 pub fn git_options_signature(options: &GitHistoryAnalyzerOptions) -> String {
@@ -529,16 +532,29 @@ pub fn collect_git_plan(
     let head_timestamp = git_stdout(root, ["show", "-s", "--format=%ct", "HEAD"])?;
     let parsed_head_timestamp =
         non_empty_trimmed(head_timestamp).and_then(|value| value.parse().ok());
-    let total_commits = match parsed_head_timestamp {
+    let first_parent_commit_count = match parsed_head_timestamp {
         Some(head_timestamp) => bounded_commit_count(root, head_timestamp, options).ok(),
+        None => None,
+    };
+    let all_reachable_commit_count = match parsed_head_timestamp {
+        Some(head_timestamp) => {
+            bounded_all_reachable_commit_count(root, head_timestamp, options).ok()
+        }
+        None => None,
+    };
+    let merge_commit_count = match parsed_head_timestamp {
+        Some(head_timestamp) => bounded_merge_commit_count(root, head_timestamp, options).ok(),
         None => None,
     };
 
     Ok(Some(GitRepositoryPlan {
         head_commit: non_empty_trimmed(head_commit),
         head_timestamp: parsed_head_timestamp,
-        total_commits,
+        total_commits: first_parent_commit_count,
         is_shallow,
+        first_parent_commit_count,
+        all_reachable_commit_count,
+        merge_commit_count,
     }))
 }
 
@@ -552,6 +568,48 @@ pub fn bounded_commit_count(
         "--count".to_owned(),
         "--first-parent".to_owned(),
     ];
+    if let Some(max_age_days) = options.max_age_days {
+        let cutoff = head_timestamp - max_age_days.max(0) * SECONDS_PER_DAY;
+        args.push(format!("--since=@{cutoff}"));
+    }
+    args.push("HEAD".to_owned());
+    let count = git_stdout(root, args)?;
+    let mut total = count.trim().parse::<u64>().unwrap_or(0);
+    if let Some(max_commits) = options.max_commits {
+        total = total.min(max_commits as u64);
+    }
+    Ok(total)
+}
+
+pub fn bounded_all_reachable_commit_count(
+    root: &Path,
+    head_timestamp: i64,
+    options: &GitHistoryAnalyzerOptions,
+) -> Result<u64, GitHistoryError> {
+    bounded_rev_list_count(root, head_timestamp, options, &[])
+}
+
+pub fn bounded_merge_commit_count(
+    root: &Path,
+    head_timestamp: i64,
+    options: &GitHistoryAnalyzerOptions,
+) -> Result<u64, GitHistoryError> {
+    bounded_rev_list_count(
+        root,
+        head_timestamp,
+        options,
+        &["--first-parent", "--merges"],
+    )
+}
+
+fn bounded_rev_list_count(
+    root: &Path,
+    head_timestamp: i64,
+    options: &GitHistoryAnalyzerOptions,
+    extra_args: &[&str],
+) -> Result<u64, GitHistoryError> {
+    let mut args = vec!["rev-list".to_owned(), "--count".to_owned()];
+    args.extend(extra_args.iter().map(|arg| (*arg).to_owned()));
     if let Some(max_age_days) = options.max_age_days {
         let cutoff = head_timestamp - max_age_days.max(0) * SECONDS_PER_DAY;
         args.push(format!("--since=@{cutoff}"));

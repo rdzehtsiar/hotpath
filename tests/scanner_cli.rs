@@ -209,7 +209,7 @@ fn scan_reports_git_progress_for_git_repository() {
     fixture.commit(CommitOptions::new(
         "Add main",
         author.clone(),
-        "2024-01-01T00:00:00Z",
+        "2025-01-01T00:00:00Z",
     ));
     fixture.write("main.go", "package main\n\nfunc main() {}\n");
     fixture.commit(CommitOptions::new(
@@ -318,6 +318,82 @@ fn scan_follows_basic_git_renames_for_file_metrics() {
             "SELECT value FROM stage_metadata WHERE key = 'git_renames'",
         ),
         "true"
+    );
+}
+
+#[test]
+fn scan_warns_when_first_parent_history_hides_side_branch_work() {
+    let fixture = GitFixture::new("scan-merge-heavy");
+    let author = GitIdentity::new("Hotpath Test", "hotpath.test@example.invalid");
+    fixture.write("base.go", "package main\n");
+    fixture.commit(CommitOptions::new(
+        "Add base",
+        author.clone(),
+        "2025-01-01T00:00:00Z",
+    ));
+
+    fixture.git_ok(["checkout", "--quiet", "-b", "side"]);
+    for index in 0..3 {
+        fixture.write(
+            format!("side-{index}.go"),
+            &format!("package main\n\nfunc side{index}() {{}}\n"),
+        );
+        fixture.commit(CommitOptions::new(
+            &format!("Add side {index}"),
+            author.clone(),
+            &format!("2025-01-0{}T00:00:00Z", index + 2),
+        ));
+    }
+
+    fixture.git_ok(["checkout", "--quiet", "main"]);
+    fixture.write("main.go", "package main\n\nfunc mainPath() {}\n");
+    fixture.commit(CommitOptions::new(
+        "Add main path",
+        author,
+        "2025-01-06T00:00:00Z",
+    ));
+    fixture.git_ok(["merge", "--quiet", "--no-ff", "side", "-m", "Merge side"]);
+
+    let output = hotpath(&["scan"], fixture.path());
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.contains("warning all reachable history is much larger"));
+
+    let connection =
+        Connection::open(fixture.path().join(".hotpath").join("index.sqlite")).expect("db opens");
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_first_parent_commit_count'",
+        ),
+        "3"
+    );
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_all_reachable_commit_count'",
+        ),
+        "6"
+    );
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_merge_commit_count'",
+        ),
+        "1"
+    );
+    assert!(scalar_text(
+        &connection,
+        "SELECT value FROM stage_metadata WHERE key = 'git_merge_heavy_warning'",
+    )
+    .contains("undercount side-branch work"));
+    assert_eq!(
+        scalar_i64(
+            &connection,
+            "SELECT commits_per_file FROM git_file_metrics WHERE path = 'side-0.go'",
+        ),
+        1
     );
 }
 

@@ -456,6 +456,26 @@ fn spawn_git_planner(
                     .store_metadata("git_recent_churn_reference", "head_committer_timestamp");
                 let _ =
                     store_handle.store_metadata("git_head_timestamp", head_timestamp.to_string());
+                if let Some(first_parent_count) = plan.first_parent_commit_count {
+                    let _ = store_handle.store_metadata(
+                        "git_first_parent_commit_count",
+                        first_parent_count.to_string(),
+                    );
+                }
+                if let Some(all_reachable_count) = plan.all_reachable_commit_count {
+                    let _ = store_handle.store_metadata(
+                        "git_all_reachable_commit_count",
+                        all_reachable_count.to_string(),
+                    );
+                }
+                if let Some(merge_count) = plan.merge_commit_count {
+                    let _ = store_handle
+                        .store_metadata("git_merge_commit_count", merge_count.to_string());
+                }
+                let merge_warning = merge_heavy_warning(&plan);
+                if let Some(warning) = merge_warning {
+                    let _ = store_handle.store_metadata("git_merge_heavy_warning", warning);
+                }
                 let _ = store_handle.store_metadata(
                     "git_max_commits",
                     git_history_options
@@ -500,6 +520,7 @@ fn spawn_git_planner(
                         ),
                         recent_churn_window_days: Some(RECENT_CHURN_WINDOW_DAYS),
                         head_timestamp: Some(head_timestamp),
+                        warning: merge_warning.map(str::to_owned),
                         ..GitStatus::default()
                     },
                 });
@@ -667,6 +688,28 @@ fn git_confidence_for_mode(
         _ if options.max_commits.is_some() || options.max_age_days.is_some() => "bounded",
         _ => "first_parent_only",
     }
+}
+
+fn merge_heavy_warning(
+    plan: &crate::pipeline::git_history_analyzer::GitRepositoryPlan,
+) -> Option<&'static str> {
+    let first_parent = plan.first_parent_commit_count?;
+    let all_reachable = plan.all_reachable_commit_count?;
+    let merges = plan.merge_commit_count.unwrap_or(0);
+
+    if first_parent >= 4 && merges >= 3 && merges * 4 >= first_parent {
+        return Some(
+            "many first-parent commits are merges; Git metrics may undercount side-branch work",
+        );
+    }
+    if all_reachable >= first_parent.saturating_add(3)
+        && all_reachable * 4 >= first_parent.max(1) * 5
+    {
+        return Some(
+            "all reachable history is much larger than first-parent history; Git metrics may undercount side-branch work",
+        );
+    }
+    None
 }
 
 fn spawn_total_counter(

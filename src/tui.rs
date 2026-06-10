@@ -125,6 +125,9 @@ pub struct GitMetadata {
     pub cochange_max_files_per_commit: Option<String>,
     pub recent_churn_window_days: Option<String>,
     pub head_timestamp: Option<String>,
+    pub first_parent_commit_count: Option<String>,
+    pub all_reachable_commit_count: Option<String>,
+    pub merge_commit_count: Option<String>,
     pub warning: Option<String>,
     pub diagnostic: Option<String>,
     pub index_action: Option<String>,
@@ -468,6 +471,15 @@ fn git_status_line(git: &GitMetadata) -> String {
     }
     if let Some(head_timestamp) = &git.head_timestamp {
         parts.push(format!("head_timestamp {head_timestamp}"));
+    }
+    if let Some(first_parent_count) = &git.first_parent_commit_count {
+        parts.push(format!("first_parent_commits {first_parent_count}"));
+    }
+    if let Some(all_reachable_count) = &git.all_reachable_commit_count {
+        parts.push(format!("all_reachable_commits {all_reachable_count}"));
+    }
+    if let Some(merge_count) = &git.merge_commit_count {
+        parts.push(format!("merge_commits {merge_count}"));
     }
     if let Some(warning) = &git.warning {
         parts.push(format!("warning {warning}"));
@@ -953,6 +965,9 @@ fn load_git_metadata(connection: &Connection) -> rusqlite::Result<GitMetadata> {
         cochange_max_files_per_commit: values.get("git_cochange_max_files_per_commit").cloned(),
         recent_churn_window_days: values.get("git_recent_churn_window_days").cloned(),
         head_timestamp: values.get("git_head_timestamp").cloned(),
+        first_parent_commit_count: values.get("git_first_parent_commit_count").cloned(),
+        all_reachable_commit_count: values.get("git_all_reachable_commit_count").cloned(),
+        merge_commit_count: values.get("git_merge_commit_count").cloned(),
         warning: values.get("git_merge_heavy_warning").cloned(),
         diagnostic: values
             .get("git_diagnostic_message")
@@ -1894,6 +1909,8 @@ mod tests {
         assert!(output.contains("coverage 100.0%"));
         assert!(output.contains("git confidence bounded"));
         assert!(output.contains("max_commits 50000"));
+        assert!(output.contains("all_reachable_commits 7"));
+        assert!(output.contains("undercount side-branch work"));
         assert!(output.contains("Go coverage: 100.0%"));
         assert!(output.contains("Top Factor"));
         assert!(output.contains("Inspector"));
@@ -2144,7 +2161,11 @@ mod tests {
                     ('git_renames', 'true'),
                     ('git_cochange_max_files_per_commit', '100'),
                     ('git_recent_churn_window_days', '90'),
-                    ('git_head_timestamp', '1700000000');
+                    ('git_head_timestamp', '1700000000'),
+                    ('git_first_parent_commit_count', '4'),
+                    ('git_all_reachable_commit_count', '7'),
+                    ('git_merge_commit_count', '1'),
+                    ('git_merge_heavy_warning', 'all reachable history is much larger than first-parent history; Git metrics may undercount side-branch work');
                 ",
             )
             .expect("fixture schema should be created");
