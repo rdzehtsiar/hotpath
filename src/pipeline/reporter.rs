@@ -10,6 +10,8 @@ const COUNT_VALUE_WIDTH: usize = 9;
 const TOTAL_VALUE_WIDTH: usize = 10;
 const SPEED_VALUE_WIDTH: usize = 10;
 const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(100);
+#[cfg(windows)]
+const UTF8_CODE_PAGE: u32 = 65001;
 
 pub trait PipelineReporter {
     fn update(&mut self, state: &PipelineState);
@@ -285,25 +287,51 @@ impl ProgressBarStyle {
 }
 
 fn ascii_only_terminal() -> bool {
-    if std::env::var_os("NO_COLOR").is_some() {
+    let term = std::env::var("TERM").ok();
+    ascii_only_terminal_for(
+        std::env::var_os("NO_COLOR").is_some(),
+        term.as_deref(),
+        terminal_platform(),
+    )
+}
+
+fn ascii_only_terminal_for(no_color: bool, term: Option<&str>, platform: TerminalPlatform) -> bool {
+    if no_color {
         return true;
     }
 
-    if std::env::var("TERM")
-        .map(|term| term.eq_ignore_ascii_case("dumb"))
-        .unwrap_or(false)
-    {
+    if term.is_some_and(|term| term.eq_ignore_ascii_case("dumb")) {
         return true;
     }
 
-    if cfg!(windows) {
-        return std::env::var("CHCP")
-            .or_else(|_| std::env::var("CODEPAGE"))
-            .map(|code_page| code_page != "65001")
-            .unwrap_or(false);
+    if let TerminalPlatform::Windows { output_utf8 } = platform {
+        return !output_utf8;
     }
 
     false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalPlatform {
+    Windows { output_utf8: bool },
+    Other,
+}
+
+#[cfg(windows)]
+fn terminal_platform() -> TerminalPlatform {
+    TerminalPlatform::Windows {
+        output_utf8: windows_console_output_is_utf8(),
+    }
+}
+
+#[cfg(not(windows))]
+fn terminal_platform() -> TerminalPlatform {
+    TerminalPlatform::Other
+}
+
+#[cfg(windows)]
+fn windows_console_output_is_utf8() -> bool {
+    unsafe { windows_sys::Win32::System::Console::GetConsoleOutputCP() == UTF8_CODE_PAGE }
 }
 
 #[cfg(test)]
@@ -311,8 +339,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        render_git_status_lines, render_progress_bar, render_progress_row, render_report_lines,
-        render_report_lines_with_style, PipelineReporter, ProgressBarStyle, StdioReporter,
+        ascii_only_terminal_for, render_git_status_lines, render_progress_bar, render_progress_row,
+        render_report_lines, render_report_lines_with_style, PipelineReporter, ProgressBarStyle,
+        StdioReporter, TerminalPlatform,
     };
     use crate::pipeline::events::{GitStatus, PipelineState};
 
@@ -412,6 +441,43 @@ mod tests {
         let lines = render_report_lines_with_style(&state, ProgressBarStyle::Ascii);
 
         assert!(lines[0].contains("[############            ]"));
+    }
+
+    #[test]
+    fn style_detection_uses_ascii_when_no_color_is_set() {
+        assert!(ascii_only_terminal_for(true, None, TerminalPlatform::Other));
+    }
+
+    #[test]
+    fn style_detection_uses_ascii_when_term_is_dumb() {
+        assert!(ascii_only_terminal_for(
+            false,
+            Some("dumb"),
+            TerminalPlatform::Other
+        ));
+    }
+
+    #[test]
+    fn style_detection_allows_unicode_on_non_windows_without_ascii_signal() {
+        assert!(!ascii_only_terminal_for(
+            false,
+            None,
+            TerminalPlatform::Other
+        ));
+    }
+
+    #[test]
+    fn style_detection_requires_confirmed_utf8_output_on_windows() {
+        assert!(!ascii_only_terminal_for(
+            false,
+            None,
+            TerminalPlatform::Windows { output_utf8: true }
+        ));
+        assert!(ascii_only_terminal_for(
+            false,
+            None,
+            TerminalPlatform::Windows { output_utf8: false }
+        ));
     }
 
     #[test]
