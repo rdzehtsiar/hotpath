@@ -6,6 +6,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rusqlite::Connection;
+use serde_json::Value;
 
 mod support;
 
@@ -91,6 +92,85 @@ fn scan_prints_file_and_git_progress_summary() {
     let connection =
         Connection::open(fixture.path.join(".hotpath").join("index.sqlite")).expect("db opens");
     assert_eq!(row_count(&connection, "file_analysis"), 2);
+}
+
+#[test]
+fn scan_json_reports_stable_non_git_summary_without_progress() {
+    let fixture = Fixture::new("scan-json-non-git");
+    fixture.write("main.go", "package main\n");
+    fixture.write("nested/worker.go", "package nested\n");
+
+    let output = hotpath(&["scan", "--json"], &fixture.path);
+
+    assert!(
+        output.status.success(),
+        "hotpath scan --json failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.ends_with('\n'));
+    assert_eq!(stdout.lines().count(), 1);
+    assert!(!stdout.contains("| speed"));
+    assert!(!stdout.contains("summary"));
+
+    let json: Value = serde_json::from_str(&stdout).expect("stdout should be JSON");
+    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["command"], "scan");
+    assert_eq!(json["files"]["detected"], 2);
+    assert_eq!(json["files"]["analyzed"], 2);
+    assert_eq!(json["git"]["skipped"], true);
+    assert_eq!(json["git"]["mode"], "skipped_not_git");
+    assert_eq!(json["git"]["confidence"], "not_git");
+    assert_eq!(json["git"]["commits_total"], 0);
+    assert_eq!(json["git"]["commits_processed"], 0);
+    assert_eq!(json["git"]["diagnostic"], "not_git");
+    assert_eq!(json["git"]["index_action"], "cleared_not_git");
+    assert!(json["index"]["records_stored"].as_u64().unwrap_or_default() > 0);
+}
+
+#[test]
+fn scan_json_reports_stable_git_summary() {
+    let fixture = GitFixture::new("scan-json-git");
+    let author = GitIdentity::new("Hotpath Test", "hotpath.test@example.invalid");
+    fixture.write("main.go", "package main\n");
+    fixture.commit(CommitOptions::new(
+        "Add main",
+        author.clone(),
+        "2025-01-01T00:00:00Z",
+    ));
+    fixture.write("main.go", "package main\n\nfunc main() {}\n");
+    fixture.commit(CommitOptions::new(
+        "Update main",
+        author,
+        "2025-01-02T00:00:00Z",
+    ));
+
+    let output = hotpath(&["scan", "--json"], fixture.path());
+
+    assert!(
+        output.status.success(),
+        "hotpath scan --json failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    let json: Value = serde_json::from_str(&stdout).expect("stdout should be JSON");
+
+    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["files"]["detected"], 1);
+    assert_eq!(json["files"]["analyzed"], 1);
+    assert_eq!(json["git"]["skipped"], false);
+    assert_eq!(json["git"]["mode"], "full");
+    assert_eq!(json["git"]["confidence"], "bounded");
+    assert_eq!(json["git"]["commits_total"], 2);
+    assert_eq!(json["git"]["commits_processed"], 2);
+    assert_eq!(json["git"]["diagnostic"], Value::Null);
+    assert_eq!(json["git"]["index_action"], "fully_rebuilt");
 }
 
 #[test]
@@ -861,6 +941,23 @@ fn tui_command_is_recognized_by_clap() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     assert!(stdout.contains("Usage:"));
     assert!(stdout.contains("tui"));
+}
+
+#[test]
+fn scan_json_flag_is_recognized_by_clap() {
+    let fixture = Fixture::new("scan-json-help");
+
+    let output = hotpath(&["scan", "--help"], &fixture.path);
+
+    assert!(
+        output.status.success(),
+        "hotpath scan --help failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.contains("Usage:"));
+    assert!(stdout.contains("--json"));
 }
 
 fn final_scan_lines(stdout: &str) -> Vec<String> {

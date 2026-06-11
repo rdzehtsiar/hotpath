@@ -37,6 +37,12 @@ pub struct AnalysisEngineOptions {
     pub store_reducer: StoreReducerOptions,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScanOutcome {
+    pub enumeration: EnumerationResult,
+    pub state: PipelineState,
+}
+
 #[derive(Debug)]
 pub enum AnalysisEngineError {
     Enumeration(EnumerationError),
@@ -107,10 +113,26 @@ impl AnalysisEngine {
         self.scan_with_reporter(&mut reporter)
     }
 
+    pub fn scan_with_state(&self) -> Result<ScanOutcome, AnalysisEngineError> {
+        let mut reporter = NoopReporter;
+        self.scan_with_reporter_and_state(&mut reporter)
+    }
+
     pub fn scan_with_reporter<R>(
         &self,
         reporter: &mut R,
     ) -> Result<EnumerationResult, AnalysisEngineError>
+    where
+        R: PipelineReporter,
+    {
+        self.scan_with_reporter_and_state(reporter)
+            .map(|outcome| outcome.enumeration)
+    }
+
+    pub fn scan_with_reporter_and_state<R>(
+        &self,
+        reporter: &mut R,
+    ) -> Result<ScanOutcome, AnalysisEngineError>
     where
         R: PipelineReporter,
     {
@@ -120,7 +142,10 @@ impl AnalysisEngine {
             reporter.update(state);
         });
         reporter.finish(&latest_state);
-        result
+        result.map(|enumeration| ScanOutcome {
+            enumeration,
+            state: latest_state,
+        })
     }
 
     pub fn scan_with_event_observer<F>(

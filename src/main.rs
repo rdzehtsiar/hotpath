@@ -3,8 +3,12 @@
 use std::env;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+use hotpath::pipeline::events::PipelineState;
 use hotpath::pipeline::reporter::StdioReporter;
+use serde::Serialize;
+
+const SCAN_JSON_SCHEMA_VERSION: u64 = 1;
 
 #[derive(Debug, Parser)]
 #[command(name = "hotpath")]
@@ -17,16 +21,23 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Enumerate repository files and print scan throughput.
-    Scan,
+    Scan(ScanArgs),
     /// Open the read-only Hotpath terminal UI for the current index.
     Tui,
+}
+
+#[derive(Debug, Args)]
+struct ScanArgs {
+    /// Write a stable JSON scan summary instead of terminal progress.
+    #[arg(long)]
+    json: bool,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Scan => run_scan(),
+        Commands::Scan(args) => run_scan(args),
         Commands::Tui => run_tui(),
     }
 }
@@ -41,8 +52,7 @@ fn run_tui() -> ExitCode {
     }
 }
 
-fn run_scan() -> ExitCode {
-    let mut reporter = StdioReporter::stdout();
+fn run_scan(args: ScanArgs) -> ExitCode {
     let root = match env::current_dir()
         .map_err(hotpath::pipeline::enumerator::EnumerationError::CurrentDir)
         .map_err(hotpath::pipeline::analysis_engine::AnalysisEngineError::Enumeration)
@@ -55,6 +65,28 @@ fn run_scan() -> ExitCode {
     };
 
     let engine = hotpath::pipeline::analysis_engine::AnalysisEngine::new(&root);
+    if args.json {
+        let outcome = match engine.scan_with_state() {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                eprintln!("hotpath: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        match serde_json::to_string(&ScanJsonOutput::from_state(&outcome.state)) {
+            Ok(json) => {
+                println!("{json}");
+                return ExitCode::SUCCESS;
+            }
+            Err(error) => {
+                eprintln!("hotpath: failed to serialize scan JSON: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    let mut reporter = StdioReporter::stdout();
     if let Err(error) = engine.scan_with_reporter(&mut reporter) {
         eprintln!("hotpath: {error}");
         return ExitCode::FAILURE;
@@ -71,6 +103,62 @@ fn run_scan() -> ExitCode {
         Err(error) => {
             eprintln!("hotpath: {error}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ScanJsonOutput {
+    schema_version: u64,
+    command: &'static str,
+    files: ScanJsonFiles,
+    git: ScanJsonGit,
+    index: ScanJsonIndex,
+}
+
+#[derive(Debug, Serialize)]
+struct ScanJsonFiles {
+    detected: u64,
+    analyzed: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ScanJsonGit {
+    skipped: bool,
+    mode: Option<String>,
+    confidence: Option<String>,
+    commits_total: Option<u64>,
+    commits_processed: u64,
+    diagnostic: Option<String>,
+    index_action: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ScanJsonIndex {
+    records_stored: u64,
+}
+
+impl ScanJsonOutput {
+    fn from_state(state: &PipelineState) -> Self {
+        Self {
+            schema_version: SCAN_JSON_SCHEMA_VERSION,
+            command: "scan",
+            files: ScanJsonFiles {
+                detected: state.total_files.unwrap_or(state.enumerated_files),
+                analyzed: state.analyzed_files,
+            },
+            git: ScanJsonGit {
+                skipped: state.git_skipped,
+                mode: state.git_status.mode.clone(),
+                confidence: state.git_status.confidence.clone(),
+                commits_total: state.total_git_commits,
+                commits_processed: state.git_commits_processed,
+                diagnostic: state.git_status.diagnostic.clone(),
+                index_action: state.git_status.index_action.clone(),
+            },
+            index: ScanJsonIndex {
+                records_stored: state.stored_records,
+            },
         }
     }
 }
