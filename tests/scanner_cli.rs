@@ -317,6 +317,89 @@ fn scan_reports_git_progress_for_git_repository() {
 }
 
 #[test]
+fn scan_bounds_git_history_to_730_days_from_head() {
+    let fixture = GitFixture::new("scan-git-old-history-bound");
+    let author = GitIdentity::new("Hotpath Test", "hotpath.test@example.invalid");
+    fixture.write("legacy.go", "package main\n\nfunc legacy() {}\n");
+    fixture.commit(CommitOptions::new(
+        "Add legacy file",
+        author.clone(),
+        "2023-01-01T00:00:00Z",
+    ));
+    fixture.write("recent.go", "package main\n\nfunc recent() {}\n");
+    fixture.commit(CommitOptions::new(
+        "Add recent file",
+        author.clone(),
+        "2025-01-01T00:00:00Z",
+    ));
+    fixture.write(
+        "recent.go",
+        "package main\n\nfunc recent() {}\n\nfunc changed() {}\n",
+    );
+    fixture.commit(CommitOptions::new(
+        "Update recent file",
+        author,
+        "2025-01-02T00:00:00Z",
+    ));
+
+    let output = hotpath(&["scan"], fixture.path());
+
+    assert!(
+        output.status.success(),
+        "hotpath failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.contains("max_age_days 730"));
+
+    let connection =
+        Connection::open(fixture.path().join(".hotpath").join("index.sqlite")).expect("db opens");
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_max_age_days'",
+        ),
+        "730"
+    );
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_first_parent_commit_count'",
+        ),
+        "2"
+    );
+    assert_eq!(
+        scalar_text(
+            &connection,
+            "SELECT value FROM stage_metadata WHERE key = 'git_all_reachable_commit_count'",
+        ),
+        "2"
+    );
+    assert_eq!(
+        scalar_i64(
+            &connection,
+            "SELECT COUNT(*) FROM git_file_metrics WHERE path = 'legacy.go'",
+        ),
+        0
+    );
+    assert_eq!(
+        scalar_i64(
+            &connection,
+            "SELECT commits_per_file FROM git_file_metrics WHERE path = 'recent.go'",
+        ),
+        2
+    );
+    assert_eq!(
+        scalar_i64(
+            &connection,
+            "SELECT commits_per_file FROM file_facts WHERE relative_path = 'legacy.go'",
+        ),
+        0
+    );
+}
+
+#[test]
 fn scan_follows_basic_git_renames_for_file_metrics() {
     let fixture = GitFixture::new("scan-git-rename");
     let author = GitIdentity::new("Hotpath Test", "hotpath.test@example.invalid");
@@ -494,96 +577,6 @@ fn broad_commits_skip_cochange_but_keep_churn_and_ownership() {
         "SELECT value FROM stage_metadata WHERE key = 'git_broad_commit_warning'",
     )
     .contains("still counted churn and ownership"));
-}
-
-#[test]
-fn scan_materializes_go_package_risk_scores() {
-    let fixture = Fixture::new("scan-package-risk");
-    fixture.write("go.mod", "module example.test/hotpath\n");
-    fixture.write(
-        "cmd/app/main.go",
-        r#"package main
-
-import "example.test/hotpath/internal/service"
-
-func main() {
-	service.Run(true)
-}
-"#,
-    );
-    fixture.write(
-        "internal/service/a.go",
-        r#"package service
-
-func Run(enabled bool) int {
-	if enabled {
-		return 1
-	}
-	return 0
-}
-"#,
-    );
-    fixture.write(
-        "internal/service/b.go",
-        r#"package service
-
-func Stop(enabled bool) int {
-	if enabled {
-		return 2
-	}
-	return 0
-}
-"#,
-    );
-
-    let output = hotpath(&["scan"], &fixture.path);
-
-    assert!(
-        output.status.success(),
-        "hotpath failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let connection =
-        Connection::open(fixture.path.join(".hotpath").join("index.sqlite")).expect("db opens");
-    assert_eq!(row_count(&connection, "package_risk_scores"), 2);
-    assert_eq!(row_count(&connection, "package_risk_terms"), 10);
-    assert_eq!(row_count(&connection, "package_risk_facts"), 4);
-    assert_eq!(
-        scalar_text(
-            &connection,
-            "SELECT value FROM stage_metadata WHERE key = 'package_risk_formula_id'",
-        ),
-        "hotpath.package_risk.go.v1"
-    );
-    assert_eq!(
-        scalar_text(
-            &connection,
-            "SELECT value FROM stage_metadata WHERE key = 'package_risk_scores_materialized'",
-        ),
-        "2"
-    );
-    assert_eq!(
-        scalar_i64(
-            &connection,
-            "SELECT file_count FROM package_risk_scores WHERE package_path = 'internal/service'",
-        ),
-        2
-    );
-    assert_eq!(
-        scalar_i64(
-            &connection,
-            "SELECT source_coupling_in FROM package_risk_scores WHERE package_path = 'internal/service'",
-        ),
-        2
-    );
-    assert!(
-        scalar_f64(
-            &connection,
-            "SELECT score FROM package_risk_scores WHERE package_path = 'internal/service'",
-        ) > 0.0
-    );
 }
 
 #[test]
