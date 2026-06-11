@@ -26,7 +26,7 @@ enum Commands {
     /// Explain indexed metrics and score context for one file.
     Explain(ExplainArgs),
     /// Show ranked Go file hotspots from the latest complete local index.
-    Hotspots,
+    Hotspots(HotspotsArgs),
     /// Open the read-only Hotpath terminal UI for the current index.
     Tui,
 }
@@ -47,6 +47,13 @@ struct ExplainArgs {
     format: ExplainFormat,
 }
 
+#[derive(Debug, Args)]
+struct HotspotsArgs {
+    /// Show Go test-file hotspots instead of production Go hotspots.
+    #[arg(long)]
+    tests: bool,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ExplainFormat {
     Text,
@@ -59,7 +66,7 @@ fn main() -> ExitCode {
     match cli.command {
         Commands::Scan(args) => run_scan(args),
         Commands::Explain(args) => run_explain(args),
-        Commands::Hotspots => run_hotspots(),
+        Commands::Hotspots(args) => run_hotspots(args),
         Commands::Tui => run_tui(),
     }
 }
@@ -163,7 +170,7 @@ fn run_explain(args: ExplainArgs) -> ExitCode {
     }
 }
 
-fn run_hotspots() -> ExitCode {
+fn run_hotspots(args: HotspotsArgs) -> ExitCode {
     let current_dir = match env::current_dir() {
         Ok(current_dir) => current_dir,
         Err(error) => {
@@ -171,7 +178,12 @@ fn run_hotspots() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let report = match hotpath::hotspots::load_hotspots_report(&current_dir) {
+    let scope = if args.tests {
+        hotpath::hotspots::HotspotScope::Tests
+    } else {
+        hotpath::hotspots::HotspotScope::Production
+    };
+    let report = match hotpath::hotspots::load_hotspots_report(&current_dir, scope) {
         Ok(report) => report,
         Err(error) => {
             eprintln!("hotpath: {error}");

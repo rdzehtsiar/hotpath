@@ -19,6 +19,7 @@ The CLI currently exposes these subcommands:
 ```powershell
 hotpath scan
 hotpath explain <path>
+hotpath hotspots
 hotpath tui
 ```
 
@@ -38,6 +39,16 @@ hotpath tui
 
 `hotpath scan --json` writes a compact JSON scan summary. There is no current CI
 gate or stable report schema beyond the explicitly versioned command JSON.
+
+### `hotpath hotspots`
+
+`hotpath hotspots` reads the nearest existing `.hotpath/index.sqlite` and prints
+the top production Go file hotspots from the latest completed scan. Test files
+are excluded from this default view.
+
+Use `hotpath hotspots --tests` to print Go test-file hotspots. Test hotspot
+scores use the same advisory formula, but they reflect test maintenance
+pressure and should not be interpreted as production runtime risk.
 
 ### `hotpath explain <path>`
 
@@ -128,9 +139,13 @@ Current Go processing is intentionally limited:
   complexity implementation or a complete model of Go execution semantics.
 - Go file risk scoring is currently limited to active rows whose language is
   `go`.
-- Go package risk is an approximate aggregation over scored Go files in the same
-  repository-relative directory. It uses package paths derived from file
-  locations, not full Go build metadata.
+- Default hotspot, package-risk, and project-risk output is production-focused:
+  non-generated, non-vendor `_test.go` files are still scored and indexed, but
+  excluded from production project and package risk. Use test-specific hotspot
+  output to inspect them separately.
+- Go package risk is an approximate aggregation over scored production Go files
+  in the same repository-relative directory. It uses package paths derived from
+  file locations, not full Go build metadata.
 - Generated and vendor Go files are excluded from Go file risk scoring by
   default so generated churn or vendored code does not dominate hotspot ranks.
   Their generated/vendor flags remain stored in file facts for inspection.

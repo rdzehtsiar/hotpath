@@ -13,7 +13,14 @@ const DRIVER_LIMIT: usize = 4;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HotspotsReport {
+    pub scope: HotspotScope,
     pub rows: Vec<HotspotRow>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotspotScope {
+    Production,
+    Tests,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +90,7 @@ impl std::error::Error for HotspotsError {
 
 pub fn load_hotspots_report(
     current_dir: impl AsRef<Path>,
+    scope: HotspotScope,
 ) -> Result<HotspotsReport, HotspotsError> {
     let index_root = find_index_root(current_dir.as_ref()).ok_or(HotspotsError::NoIndex)?;
     let index_path = index_root.join(INDEX_DB);
@@ -92,19 +100,20 @@ pub fn load_hotspots_report(
             source,
         })?;
 
-    load_hotspots_report_from_connection(&connection, DEFAULT_HOTSPOT_LIMIT)
+    load_hotspots_report_from_connection(&connection, DEFAULT_HOTSPOT_LIMIT, scope)
 }
 
 fn load_hotspots_report_from_connection(
     connection: &Connection,
     limit: usize,
+    scope: HotspotScope,
 ) -> Result<HotspotsReport, HotspotsError> {
     if !index_is_complete(connection)? {
         return Err(HotspotsError::IncompleteIndex);
     }
 
     let confidence = load_project_confidence(connection)?.unwrap_or_else(|| "none".to_owned());
-    let score_rows = load_score_rows(connection, limit)?;
+    let score_rows = load_score_rows(connection, limit, scope)?;
     let facts = load_facts(connection)?;
     let terms = load_terms(connection)?;
 
@@ -130,15 +139,25 @@ fn load_hotspots_report_from_connection(
         })
         .collect();
 
-    Ok(HotspotsReport { rows })
+    Ok(HotspotsReport { scope, rows })
 }
 
 pub fn render_hotspots_table(report: &HotspotsReport) -> String {
     if report.rows.is_empty() {
-        return "No scored Go file hotspots found.".to_owned();
+        return match report.scope {
+            HotspotScope::Production => "No scored production Go file hotspots found.".to_owned(),
+            HotspotScope::Tests => "No scored Go test-file hotspots found.".to_owned(),
+        };
     }
 
-    let mut lines = vec!["Rank  Score  Path  Drivers  Tags  Confidence".to_owned()];
+    let title = match report.scope {
+        HotspotScope::Production => "Production Go hotspots",
+        HotspotScope::Tests => "Go test-file hotspots",
+    };
+    let mut lines = vec![
+        title.to_owned(),
+        "Rank  Score  Path  Drivers  Tags  Confidence".to_owned(),
+    ];
     lines.extend(report.rows.iter().map(render_hotspot_row));
     lines.join("\n")
 }
@@ -218,6 +237,7 @@ fn load_project_confidence(connection: &Connection) -> Result<Option<String>, Ho
 fn load_score_rows(
     connection: &Connection,
     limit: usize,
+    scope: HotspotScope,
 ) -> Result<Vec<HotspotScoreRow>, HotspotsError> {
     let mut statement = connection
         .prepare(
@@ -230,13 +250,18 @@ fn load_score_rows(
                 is_test
             FROM file_risk_scores
             WHERE formula_id = ?1
+                AND is_test = ?2
             ORDER BY score DESC, relative_path ASC
-            LIMIT ?2
+            LIMIT ?3
             ",
         )
         .map_err(HotspotsError::QueryDatabase)?;
+    let test_flag = match scope {
+        HotspotScope::Production => 0_i64,
+        HotspotScope::Tests => 1_i64,
+    };
     let rows = statement
-        .query_map(params![FORMULA_ID, limit as i64], |row| {
+        .query_map(params![FORMULA_ID, test_flag, limit as i64], |row| {
             Ok(HotspotScoreRow {
                 score: row.get(0)?,
                 relative_path: row.get(1)?,
@@ -365,12 +390,13 @@ mod tests {
 
     use super::{
         load_hotspots_report_from_connection, render_hotspots_table, tags_for_row, HotspotRow,
-        HotspotScoreRow, HotspotTerm, HotspotsError, HotspotsReport,
+        HotspotScope, HotspotScoreRow, HotspotTerm, HotspotsError, HotspotsReport,
     };
 
     #[test]
     fn renders_hotspots_table_with_requested_columns() {
         let report = HotspotsReport {
+            scope: HotspotScope::Production,
             rows: vec![HotspotRow {
                 rank: 1,
                 score: 0.875,
@@ -383,7 +409,8 @@ mod tests {
 
         let rendered = render_hotspots_table(&report);
 
-        assert!(rendered.starts_with("Rank  Score  Path  Drivers  Tags  Confidence"));
+        assert!(rendered.starts_with("Production Go hotspots"));
+        assert!(rendered.contains("Rank  Score  Path  Drivers  Tags  Confidence"));
         assert!(rendered.contains("0.875"));
         assert!(rendered.contains("internal/service/risky.go"));
         assert!(rendered.contains("High total churn"));
@@ -393,9 +420,12 @@ mod tests {
 
     #[test]
     fn empty_report_renders_empty_state() {
-        let rendered = render_hotspots_table(&HotspotsReport { rows: Vec::new() });
+        let rendered = render_hotspots_table(&HotspotsReport {
+            scope: HotspotScope::Production,
+            rows: Vec::new(),
+        });
 
-        assert_eq!(rendered, "No scored Go file hotspots found.");
+        assert_eq!(rendered, "No scored production Go file hotspots found.");
     }
 
     #[test]
@@ -443,7 +473,7 @@ mod tests {
             )
             .expect("schema should be created");
 
-        let error = load_hotspots_report_from_connection(&connection, 20)
+        let error = load_hotspots_report_from_connection(&connection, 20, HotspotScope::Production)
             .expect_err("incomplete index should fail");
 
         assert!(matches!(error, HotspotsError::IncompleteIndex));
@@ -461,7 +491,8 @@ mod tests {
                 INSERT INTO file_risk_scores VALUES
                     ('z.go', 'z.go', 1, 'hotpath.score.go.v1', 3, 0.8, 8.0, 'high', 0, 0, 0),
                     ('a.go', 'a.go', 1, 'hotpath.score.go.v1', 2, 0.8, 8.0, 'high', 0, 0, 0),
-                    ('m.go', 'm.go', 1, 'hotpath.score.go.v1', 1, 0.9, 9.0, 'extreme', 0, 0, 0);
+                    ('m.go', 'm.go', 1, 'hotpath.score.go.v1', 1, 0.9, 9.0, 'extreme', 0, 0, 0),
+                    ('test_test.go', 'test_test.go', 1, 'hotpath.score.go.v1', 4, 1.0, 10.0, 'extreme', 0, 0, 1);
                 INSERT INTO file_risk_facts VALUES
                     ('m.go', 'hotpath.score.go.v1', 0, 'summary', 'M fact'),
                     ('a.go', 'hotpath.score.go.v1', 0, 'summary', 'A fact');
@@ -472,8 +503,8 @@ mod tests {
             )
             .expect("rows should insert");
 
-        let report =
-            load_hotspots_report_from_connection(&connection, 2).expect("hotspots should load");
+        let report = load_hotspots_report_from_connection(&connection, 2, HotspotScope::Production)
+            .expect("hotspots should load");
 
         assert_eq!(report.rows.len(), 2);
         assert_eq!(report.rows[0].relative_path, "m.go");
@@ -483,6 +514,31 @@ mod tests {
         assert_eq!(report.rows[0].confidence, "bounded");
         assert_eq!(report.rows[0].drivers, vec!["M fact"]);
         assert_eq!(report.rows[0].tags, vec!["CHURN"]);
+    }
+
+    #[test]
+    fn loader_can_return_test_hotspots_separately() {
+        let connection = Connection::open_in_memory().expect("database opens");
+        create_hotspots_schema(&connection);
+        connection
+            .execute_batch(
+                "
+                INSERT INTO scan_state VALUES ('last_scan_completed', '1');
+                INSERT INTO project_risk_summary VALUES ('hotpath.project_risk.go.v1', 'bounded');
+                INSERT INTO file_risk_scores VALUES
+                    ('prod.go', 'prod.go', 1, 'hotpath.score.go.v1', 1, 0.9, 9.0, 'extreme', 0, 0, 0),
+                    ('prod_test.go', 'prod_test.go', 1, 'hotpath.score.go.v1', 2, 0.8, 8.0, 'high', 0, 0, 1);
+                ",
+            )
+            .expect("rows should insert");
+
+        let report = load_hotspots_report_from_connection(&connection, 20, HotspotScope::Tests)
+            .expect("test hotspots should load");
+
+        assert_eq!(report.scope, HotspotScope::Tests);
+        assert_eq!(report.rows.len(), 1);
+        assert_eq!(report.rows[0].relative_path, "prod_test.go");
+        assert_eq!(report.rows[0].tags, vec!["TEST"]);
     }
 
     fn create_hotspots_schema(connection: &Connection) {

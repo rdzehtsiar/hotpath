@@ -46,6 +46,7 @@ pub struct TuiDatabaseSnapshot {
     pub project: Option<ProjectRiskSummary>,
     pub git: GitMetadata,
     pub rows: Vec<RiskRow>,
+    pub test_rows: Vec<RiskRow>,
 }
 
 impl TuiDatabaseSnapshot {
@@ -57,11 +58,15 @@ impl TuiDatabaseSnapshot {
                 project: None,
                 git: GitMetadata::default(),
                 rows: Vec::new(),
+                test_rows: Vec::new(),
             };
         };
         match Self::load_from_index_root(&index_root) {
             Ok(mut snapshot) => {
-                if snapshot.rows.is_empty() && snapshot.status.is_none() {
+                if snapshot.rows.is_empty()
+                    && snapshot.test_rows.is_empty()
+                    && snapshot.status.is_none()
+                {
                     snapshot.status = Some(
                         "No scored Go files found. Run hotpath scan after Go files are present."
                             .to_owned(),
@@ -75,6 +80,7 @@ impl TuiDatabaseSnapshot {
                 project: None,
                 git: GitMetadata::default(),
                 rows: Vec::new(),
+                test_rows: Vec::new(),
             },
         }
     }
@@ -86,13 +92,14 @@ impl TuiDatabaseSnapshot {
         )?;
         let project = load_project_summary(&connection)?;
         let git = load_git_metadata(&connection)?;
-        let mut rows = load_risk_rows(&connection)?;
+        let mut rows = load_risk_rows(&connection, false)?;
+        let mut test_rows = load_risk_rows(&connection, true)?;
         let terms = load_terms(&connection)?;
         let facts = load_facts(&connection)?;
         let limitations = load_limitations(&connection)?;
         let owners = load_owners(&connection)?;
 
-        for row in &mut rows {
+        for row in rows.iter_mut().chain(test_rows.iter_mut()) {
             row.terms = terms.get(&row.relative_path).cloned().unwrap_or_default();
             row.facts = facts.get(&row.relative_path).cloned().unwrap_or_default();
             row.limitations = limitations
@@ -109,6 +116,7 @@ impl TuiDatabaseSnapshot {
             project,
             git,
             rows,
+            test_rows,
         })
     }
 }
@@ -169,6 +177,7 @@ pub struct RiskRow {
     pub risk_band: String,
     pub is_generated: bool,
     pub is_vendor: bool,
+    pub is_test: bool,
     pub line_count: Option<u64>,
     pub byte_size: Option<u64>,
     pub language_id: Option<String>,
@@ -225,6 +234,7 @@ struct TuiState {
     selected: usize,
     search_query: String,
     search_editing: bool,
+    show_tests: bool,
     show_help: bool,
     should_exit: bool,
 }
@@ -288,19 +298,19 @@ impl TuiState {
             selected: 0,
             search_query: String::new(),
             search_editing: false,
+            show_tests: false,
             show_help: false,
             should_exit: false,
         }
     }
 
     fn filtered_indices(&self, snapshot: &TuiDatabaseSnapshot) -> Vec<usize> {
+        let rows = active_rows(snapshot, self);
         if self.search_query.is_empty() {
-            return (0..snapshot.rows.len()).collect();
+            return (0..rows.len()).collect();
         }
         let query = self.search_query.to_ascii_lowercase();
-        snapshot
-            .rows
-            .iter()
+        rows.iter()
             .enumerate()
             .filter(|(_index, row)| row.relative_path.to_ascii_lowercase().contains(&query))
             .map(|(index, _row)| index)
@@ -357,6 +367,10 @@ fn reduce_key(state: &mut TuiState, snapshot: &TuiDatabaseSnapshot, key: KeyEven
         KeyCode::Char('q') => state.should_exit = true,
         KeyCode::Char('?') => state.show_help = !state.show_help,
         KeyCode::Char('/') => state.search_editing = true,
+        KeyCode::Char('t') => {
+            state.show_tests = !state.show_tests;
+            state.selected = 0;
+        }
         KeyCode::Esc => {
             if state.show_help {
                 state.show_help = false;
@@ -667,7 +681,7 @@ fn render_inspector(
     ];
     match selected_row(snapshot, state) {
         Some(row) => lines.extend(inspector_lines(row, content.width)),
-        None => lines.extend(empty_state_lines(snapshot)),
+        None => lines.extend(empty_state_lines(snapshot, state)),
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), content);
 }
@@ -685,6 +699,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     } else if state.search_query.is_empty() {
         [
             "j/k or arrows move",
+            "t tests",
             "/ search",
             "g/G jump",
             "? help",
@@ -693,7 +708,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .join(HOTSPOT_TAG_SEPARATOR)
     } else {
         format!(
-            "filter /{}{HOTSPOT_TAG_SEPARATOR}Esc clear{HOTSPOT_TAG_SEPARATOR}j/k move{HOTSPOT_TAG_SEPARATOR}? help{HOTSPOT_TAG_SEPARATOR}q quit",
+            "filter /{}{HOTSPOT_TAG_SEPARATOR}t tests{HOTSPOT_TAG_SEPARATOR}Esc clear{HOTSPOT_TAG_SEPARATOR}j/k move{HOTSPOT_TAG_SEPARATOR}? help{HOTSPOT_TAG_SEPARATOR}q quit",
             state.search_query,
         )
     };
@@ -717,6 +732,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::raw(""),
         Line::raw("j/k or arrows  move selection"),
         Line::raw("g/G            first / last row"),
+        Line::raw("t              toggle production / test hotspots"),
         Line::raw("/              search paths"),
         Line::raw("Esc            clear search or close help"),
         Line::raw("q              quit"),
@@ -735,8 +751,9 @@ fn visible_risk_lines(
     max_rows: usize,
 ) -> Vec<Line<'static>> {
     let indices = state.filtered_indices(snapshot);
-    if snapshot.rows.is_empty() {
-        return empty_state_lines(snapshot);
+    let rows = active_rows(snapshot, state);
+    if rows.is_empty() {
+        return empty_state_lines(snapshot, state);
     }
     if indices.is_empty() {
         return vec![Line::styled(
@@ -755,9 +772,7 @@ fn visible_risk_lines(
         .skip(start)
         .take(max_rows.max(1))
         .filter_map(|(display_index, row_index)| {
-            snapshot
-                .rows
-                .get(*row_index)
+            rows.get(*row_index)
                 .map(|row| risk_row_line(row, display_index == selected, width))
         })
         .collect()
@@ -868,6 +883,12 @@ fn inspector_lines(row: &RiskRow, width: u16) -> Vec<Line<'static>> {
         lines.push(Line::raw(""));
         lines.push(Line::styled(tags, style(TuiSeverity::Muted)));
     }
+    if row.is_test {
+        lines.push(Line::styled(
+            "Test hotspot scores reflect test maintenance pressure and should not be interpreted as production runtime risk.",
+            style(TuiSeverity::Muted),
+        ));
+    }
 
     if !row.parser_diagnostics.is_empty() {
         lines.push(Line::raw(""));
@@ -916,12 +937,17 @@ fn inspector_lines(row: &RiskRow, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-fn empty_state_lines(snapshot: &TuiDatabaseSnapshot) -> Vec<Line<'static>> {
+fn empty_state_lines(snapshot: &TuiDatabaseSnapshot, state: &TuiState) -> Vec<Line<'static>> {
+    let default_message = if state.show_tests {
+        "No scored Go test hotspots found. Run hotpath scan after Go test files are present."
+    } else {
+        "No scored production Go files found. Run hotpath scan after production Go files are present."
+    };
     vec![Line::styled(
         snapshot
             .status
             .as_deref()
-            .unwrap_or("No scored Go files found. Run hotpath scan after Go files are present.")
+            .unwrap_or(default_message)
             .to_owned(),
         Style::default().fg(Color::DarkGray),
     )]
@@ -929,9 +955,18 @@ fn empty_state_lines(snapshot: &TuiDatabaseSnapshot) -> Vec<Line<'static>> {
 
 fn selected_row<'a>(snapshot: &'a TuiDatabaseSnapshot, state: &TuiState) -> Option<&'a RiskRow> {
     let indices = state.filtered_indices(snapshot);
+    let rows = active_rows(snapshot, state);
     indices
         .get(state.selected.min(indices.len().saturating_sub(1)))
-        .and_then(|index| snapshot.rows.get(*index))
+        .and_then(|index| rows.get(*index))
+}
+
+fn active_rows<'a>(snapshot: &'a TuiDatabaseSnapshot, state: &TuiState) -> &'a [RiskRow] {
+    if state.show_tests {
+        &snapshot.test_rows
+    } else {
+        &snapshot.rows
+    }
 }
 
 fn load_project_summary(connection: &Connection) -> rusqlite::Result<Option<ProjectRiskSummary>> {
@@ -1042,7 +1077,7 @@ fn table_exists(connection: &Connection, table: &str) -> rusqlite::Result<bool> 
     )
 }
 
-fn load_risk_rows(connection: &Connection) -> rusqlite::Result<Vec<RiskRow>> {
+fn load_risk_rows(connection: &Connection, tests_only: bool) -> rusqlite::Result<Vec<RiskRow>> {
     let mut statement = connection.prepare(
         "
         SELECT
@@ -1055,6 +1090,7 @@ fn load_risk_rows(connection: &Connection) -> rusqlite::Result<Vec<RiskRow>> {
             score.risk_band,
             score.is_generated,
             score.is_vendor,
+            score.is_test,
             facts.line_count,
             facts.byte_size,
             facts.language_id,
@@ -1074,10 +1110,12 @@ fn load_risk_rows(connection: &Connection) -> rusqlite::Result<Vec<RiskRow>> {
         FROM file_risk_scores score
         LEFT JOIN file_facts facts
             ON facts.relative_path = score.relative_path
+        WHERE score.is_test = ?1
         ORDER BY score.score DESC, score.relative_path ASC
         ",
     )?;
-    let rows = statement.query_map([], |row| {
+    let test_flag = if tests_only { 1_i64 } else { 0_i64 };
+    let rows = statement.query_map([test_flag], |row| {
         Ok(RiskRow {
             rank: i64_to_u64(row.get::<_, i64>(0)?),
             relative_path: row.get(1)?,
@@ -1088,25 +1126,26 @@ fn load_risk_rows(connection: &Connection) -> rusqlite::Result<Vec<RiskRow>> {
             risk_band: row.get(6)?,
             is_generated: row.get::<_, i64>(7)? != 0,
             is_vendor: row.get::<_, i64>(8)? != 0,
-            line_count: optional_i64_to_u64(row.get::<_, Option<i64>>(9)?),
-            byte_size: optional_i64_to_u64(row.get::<_, Option<i64>>(10)?),
-            language_id: row.get(11)?,
-            complexity_pressure: optional_i64_to_u64(row.get::<_, Option<i64>>(12)?),
-            max_function_complexity_pressure: optional_i64_to_u64(row.get::<_, Option<i64>>(13)?),
-            source_coupling_pressure_in: optional_i64_to_u64(row.get::<_, Option<i64>>(14)?),
-            source_coupling_pressure_out: optional_i64_to_u64(row.get::<_, Option<i64>>(15)?),
-            co_changed_file_count: i64_to_u64(row.get::<_, i64>(16)?),
-            total_churn_lines: i64_to_u64(row.get::<_, i64>(17)?),
-            recent_churn_lines: i64_to_u64(row.get::<_, i64>(18)?),
-            commits_per_file: i64_to_u64(row.get::<_, i64>(19)?),
-            dominant_owner: row.get(20)?,
-            dominant_owner_share: row.get(21)?,
-            owner_count: optional_i64_to_u64(row.get::<_, Option<i64>>(22)?),
-            author_count: i64_to_u64(row.get::<_, i64>(23)?),
+            is_test: row.get::<_, i64>(9)? != 0,
+            line_count: optional_i64_to_u64(row.get::<_, Option<i64>>(10)?),
+            byte_size: optional_i64_to_u64(row.get::<_, Option<i64>>(11)?),
+            language_id: row.get(12)?,
+            complexity_pressure: optional_i64_to_u64(row.get::<_, Option<i64>>(13)?),
+            max_function_complexity_pressure: optional_i64_to_u64(row.get::<_, Option<i64>>(14)?),
+            source_coupling_pressure_in: optional_i64_to_u64(row.get::<_, Option<i64>>(15)?),
+            source_coupling_pressure_out: optional_i64_to_u64(row.get::<_, Option<i64>>(16)?),
+            co_changed_file_count: i64_to_u64(row.get::<_, i64>(17)?),
+            total_churn_lines: i64_to_u64(row.get::<_, i64>(18)?),
+            recent_churn_lines: i64_to_u64(row.get::<_, i64>(19)?),
+            commits_per_file: i64_to_u64(row.get::<_, i64>(20)?),
+            dominant_owner: row.get(21)?,
+            dominant_owner_share: row.get(22)?,
+            owner_count: optional_i64_to_u64(row.get::<_, Option<i64>>(23)?),
+            author_count: i64_to_u64(row.get::<_, i64>(24)?),
             terms: Vec::new(),
             facts: Vec::new(),
             limitations: Vec::new(),
-            parser_diagnostics: parse_diagnostics_json(row.get::<_, String>(24)?.as_str()),
+            parser_diagnostics: parse_diagnostics_json(row.get::<_, String>(25)?.as_str()),
             owners: Vec::new(),
             tags: Vec::new(),
         })
@@ -1257,6 +1296,9 @@ fn inspector_tags(row: &RiskRow) -> Vec<String> {
     }
     if row.is_vendor {
         signals.push(("VENDOR", 1.0, 10));
+    }
+    if row.is_test {
+        signals.push(("TEST", 1.0, 20));
     }
     if !row.parser_diagnostics.is_empty() {
         signals.push(("PARSER", 1.0, 95));
@@ -1878,6 +1920,7 @@ mod tests {
             Some("high")
         );
         assert_eq!(snapshot.rows.len(), 2);
+        assert!(snapshot.test_rows.is_empty());
         assert_eq!(snapshot.rows[0].relative_path, "src/risky.go");
         assert!(snapshot.rows[0].is_generated);
         assert!(inspector_tags(&snapshot.rows[0])
@@ -1889,6 +1932,44 @@ mod tests {
         assert_eq!(snapshot.rows[0].parser_diagnostics.len(), 1);
         assert_eq!(snapshot.rows[0].parser_diagnostics[0].code, "parse_error");
         assert_eq!(snapshot.rows[0].owners.len(), 1);
+    }
+
+    #[test]
+    fn loads_test_risk_rows_separately_with_test_tags() {
+        let fixture = Fixture::new("test-load");
+        create_tui_db(&fixture.db_path());
+        let connection = Connection::open(fixture.db_path()).expect("db should open");
+        connection
+            .execute(
+                "INSERT INTO file_risk_scores VALUES ('src/risky_test.go', 'C:/repo/src/risky_test.go', 1, 'hotpath.score.go.v1', 3, 0.95, 9.5, 'extreme', 0, 0, 1)",
+                [],
+            )
+            .expect("test risk row should insert");
+        connection
+            .execute(
+                "INSERT INTO file_facts VALUES ('src/risky_test.go', 100, 4000, 'go', 10, 10, 0, 0, 0, 10, 0, 1, NULL, NULL, NULL, 1, '[]')",
+                [],
+            )
+            .expect("test facts should insert");
+
+        let snapshot = TuiDatabaseSnapshot::load_from_dir(&fixture.path);
+        let mut state = TuiState::new();
+
+        assert_eq!(snapshot.rows.len(), 2);
+        assert_eq!(snapshot.test_rows.len(), 1);
+        assert_eq!(state.filtered_indices(&snapshot).len(), 2);
+        assert_eq!(snapshot.test_rows[0].relative_path, "src/risky_test.go");
+        assert!(inspector_tags(&snapshot.test_rows[0])
+            .iter()
+            .any(|tag| tag == "TEST"));
+
+        reduce_key(&mut state, &snapshot, KeyEvent::from(KeyCode::Char('t')));
+
+        assert_eq!(state.filtered_indices(&snapshot), vec![0]);
+        assert_eq!(
+            selected_row(&snapshot, &state).map(|row| row.relative_path.as_str()),
+            Some("src/risky_test.go")
+        );
     }
 
     #[test]
@@ -1990,6 +2071,7 @@ mod tests {
             project: None,
             git: GitMetadata::default(),
             rows: Vec::new(),
+            test_rows: Vec::new(),
         };
         let state = TuiState::new();
         let backend = TestBackend::new(90, 24);
@@ -2031,7 +2113,8 @@ mod tests {
                     risk_10 REAL NOT NULL,
                     risk_band TEXT NOT NULL,
                     is_generated INTEGER NOT NULL,
-                    is_vendor INTEGER NOT NULL
+                    is_vendor INTEGER NOT NULL,
+                    is_test INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE file_facts (
                     relative_path TEXT,
@@ -2142,7 +2225,8 @@ mod tests {
                     risk_10 REAL NOT NULL,
                     risk_band TEXT NOT NULL,
                     is_generated INTEGER NOT NULL,
-                    is_vendor INTEGER NOT NULL
+                    is_vendor INTEGER NOT NULL,
+                    is_test INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE file_facts (
                     relative_path TEXT,
@@ -2198,8 +2282,8 @@ mod tests {
                 INSERT INTO project_risk_summary VALUES
                     ('hotpath.project_risk.go.v1', 1, 0.72, 7.2, 'high', 'high', 2, 2, 2, 1.0, 1.0, 0.90, 0.55, 1, 1, 'churn', 0.8, 'available');
                 INSERT INTO file_risk_scores VALUES
-                    ('src/risky.go', 'C:/repo/src/risky.go', 1, 'hotpath.score.go.v1', 1, 0.9, 9.0, 'extreme', 1, 0),
-                    ('src/safe.go', 'C:/repo/src/safe.go', 1, 'hotpath.score.go.v1', 2, 0.2, 2.0, 'low', 0, 0);
+                    ('src/risky.go', 'C:/repo/src/risky.go', 1, 'hotpath.score.go.v1', 1, 0.9, 9.0, 'extreme', 1, 0, 0),
+                    ('src/safe.go', 'C:/repo/src/safe.go', 1, 'hotpath.score.go.v1', 2, 0.2, 2.0, 'low', 0, 0, 0);
                 INSERT INTO file_facts VALUES
                     ('src/risky.go', 1200, 48000, 'go', 220, 45, 12, 8, 20, 2300, 1000, 3, 'Alice <a@example.invalid>', 0.9, 1, 1, '[{\"code\":\"parse_error\",\"message\":\"Go source contains syntax errors\"}]'),
                     ('src/safe.go', 10, 400, 'go', 1, 1, 0, 0, 0, 1, 0, 1, NULL, NULL, NULL, 1, '[]');

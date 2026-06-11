@@ -2662,6 +2662,9 @@ fn materialize_file_risk_scores(
             VALUES
                 ('file_risk_formula_id', ?1),
                 ('file_risk_scores_materialized', ?2),
+                ('file_risk_scored_production_go_files', ?3),
+                ('file_risk_scored_test_go_files', ?4),
+                ('file_risk_excluded_test_go_files_from_project_risk', ?4),
                 ('file_risk_excluded_generated_vendor_go_files', CAST((
                     SELECT COUNT(*)
                     FROM file_facts
@@ -2671,7 +2674,20 @@ fn materialize_file_risk_scores(
                 ) AS TEXT)),
                 ('file_risk_scorer_version', '1')
             ",
-            params![FORMULA_ID, risk_rows.len().to_string()],
+            params![
+                FORMULA_ID,
+                risk_rows.len().to_string(),
+                risk_rows
+                    .iter()
+                    .filter(|row| !row.is_test)
+                    .count()
+                    .to_string(),
+                risk_rows
+                    .iter()
+                    .filter(|row| row.is_test)
+                    .count()
+                    .to_string(),
+            ],
         )
         .map(|_| ())
         .map_err(StoreReducerError::WriteDatabase)
@@ -2757,6 +2773,7 @@ fn materialize_package_risk_scores(
                 AND score.formula_id = ?1
             WHERE facts.language_id = 'go'
                 AND facts.relative_path IS NOT NULL
+                AND score.is_test = 0
             ORDER BY facts.relative_path
             ",
         )
@@ -3147,7 +3164,15 @@ fn project_risk_input(
         .map_err(StoreReducerError::WriteDatabase)?;
     let active_go_file_count = transaction
         .query_row(
-            "SELECT COUNT(*) FROM file_facts WHERE language_id = 'go'",
+            "
+            SELECT COUNT(*)
+            FROM file_facts
+            WHERE language_id = 'go'
+                AND relative_path IS NOT NULL
+                AND is_generated = 0
+                AND is_vendor = 0
+                AND is_test = 0
+            ",
             [],
             |row| row.get::<_, i64>(0),
         )
@@ -3166,6 +3191,7 @@ fn project_risk_input(
             SELECT relative_path, score
             FROM file_risk_scores
             WHERE formula_id = ?1
+                AND is_test = 0
             ORDER BY score DESC, relative_path ASC
             ",
         )
@@ -4833,6 +4859,20 @@ mod tests {
             ),
             2
         );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT CAST(value AS INTEGER) FROM stage_metadata WHERE key = 'file_risk_scored_production_go_files'",
+            ),
+            2
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT CAST(value AS INTEGER) FROM stage_metadata WHERE key = 'file_risk_scored_test_go_files'",
+            ),
+            0
+        );
         assert!(
             scalar_i64(
                 &connection,
@@ -5009,6 +5049,114 @@ mod tests {
                 "SELECT CAST(value AS INTEGER) FROM stage_metadata WHERE key = 'file_risk_excluded_generated_vendor_go_files'",
             ),
             2
+        );
+    }
+
+    #[test]
+    fn scores_test_go_files_but_excludes_them_from_project_risk() {
+        let fixture = Fixture::new("file-risk-test-files");
+        write_fixture_file(&fixture.path, "prod.go");
+        write_fixture_file(&fixture.path, "prod_test.go");
+        write_fixture_file(&fixture.path, "generated/generated_test.go");
+        write_fixture_file(&fixture.path, "vendor/pkg/vendor_test.go");
+        let (event_sender, _event_receiver) = mpsc::channel();
+        let reducer =
+            StoreReducer::start(&fixture.path, StoreReducerOptions::default(), event_sender)
+                .expect("reducer should start");
+        let handle = reducer.handle();
+
+        handle
+            .store_file_analysis(go_result_with_metrics(
+                fixture.path.join("prod.go"),
+                10,
+                1,
+                1,
+                false,
+                false,
+            ))
+            .expect("prod file should enqueue");
+        let mut test_result = go_result_with_metrics(
+            fixture.path.join("prod_test.go"),
+            2_000,
+            500,
+            100,
+            false,
+            false,
+        );
+        test_result.is_test = true;
+        handle
+            .store_file_analysis(test_result)
+            .expect("test file should enqueue");
+        let mut generated_test_result = go_result_with_metrics(
+            fixture.path.join("generated/generated_test.go"),
+            2_000,
+            500,
+            100,
+            true,
+            false,
+        );
+        generated_test_result.is_test = true;
+        handle
+            .store_file_analysis(generated_test_result)
+            .expect("generated test file should enqueue");
+        let mut vendor_test_result = go_result_with_metrics(
+            fixture.path.join("vendor/pkg/vendor_test.go"),
+            2_000,
+            500,
+            100,
+            false,
+            true,
+        );
+        vendor_test_result.is_test = true;
+        handle
+            .store_file_analysis(vendor_test_result)
+            .expect("vendor test file should enqueue");
+
+        reducer.finish().expect("reducer should finish");
+
+        let connection = Connection::open(fixture.db_path()).expect("db should open");
+        assert_eq!(row_count(&connection, "file_risk_scores"), 2);
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT is_test FROM file_risk_scores WHERE relative_path = 'prod_test.go'",
+            ),
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT COUNT(*) FROM file_risk_scores WHERE relative_path IN ('generated/generated_test.go', 'vendor/pkg/vendor_test.go')",
+            ),
+            0
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT scored_file_count FROM project_risk_summary WHERE formula_id = 'hotpath.project_risk.go.v1'",
+            ),
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT CAST(value AS INTEGER) FROM stage_metadata WHERE key = 'file_risk_scored_production_go_files'",
+            ),
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT CAST(value AS INTEGER) FROM stage_metadata WHERE key = 'file_risk_scored_test_go_files'",
+            ),
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT CAST(value AS INTEGER) FROM stage_metadata WHERE key = 'file_risk_excluded_test_go_files_from_project_risk'",
+            ),
+            1
         );
     }
 

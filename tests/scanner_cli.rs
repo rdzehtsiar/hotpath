@@ -84,7 +84,7 @@ fn scan_prints_file_and_git_progress_summary() {
     assert!(final_lines[2].contains("elapsed"));
     assert!(stdout.contains("summary"));
     assert!(stdout.contains("top_go_hotspots"));
-    assert!(stdout.contains("project_coverage Go 100.0%"));
+    assert!(stdout.contains("project_coverage production_go 100.0%"));
     assert!(stdout.contains("git confidence not_git"));
     assert!(stdout.contains("git: Git analysis skipped"));
     assert!(stdout.contains(&format!("index {}", index_display(&fixture.path))));
@@ -190,7 +190,7 @@ fn scan_summary_reports_no_go_coverage_and_limitation() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     assert!(stdout.contains("top_go_hotspots none"));
     assert!(stdout.contains(
-        "project_coverage Go 0.0%  scored 0/0 Go files  active_files 1  confidence none"
+        "project_coverage production_go 0.0%  scored 0/0 production Go files  active_files 1  confidence none"
     ));
     assert!(stdout.contains("limitations no_scored_files: No Go file risk scores are available."));
     assert!(stdout.contains(&format!("index {}", index_display(&fixture.path))));
@@ -246,7 +246,8 @@ fn hotspots_prints_ranked_go_file_table_from_completed_index() {
     );
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
-    assert!(stdout.starts_with("Rank  Score  Path  Drivers  Tags  Confidence"));
+    assert!(stdout.starts_with("Production Go hotspots"));
+    assert!(stdout.contains("Rank  Score  Path  Drivers  Tags  Confidence"));
     assert!(stdout.contains("1     0.900  risky.go"));
     assert!(stdout.contains("High total churn: 2500 changed lines"));
     assert!(stdout.contains("CHURN"));
@@ -281,7 +282,7 @@ fn hotspots_default_output_is_limited_to_top_twenty() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
-    assert_eq!(stdout.lines().count(), 21);
+    assert_eq!(stdout.lines().count(), 22);
     assert!(stdout.contains("file-00.go"));
     assert!(stdout.contains("file-19.go"));
     assert!(!stdout.contains("file-20.go"));
@@ -315,7 +316,7 @@ fn hotspots_breaks_score_ties_by_path() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
-    let rows = stdout.lines().skip(1).collect::<Vec<_>>();
+    let rows = stdout.lines().skip(2).collect::<Vec<_>>();
     assert!(rows[0].contains("a.go"), "stdout:\n{stdout}");
     assert!(rows[1].contains("b.go"), "stdout:\n{stdout}");
 }
@@ -381,11 +382,14 @@ fn hotspots_completed_index_without_scored_go_files_prints_empty_state() {
     );
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
-    assert_eq!(stdout.trim(), "No scored Go file hotspots found.");
+    assert_eq!(
+        stdout.trim(),
+        "No scored production Go file hotspots found."
+    );
 }
 
 #[test]
-fn scan_tags_go_test_files_in_index_facts_and_risk_rows() {
+fn scan_separates_go_test_files_from_production_risk_output() {
     let fixture = Fixture::new("scan-go-test-files");
     fixture.write("service.go", "package main\n\nfunc Service() {}\n");
     fixture.write("service_test.go", "package main\n\nfunc TestService() {}\n");
@@ -429,6 +433,42 @@ fn scan_tags_go_test_files_in_index_facts_and_risk_rows() {
         ),
         0
     );
+    assert_eq!(
+        scalar_i64(
+            &connection,
+            "SELECT scored_file_count FROM project_risk_summary WHERE formula_id = 'hotpath.project_risk.go.v1'",
+        ),
+        1
+    );
+    assert_eq!(
+        scalar_i64(
+            &connection,
+            "SELECT CAST(value AS INTEGER) FROM stage_metadata WHERE key = 'file_risk_scored_production_go_files'",
+        ),
+        1
+    );
+    assert_eq!(
+        scalar_i64(
+            &connection,
+            "SELECT CAST(value AS INTEGER) FROM stage_metadata WHERE key = 'file_risk_scored_test_go_files'",
+        ),
+        1
+    );
+
+    let production = hotpath(&["hotspots"], &fixture.path);
+    assert!(production.status.success());
+    let production_stdout = String::from_utf8(production.stdout).expect("stdout should be UTF-8");
+    assert!(production_stdout.contains("Production Go hotspots"));
+    assert!(production_stdout.contains("service.go"));
+    assert!(!production_stdout.contains("service_test.go"));
+
+    let tests = hotpath(&["hotspots", "--tests"], &fixture.path);
+    assert!(tests.status.success());
+    let test_stdout = String::from_utf8(tests.stdout).expect("stdout should be UTF-8");
+    assert!(test_stdout.contains("Go test-file hotspots"));
+    assert!(test_stdout.contains("service_test.go"));
+    assert!(test_stdout.contains("TEST"));
+    assert!(!test_stdout.contains("service.go"));
 }
 
 #[test]
@@ -975,7 +1015,9 @@ func Stop(enabled bool) int {
     assert!(stdout.contains("top_go_hotspots"));
     assert!(stdout.contains("cmd/app/main.go"));
     assert!(stdout.contains("internal/service/a.go"));
-    assert!(stdout.contains("project_coverage Go 100.0%  scored 3/3 Go files"));
+    assert!(
+        stdout.contains("project_coverage production_go 100.0%  scored 3/3 production Go files")
+    );
     assert!(stdout.contains("git confidence not_git"));
     assert!(stdout.contains(&format!("index {}", index_display(&fixture.path))));
 }

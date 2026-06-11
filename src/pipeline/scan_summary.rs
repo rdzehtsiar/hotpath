@@ -148,7 +148,6 @@ fn load_hotspots(connection: &Connection) -> Result<Vec<GoHotspot>, ScanSummaryE
         .prepare(
             "
             SELECT
-                score.rank,
                 score.relative_path,
                 score.risk_10,
                 score.risk_band,
@@ -158,24 +157,35 @@ fn load_hotspots(connection: &Connection) -> Result<Vec<GoHotspot>, ScanSummaryE
                 ON fact.relative_path = score.relative_path
                 AND fact.formula_id = score.formula_id
                 AND fact.fact_index = 0
-            ORDER BY score.rank ASC
+            WHERE score.is_test = 0
+            ORDER BY score.score DESC, score.relative_path ASC
             LIMIT ?1
             ",
         )
         .map_err(ScanSummaryError::QueryDatabase)?;
     let rows = statement
         .query_map([TOP_HOTSPOT_LIMIT], |row| {
-            Ok(GoHotspot {
-                rank: i64_to_u64(row.get::<_, i64>(0)?),
-                relative_path: row.get(1)?,
-                risk_10: row.get(2)?,
-                risk_band: row.get(3)?,
-                fact: row.get(4)?,
-            })
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
         })
         .map_err(ScanSummaryError::QueryDatabase)?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(ScanSummaryError::QueryDatabase)
+    rows.enumerate()
+        .map(|(index, row)| {
+            let (relative_path, risk_10, risk_band, fact) =
+                row.map_err(ScanSummaryError::QueryDatabase)?;
+            Ok(GoHotspot {
+                rank: index as u64 + 1,
+                relative_path,
+                risk_10,
+                risk_band,
+                fact,
+            })
+        })
+        .collect()
 }
 
 fn load_project_coverage(
@@ -298,14 +308,14 @@ fn render_hotspot(hotspot: &GoHotspot) -> String {
 fn render_project_coverage(project: Option<&ProjectCoverage>) -> String {
     match project {
         Some(project) => format!(
-            "  project_coverage Go {:.1}%  scored {}/{} Go files  active_files {}  confidence {}",
+            "  project_coverage production_go {:.1}%  scored {}/{} production Go files  active_files {}  confidence {}",
             project.coverage_percent,
             project.scored_file_count,
             project.active_go_file_count,
             project.active_file_count,
             project.confidence
         ),
-        None => "  project_coverage Go 0.0%  scored 0/0 Go files  active_files 0  confidence none"
+        None => "  project_coverage production_go 0.0%  scored 0/0 production Go files  active_files 0  confidence none"
             .to_owned(),
     }
 }
@@ -383,7 +393,7 @@ mod tests {
         assert!(rendered.contains("summary"));
         assert!(rendered.contains("1. internal/service/a.go  risk 7.2/10 high"));
         assert!(rendered.contains(
-            "project_coverage Go 100.0%  scored 2/2 Go files  active_files 3  confidence high"
+            "project_coverage production_go 100.0%  scored 2/2 production Go files  active_files 3  confidence high"
         ));
         assert!(rendered.contains(
             "git confidence bounded  mode full  collection bounded_recent_stream  index_action fully_rebuilt"
@@ -406,7 +416,7 @@ mod tests {
 
         assert!(rendered.contains("top_go_hotspots none"));
         assert!(rendered.contains(
-            "project_coverage Go 0.0%  scored 0/0 Go files  active_files 0  confidence none"
+            "project_coverage production_go 0.0%  scored 0/0 production Go files  active_files 0  confidence none"
         ));
         assert!(rendered.contains(
             "git confidence unknown  mode unknown  collection unknown  index_action unknown"
@@ -475,7 +485,8 @@ mod tests {
                 );
                 INSERT INTO file_risk_scores VALUES
                     ('b.go', 'b.go', 1, 'hotpath.score.go.v1', 2, 0.4, 4.0, 'medium', 0, 0, 0),
-                    ('a.go', 'a.go', 1, 'hotpath.score.go.v1', 1, 0.7, 7.0, 'high', 0, 0, 0);
+                    ('a.go', 'a.go', 1, 'hotpath.score.go.v1', 1, 0.7, 7.0, 'high', 0, 0, 0),
+                    ('a_test.go', 'a_test.go', 1, 'hotpath.score.go.v1', 3, 0.9, 9.0, 'extreme', 0, 0, 1);
                 INSERT INTO file_risk_facts VALUES
                     ('a.go', 'hotpath.score.go.v1', 0, 'summary', 'A fact'),
                     ('b.go', 'hotpath.score.go.v1', 0, 'summary', 'B fact');
@@ -498,6 +509,7 @@ mod tests {
 
         assert_eq!(summary.hotspots[0].relative_path, "a.go");
         assert_eq!(summary.hotspots[1].relative_path, "b.go");
+        assert_eq!(summary.hotspots.len(), 2);
         assert_eq!(
             summary
                 .project
