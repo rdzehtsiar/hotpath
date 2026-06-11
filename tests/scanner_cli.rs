@@ -81,10 +81,39 @@ fn scan_prints_file_and_git_progress_summary() {
     assert!(final_lines[1].contains("commits/sec"));
     assert!(final_lines[2].starts_with("time"));
     assert!(final_lines[2].contains("elapsed"));
+    assert!(stdout.contains("summary"));
+    assert!(stdout.contains("top_go_hotspots"));
+    assert!(stdout.contains("project_coverage Go 100.0%"));
+    assert!(stdout.contains("git confidence not_git"));
+    assert!(stdout.contains("git: Git analysis skipped"));
+    assert!(stdout.contains(&format!("index {}", index_display(&fixture.path))));
 
     let connection =
         Connection::open(fixture.path.join(".hotpath").join("index.sqlite")).expect("db opens");
     assert_eq!(row_count(&connection, "file_analysis"), 2);
+}
+
+#[test]
+fn scan_summary_reports_no_go_coverage_and_limitation() {
+    let fixture = Fixture::new("scan-no-go-summary");
+    fixture.write("README.md", "hello\n");
+
+    let output = hotpath(&["scan"], &fixture.path);
+
+    assert!(
+        output.status.success(),
+        "hotpath failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.contains("top_go_hotspots none"));
+    assert!(stdout.contains(
+        "project_coverage Go 0.0%  scored 0/0 Go files  active_files 1  confidence none"
+    ));
+    assert!(stdout.contains("limitations no_scored_files: No Go file risk scores are available."));
+    assert!(stdout.contains(&format!("index {}", index_display(&fixture.path))));
 }
 
 #[test]
@@ -162,6 +191,11 @@ fn scan_reports_actionable_non_git_diagnostic() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     assert!(stdout.contains("diagnostic not_git"));
+    assert!(stdout.contains(
+        "git confidence not_git  mode skipped_not_git  collection unavailable  index_action cleared_not_git"
+    ));
+    assert!(stdout.contains("git: Git analysis skipped"));
+    assert!(stdout.contains(&format!("index {}", index_display(&fixture.path))));
 
     let connection =
         Connection::open(fixture.path.join(".hotpath").join("index.sqlite")).expect("db opens");
@@ -667,6 +701,15 @@ func Stop(enabled bool) int {
             "SELECT score FROM package_risk_scores WHERE package_path = 'internal/service'",
         ) > 0.0
     );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.contains("summary"));
+    assert!(stdout.contains("top_go_hotspots"));
+    assert!(stdout.contains("cmd/app/main.go"));
+    assert!(stdout.contains("internal/service/a.go"));
+    assert!(stdout.contains("project_coverage Go 100.0%  scored 3/3 Go files"));
+    assert!(stdout.contains("git confidence not_git"));
+    assert!(stdout.contains(&format!("index {}", index_display(&fixture.path))));
 }
 
 #[test]
@@ -894,4 +937,12 @@ fn scalar_f64(connection: &Connection, sql: &str) -> f64 {
     connection
         .query_row(sql, [], |row| row.get(0))
         .expect("scalar query should run")
+}
+
+fn index_display(root: &Path) -> String {
+    let index = root.join(".hotpath").join("index.sqlite");
+    fs::canonicalize(&index)
+        .unwrap_or(index)
+        .display()
+        .to_string()
 }

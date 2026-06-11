@@ -11,5 +11,6 @@ pub mod file_risk_assessor;
 pub mod git_history_analyzer;
 pub mod repo_risk_assessor;
 pub mod reporter;
+pub mod scan_summary;
 pub mod scheduler;
 pub mod store_reducer;

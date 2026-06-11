@@ -43,16 +43,31 @@ fn run_tui() -> ExitCode {
 
 fn run_scan() -> ExitCode {
     let mut reporter = StdioReporter::stdout();
-    let result = env::current_dir()
+    let root = match env::current_dir()
         .map_err(hotpath::pipeline::enumerator::EnumerationError::CurrentDir)
         .map_err(hotpath::pipeline::analysis_engine::AnalysisEngineError::Enumeration)
-        .and_then(|root| {
-            let engine = hotpath::pipeline::analysis_engine::AnalysisEngine::new(root);
-            engine.scan_with_reporter(&mut reporter)
-        });
+    {
+        Ok(root) => root,
+        Err(error) => {
+            eprintln!("hotpath: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
 
-    match result {
-        Ok(_) => ExitCode::SUCCESS,
+    let engine = hotpath::pipeline::analysis_engine::AnalysisEngine::new(&root);
+    if let Err(error) = engine.scan_with_reporter(&mut reporter) {
+        eprintln!("hotpath: {error}");
+        return ExitCode::FAILURE;
+    }
+
+    match hotpath::pipeline::scan_summary::load_scan_summary(&root) {
+        Ok(summary) => {
+            println!(
+                "{}",
+                hotpath::pipeline::scan_summary::render_scan_summary(&summary)
+            );
+            ExitCode::SUCCESS
+        }
         Err(error) => {
             eprintln!("hotpath: {error}");
             ExitCode::FAILURE
