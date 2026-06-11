@@ -14,10 +14,11 @@ README documents only what exists in the current codebase.
 
 ## Current CLI
 
-The CLI currently exposes two subcommands:
+The CLI currently exposes these subcommands:
 
 ```powershell
 hotpath scan
+hotpath explain <path>
 hotpath tui
 ```
 
@@ -35,8 +36,34 @@ hotpath tui
 - persists derived local data to the Hotpath index
 - prints terminal progress for file and Git processing
 
-There is no current `scan --json`, `scan --summary`, report output, CI gate, or
-stable machine-readable scan schema.
+`hotpath scan --json` writes a compact JSON scan summary. There is no current CI
+gate or stable report schema beyond the explicitly versioned command JSON.
+
+### `hotpath explain <path>`
+
+`hotpath explain <path>` reads the nearest existing `.hotpath/index.sqlite` and
+prints the indexed context for one file. It is read-only: it does not refresh the
+index, rerun analysis, or mutate `.hotpath/`. If the index is missing, stale, or
+does not contain the requested file, run `hotpath scan` first.
+
+The path may be repository-relative or an absolute path under the indexed
+repository root. Output defaults to terminal text:
+
+```powershell
+hotpath explain internal/service/service.go
+hotpath explain internal/service/service.go --format text
+hotpath explain internal/service/service.go --format json
+```
+
+Text output includes file facts, raw metrics, normalized score terms, weights,
+score facts, limitations, parser diagnostics, ownership rows, Git collection
+context, co-change partners, and source-coupling context. JSON output uses the
+versioned `hotpath.explain.v1` schema for automation.
+
+Files that were scanned but not scored still explain their indexed facts and
+return success. Their score is reported as unavailable with reasons such as
+unsupported language, generated/vendor exclusion, missing parser metrics, or a
+missing score row.
 
 ### `hotpath tui`
 

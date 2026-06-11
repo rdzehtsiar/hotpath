@@ -793,6 +793,206 @@ func Stop(enabled bool) int {
 }
 
 #[test]
+fn explain_text_reports_scored_file_context() {
+    let fixture = GitFixture::new("explain-text");
+    let author = GitIdentity::new("Alice Example", "alice@example.invalid");
+    fixture.write("go.mod", "module example.test/hotpath\n");
+    fixture.write(
+        "cmd/app/main.go",
+        r#"package main
+
+import "example.test/hotpath/internal/service"
+
+func main() {
+	service.Run(true)
+}
+"#,
+    );
+    fixture.write(
+        "internal/service/service.go",
+        r#"package service
+
+func Run(enabled bool) int {
+	if enabled {
+		return 1
+	}
+	return 0
+}
+"#,
+    );
+    fixture.commit(CommitOptions::new(
+        "Add service",
+        author.clone(),
+        "2025-01-01T00:00:00Z",
+    ));
+    fixture.write(
+        "internal/service/service.go",
+        r#"package service
+
+func Run(enabled bool) int {
+	if enabled {
+		return 2
+	}
+	return 0
+}
+"#,
+    );
+    fixture.write(
+        "cmd/app/main.go",
+        r#"package main
+
+import "example.test/hotpath/internal/service"
+
+func main() {
+	service.Run(false)
+}
+"#,
+    );
+    fixture.commit(CommitOptions::new(
+        "Update service and app",
+        author,
+        "2025-01-02T00:00:00Z",
+    ));
+
+    let scan = hotpath(&["scan"], fixture.path());
+    assert!(
+        scan.status.success(),
+        "scan failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&scan.stdout),
+        String::from_utf8_lossy(&scan.stderr)
+    );
+
+    let output = hotpath(&["explain", "internal/service/service.go"], fixture.path());
+
+    assert!(
+        output.status.success(),
+        "explain failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    for expected in [
+        "File",
+        "Score",
+        "Terms",
+        "Raw Metrics",
+        "Facts",
+        "Limitations",
+        "Parser Diagnostics",
+        "Owners",
+        "Git Context",
+        "Source Coupling",
+        "formula hotpath.score.go.v1",
+        "churn raw",
+        "normalized",
+        "weight",
+        "Alice Example <alice@example.invalid>",
+        "git_confidence bounded",
+        "cochange cmd/app/main.go count",
+        "inbound_sources",
+        "cmd/app/main.go (cmd/app) -> internal/service [import]",
+    ] {
+        assert!(stdout.contains(expected), "missing {expected}\n{stdout}");
+    }
+}
+
+#[test]
+fn explain_json_reports_versioned_schema() {
+    let fixture = Fixture::new("explain-json");
+    fixture.write("main.go", "package main\n\nfunc main() {}\n");
+    let scan = hotpath(&["scan"], &fixture.path);
+    assert!(scan.status.success());
+
+    let output = hotpath(&["explain", "main.go", "--format", "json"], &fixture.path);
+
+    assert!(output.status.success());
+    let json: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(json["schema_version"], "hotpath.explain.v1");
+    assert_eq!(json["command"], "explain");
+    assert_eq!(json["file"]["relative_path"], "main.go");
+    assert_eq!(json["score_status"], "available");
+    assert!(json["terms"]
+        .as_array()
+        .is_some_and(|terms| !terms.is_empty()));
+}
+
+#[test]
+fn explain_accepts_absolute_path_under_index_root() {
+    let fixture = Fixture::new("explain-absolute-path");
+    fixture.write("main.go", "package main\n\nfunc main() {}\n");
+    let scan = hotpath(&["scan"], &fixture.path);
+    assert!(scan.status.success());
+    let absolute = fixture.path.join("main.go");
+    let absolute = absolute.to_str().expect("fixture path should be UTF-8");
+
+    let output = hotpath(&["explain", absolute], &fixture.path);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.contains("path main.go"));
+}
+
+#[test]
+fn explain_missing_index_fails_actionably() {
+    let fixture = Fixture::new("explain-missing-index");
+
+    let output = hotpath(&["explain", "main.go"], &fixture.path);
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert!(stderr.contains("Run hotpath scan first"));
+}
+
+#[test]
+fn explain_unknown_indexed_path_fails_actionably() {
+    let fixture = Fixture::new("explain-unknown-path");
+    fixture.write("main.go", "package main\n\nfunc main() {}\n");
+    let scan = hotpath(&["scan"], &fixture.path);
+    assert!(scan.status.success());
+
+    let output = hotpath(&["explain", "missing.go"], &fixture.path);
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert!(stderr.contains("not in the current Hotpath index"));
+    assert!(stderr.contains("Run hotpath scan first"));
+}
+
+#[test]
+fn explain_generated_go_file_returns_unavailable_score() {
+    let fixture = Fixture::new("explain-generated");
+    fixture.write(
+        "generated.go",
+        "// Code generated by fixture. DO NOT EDIT.\npackage main\n\nfunc Generated() {}\n",
+    );
+    let scan = hotpath(&["scan"], &fixture.path);
+    assert!(scan.status.success());
+
+    let output = hotpath(
+        &["explain", "generated.go", "--format", "json"],
+        &fixture.path,
+    );
+
+    assert!(
+        output.status.success(),
+        "explain failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(json["score_status"], "unavailable");
+    assert_eq!(json["score"], Value::Null);
+    assert!(json["score_unavailable_reasons"]
+        .as_array()
+        .expect("reasons should be array")
+        .iter()
+        .any(|reason| reason["code"] == "generated_or_vendor_excluded"));
+}
+
+#[test]
 fn second_scan_skips_git_when_head_is_unchanged() {
     let fixture = GitFixture::new("scan-git-incremental-skip");
     let author = GitIdentity::new("Hotpath Test", "hotpath.test@example.invalid");

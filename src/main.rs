@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::env;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use hotpath::pipeline::events::PipelineState;
 use hotpath::pipeline::reporter::StdioReporter;
 use serde::Serialize;
@@ -22,6 +23,8 @@ struct Cli {
 enum Commands {
     /// Enumerate repository files and print scan throughput.
     Scan(ScanArgs),
+    /// Explain indexed metrics and score context for one file.
+    Explain(ExplainArgs),
     /// Open the read-only Hotpath terminal UI for the current index.
     Tui,
 }
@@ -33,11 +36,27 @@ struct ScanArgs {
     json: bool,
 }
 
+#[derive(Debug, Args)]
+struct ExplainArgs {
+    /// Repository-relative path, or an absolute path under the indexed repository root.
+    path: PathBuf,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = ExplainFormat::Text)]
+    format: ExplainFormat,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ExplainFormat {
+    Text,
+    Json,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Scan(args) => run_scan(args),
+        Commands::Explain(args) => run_explain(args),
         Commands::Tui => run_tui(),
     }
 }
@@ -104,6 +123,40 @@ fn run_scan(args: ScanArgs) -> ExitCode {
             eprintln!("hotpath: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn run_explain(args: ExplainArgs) -> ExitCode {
+    let current_dir = match env::current_dir() {
+        Ok(current_dir) => current_dir,
+        Err(error) => {
+            eprintln!("hotpath: failed to read current directory: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let report = match hotpath::explain::load_explain_report(&current_dir, &args.path) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("hotpath: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match args.format {
+        ExplainFormat::Text => {
+            println!("{}", hotpath::explain::render_explain_text(&report));
+            ExitCode::SUCCESS
+        }
+        ExplainFormat::Json => match serde_json::to_string_pretty(&report) {
+            Ok(json) => {
+                println!("{json}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("hotpath: failed to serialize explain JSON: {error}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 
