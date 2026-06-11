@@ -197,6 +197,194 @@ fn scan_summary_reports_no_go_coverage_and_limitation() {
 }
 
 #[test]
+fn hotspots_prints_ranked_go_file_table_from_completed_index() {
+    let fixture = Fixture::new("hotspots-table");
+    fixture.write("risky.go", "package main\n\nfunc Risky() {}\n");
+    fixture.write("simple.go", "package main\n\nfunc Simple() {}\n");
+
+    let scan = hotpath(&["scan"], &fixture.path);
+    assert!(
+        scan.status.success(),
+        "scan failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&scan.stdout),
+        String::from_utf8_lossy(&scan.stderr)
+    );
+    let connection =
+        Connection::open(fixture.path.join(".hotpath").join("index.sqlite")).expect("db opens");
+    connection
+        .execute(
+            "UPDATE file_risk_scores SET score = 0.9, risk_10 = 9.0 WHERE relative_path = 'risky.go'",
+            [],
+        )
+        .expect("risky score should update");
+    connection
+        .execute(
+            "UPDATE file_risk_scores SET score = 0.2, risk_10 = 2.0 WHERE relative_path = 'simple.go'",
+            [],
+        )
+        .expect("simple score should update");
+    connection
+        .execute(
+            "UPDATE file_risk_terms SET normalized_value = 1.0 WHERE relative_path = 'risky.go' AND term_name = 'churn'",
+            [],
+        )
+        .expect("risky churn term should update");
+    connection
+        .execute(
+            "UPDATE file_risk_facts SET message = 'High total churn: 2500 changed lines' WHERE relative_path = 'risky.go' AND fact_index = 0",
+            [],
+        )
+        .expect("risky fact should update");
+
+    let output = hotpath(&["hotspots"], &fixture.path);
+
+    assert!(
+        output.status.success(),
+        "hotspots failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.starts_with("Rank  Score  Path  Drivers  Tags  Confidence"));
+    assert!(stdout.contains("1     0.900  risky.go"));
+    assert!(stdout.contains("High total churn: 2500 changed lines"));
+    assert!(stdout.contains("CHURN"));
+    assert!(stdout.contains("high"));
+    assert!(!stdout.contains(&fixture.path.display().to_string()));
+}
+
+#[test]
+fn hotspots_default_output_is_limited_to_top_twenty() {
+    let fixture = Fixture::new("hotspots-limit");
+    for index in 0..25 {
+        fixture.write(
+            format!("file-{index:02}.go"),
+            &format!("package main\n\nfunc File{index}() {{}}\n"),
+        );
+    }
+
+    let scan = hotpath(&["scan"], &fixture.path);
+    assert!(
+        scan.status.success(),
+        "scan failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&scan.stdout),
+        String::from_utf8_lossy(&scan.stderr)
+    );
+
+    let output = hotpath(&["hotspots"], &fixture.path);
+
+    assert!(
+        output.status.success(),
+        "hotspots failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert_eq!(stdout.lines().count(), 21);
+    assert!(stdout.contains("file-00.go"));
+    assert!(stdout.contains("file-19.go"));
+    assert!(!stdout.contains("file-20.go"));
+}
+
+#[test]
+fn hotspots_breaks_score_ties_by_path() {
+    let fixture = Fixture::new("hotspots-tie-sort");
+    fixture.write("b.go", "package main\n\nfunc B() {}\n");
+    fixture.write("a.go", "package main\n\nfunc A() {}\n");
+
+    let scan = hotpath(&["scan"], &fixture.path);
+    assert!(
+        scan.status.success(),
+        "scan failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&scan.stdout),
+        String::from_utf8_lossy(&scan.stderr)
+    );
+    let connection =
+        Connection::open(fixture.path.join(".hotpath").join("index.sqlite")).expect("db opens");
+    connection
+        .execute("UPDATE file_risk_scores SET score = 0.8, risk_10 = 8.0", [])
+        .expect("scores should update");
+
+    let output = hotpath(&["hotspots"], &fixture.path);
+
+    assert!(
+        output.status.success(),
+        "hotspots failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    let rows = stdout.lines().skip(1).collect::<Vec<_>>();
+    assert!(rows[0].contains("a.go"), "stdout:\n{stdout}");
+    assert!(rows[1].contains("b.go"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn hotspots_missing_index_exits_with_actionable_message() {
+    let fixture = Fixture::new("hotspots-missing-index");
+
+    let output = hotpath(&["hotspots"], &fixture.path);
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert!(stderr.contains("No Hotpath index found. Run hotpath scan first."));
+}
+
+#[test]
+fn hotspots_incomplete_index_exits_with_actionable_message() {
+    let fixture = Fixture::new("hotspots-incomplete-index");
+    fs::create_dir_all(fixture.path.join(".hotpath")).expect("index dir should be created");
+    let connection =
+        Connection::open(fixture.path.join(".hotpath").join("index.sqlite")).expect("db opens");
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE scan_state (
+                key TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL
+            );
+            INSERT INTO scan_state VALUES ('last_scan_completed', '0');
+            ",
+        )
+        .expect("incomplete index should be created");
+
+    let output = hotpath(&["hotspots"], &fixture.path);
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert!(stderr.contains("Hotpath index is incomplete. Run hotpath scan first."));
+}
+
+#[test]
+fn hotspots_completed_index_without_scored_go_files_prints_empty_state() {
+    let fixture = Fixture::new("hotspots-no-go");
+    fixture.write("README.md", "hello\n");
+
+    let scan = hotpath(&["scan"], &fixture.path);
+    assert!(
+        scan.status.success(),
+        "scan failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&scan.stdout),
+        String::from_utf8_lossy(&scan.stderr)
+    );
+
+    let output = hotpath(&["hotspots"], &fixture.path);
+
+    assert!(
+        output.status.success(),
+        "hotspots failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert_eq!(stdout.trim(), "No scored Go file hotspots found.");
+}
+
+#[test]
 fn scan_tags_go_test_files_in_index_facts_and_risk_rows() {
     let fixture = Fixture::new("scan-go-test-files");
     fixture.write("service.go", "package main\n\nfunc Service() {}\n");

@@ -1,0 +1,533 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+use rusqlite::{params, Connection, OpenFlags};
+
+const INDEX_DB: &str = ".hotpath/index.sqlite";
+const DEFAULT_HOTSPOT_LIMIT: usize = 20;
+const FORMULA_ID: &str = "hotpath.score.go.v1";
+const DRIVER_LIMIT: usize = 4;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HotspotsReport {
+    pub rows: Vec<HotspotRow>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HotspotRow {
+    pub rank: u64,
+    pub score: f64,
+    pub relative_path: String,
+    pub drivers: Vec<String>,
+    pub tags: Vec<String>,
+    pub confidence: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct HotspotScoreRow {
+    score: f64,
+    relative_path: String,
+    is_generated: bool,
+    is_vendor: bool,
+    is_test: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HotspotTerm {
+    pub name: String,
+    pub normalized_value: Option<f64>,
+}
+
+#[derive(Debug)]
+pub enum HotspotsError {
+    NoIndex,
+    IncompleteIndex,
+    OpenDatabase {
+        path: PathBuf,
+        source: rusqlite::Error,
+    },
+    QueryDatabase(rusqlite::Error),
+}
+
+impl fmt::Display for HotspotsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoIndex => write!(f, "No Hotpath index found. Run hotpath scan first."),
+            Self::IncompleteIndex => {
+                write!(f, "Hotpath index is incomplete. Run hotpath scan first.")
+            }
+            Self::OpenDatabase { path, source } => {
+                write!(
+                    f,
+                    "failed to open Hotpath index '{}': {source}",
+                    path.display()
+                )
+            }
+            Self::QueryDatabase(source) => write!(f, "failed to read Hotpath hotspots: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for HotspotsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::OpenDatabase { source, .. } => Some(source),
+            Self::QueryDatabase(source) => Some(source),
+            Self::NoIndex | Self::IncompleteIndex => None,
+        }
+    }
+}
+
+pub fn load_hotspots_report(
+    current_dir: impl AsRef<Path>,
+) -> Result<HotspotsReport, HotspotsError> {
+    let index_root = find_index_root(current_dir.as_ref()).ok_or(HotspotsError::NoIndex)?;
+    let index_path = index_root.join(INDEX_DB);
+    let connection = Connection::open_with_flags(&index_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|source| HotspotsError::OpenDatabase {
+            path: index_path,
+            source,
+        })?;
+
+    load_hotspots_report_from_connection(&connection, DEFAULT_HOTSPOT_LIMIT)
+}
+
+fn load_hotspots_report_from_connection(
+    connection: &Connection,
+    limit: usize,
+) -> Result<HotspotsReport, HotspotsError> {
+    if !index_is_complete(connection)? {
+        return Err(HotspotsError::IncompleteIndex);
+    }
+
+    let confidence = load_project_confidence(connection)?.unwrap_or_else(|| "none".to_owned());
+    let score_rows = load_score_rows(connection, limit)?;
+    let facts = load_facts(connection)?;
+    let terms = load_terms(connection)?;
+
+    let rows = score_rows
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let row_terms = terms.get(&row.relative_path).cloned().unwrap_or_default();
+            HotspotRow {
+                rank: index as u64 + 1,
+                score: row.score,
+                relative_path: row.relative_path.clone(),
+                drivers: facts
+                    .get(&row.relative_path)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .take(DRIVER_LIMIT)
+                    .collect(),
+                tags: tags_for_row(&row, &row_terms),
+                confidence: confidence.clone(),
+            }
+        })
+        .collect();
+
+    Ok(HotspotsReport { rows })
+}
+
+pub fn render_hotspots_table(report: &HotspotsReport) -> String {
+    if report.rows.is_empty() {
+        return "No scored Go file hotspots found.".to_owned();
+    }
+
+    let mut lines = vec!["Rank  Score  Path  Drivers  Tags  Confidence".to_owned()];
+    lines.extend(report.rows.iter().map(render_hotspot_row));
+    lines.join("\n")
+}
+
+fn render_hotspot_row(row: &HotspotRow) -> String {
+    format!(
+        "{:<4}  {:>5.3}  {}  {}  {}  {}",
+        row.rank,
+        row.score,
+        row.relative_path,
+        display_list(&row.drivers),
+        display_list(&row.tags),
+        row.confidence
+    )
+}
+
+fn display_list(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_owned()
+    } else {
+        values.join("; ")
+    }
+}
+
+fn find_index_root(current_dir: &Path) -> Option<PathBuf> {
+    current_dir
+        .ancestors()
+        .find(|candidate| candidate.join(INDEX_DB).is_file())
+        .map(Path::to_path_buf)
+}
+
+fn index_is_complete(connection: &Connection) -> Result<bool, HotspotsError> {
+    if !table_exists(connection, "scan_state")? {
+        return Ok(false);
+    }
+
+    let result = connection.query_row(
+        "SELECT value FROM scan_state WHERE key = 'last_scan_completed'",
+        [],
+        |row| row.get::<_, String>(0),
+    );
+    match result {
+        Ok(value) => Ok(value == "1"),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(source) => Err(HotspotsError::QueryDatabase(source)),
+    }
+}
+
+fn table_exists(connection: &Connection, table: &str) -> Result<bool, HotspotsError> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| Ok(row.get::<_, i64>(0)? > 0),
+        )
+        .map_err(HotspotsError::QueryDatabase)
+}
+
+fn load_project_confidence(connection: &Connection) -> Result<Option<String>, HotspotsError> {
+    let result = connection.query_row(
+        "
+        SELECT confidence
+        FROM project_risk_summary
+        ORDER BY formula_id
+        LIMIT 1
+        ",
+        [],
+        |row| row.get::<_, String>(0),
+    );
+    match result {
+        Ok(confidence) => Ok(Some(confidence)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(source) => Err(HotspotsError::QueryDatabase(source)),
+    }
+}
+
+fn load_score_rows(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<HotspotScoreRow>, HotspotsError> {
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT
+                score,
+                relative_path,
+                is_generated,
+                is_vendor,
+                is_test
+            FROM file_risk_scores
+            WHERE formula_id = ?1
+            ORDER BY score DESC, relative_path ASC
+            LIMIT ?2
+            ",
+        )
+        .map_err(HotspotsError::QueryDatabase)?;
+    let rows = statement
+        .query_map(params![FORMULA_ID, limit as i64], |row| {
+            Ok(HotspotScoreRow {
+                score: row.get(0)?,
+                relative_path: row.get(1)?,
+                is_generated: row.get::<_, i64>(2)? != 0,
+                is_vendor: row.get::<_, i64>(3)? != 0,
+                is_test: row.get::<_, i64>(4)? != 0,
+            })
+        })
+        .map_err(HotspotsError::QueryDatabase)?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(HotspotsError::QueryDatabase)
+}
+
+fn load_facts(connection: &Connection) -> Result<BTreeMap<String, Vec<String>>, HotspotsError> {
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT relative_path, message
+            FROM file_risk_facts
+            WHERE formula_id = ?1
+            ORDER BY relative_path ASC, fact_index ASC
+            ",
+        )
+        .map_err(HotspotsError::QueryDatabase)?;
+    let rows = statement
+        .query_map([FORMULA_ID], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(HotspotsError::QueryDatabase)?;
+
+    let mut facts = BTreeMap::new();
+    for row in rows {
+        let (path, message) = row.map_err(HotspotsError::QueryDatabase)?;
+        facts.entry(path).or_insert_with(Vec::new).push(message);
+    }
+    Ok(facts)
+}
+
+fn load_terms(
+    connection: &Connection,
+) -> Result<BTreeMap<String, Vec<HotspotTerm>>, HotspotsError> {
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT relative_path, term_name, normalized_value
+            FROM file_risk_terms
+            WHERE formula_id = ?1
+            ORDER BY relative_path ASC, term_name ASC
+            ",
+        )
+        .map_err(HotspotsError::QueryDatabase)?;
+    let rows = statement
+        .query_map([FORMULA_ID], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                HotspotTerm {
+                    name: row.get(1)?,
+                    normalized_value: row.get(2)?,
+                },
+            ))
+        })
+        .map_err(HotspotsError::QueryDatabase)?;
+
+    let mut terms = BTreeMap::new();
+    for row in rows {
+        let (path, term) = row.map_err(HotspotsError::QueryDatabase)?;
+        terms.entry(path).or_insert_with(Vec::new).push(term);
+    }
+    Ok(terms)
+}
+
+fn tags_for_row(row: &HotspotScoreRow, terms: &[HotspotTerm]) -> Vec<String> {
+    let mut signals = Vec::new();
+    if row.is_generated {
+        signals.push(("GEN", 1.0, 10));
+    }
+    if row.is_vendor {
+        signals.push(("VENDOR", 1.0, 10));
+    }
+    if row.is_test {
+        signals.push(("TEST", 1.0, 20));
+    }
+    for term in terms {
+        let value = term.normalized_value.unwrap_or_default();
+        if value < 0.60 {
+            continue;
+        }
+        match term.name.as_str() {
+            "churn" => signals.push(("CHURN", value, 90)),
+            "recent_churn" => signals.push(("VOLATILITY", value, 65)),
+            "size" => signals.push(("SIZE", value, 75)),
+            "ownership_risk" => signals.push(("FRAGILITY", value, 80)),
+            "cochange_pressure" | "source_coupling_pressure" => {
+                signals.push(("COORD PRESS", value, 85));
+            }
+            "complexity_pressure" => signals.push(("CMPX PRESS", value, 70)),
+            _ => {}
+        }
+    }
+
+    signals.sort_by(|left, right| {
+        right
+            .2
+            .cmp(&left.2)
+            .then_with(|| {
+                right
+                    .1
+                    .partial_cmp(&left.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.0.cmp(right.0))
+    });
+
+    let mut tags = Vec::new();
+    for (label, _, _) in signals {
+        if !tags.iter().any(|existing| existing == label) {
+            tags.push(label.to_owned());
+        }
+    }
+    tags
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+
+    use super::{
+        load_hotspots_report_from_connection, render_hotspots_table, tags_for_row, HotspotRow,
+        HotspotScoreRow, HotspotTerm, HotspotsError, HotspotsReport,
+    };
+
+    #[test]
+    fn renders_hotspots_table_with_requested_columns() {
+        let report = HotspotsReport {
+            rows: vec![HotspotRow {
+                rank: 1,
+                score: 0.875,
+                relative_path: "internal/service/risky.go".to_owned(),
+                drivers: vec!["High total churn".to_owned()],
+                tags: vec!["CHURN".to_owned(), "CMPX PRESS".to_owned()],
+                confidence: "high".to_owned(),
+            }],
+        };
+
+        let rendered = render_hotspots_table(&report);
+
+        assert!(rendered.starts_with("Rank  Score  Path  Drivers  Tags  Confidence"));
+        assert!(rendered.contains("0.875"));
+        assert!(rendered.contains("internal/service/risky.go"));
+        assert!(rendered.contains("High total churn"));
+        assert!(rendered.contains("CHURN; CMPX PRESS"));
+        assert!(rendered.contains("high"));
+    }
+
+    #[test]
+    fn empty_report_renders_empty_state() {
+        let rendered = render_hotspots_table(&HotspotsReport { rows: Vec::new() });
+
+        assert_eq!(rendered, "No scored Go file hotspots found.");
+    }
+
+    #[test]
+    fn tags_follow_tui_signal_priority() {
+        let row = HotspotScoreRow {
+            score: 0.8,
+            relative_path: "service_test.go".to_owned(),
+            is_generated: false,
+            is_vendor: false,
+            is_test: true,
+        };
+        let tags = tags_for_row(
+            &row,
+            &[
+                HotspotTerm {
+                    name: "complexity_pressure".to_owned(),
+                    normalized_value: Some(1.0),
+                },
+                HotspotTerm {
+                    name: "churn".to_owned(),
+                    normalized_value: Some(0.7),
+                },
+                HotspotTerm {
+                    name: "size".to_owned(),
+                    normalized_value: Some(0.3),
+                },
+            ],
+        );
+
+        assert_eq!(tags, vec!["CHURN", "CMPX PRESS", "TEST"]);
+    }
+
+    #[test]
+    fn loader_requires_complete_index() {
+        let connection = Connection::open_in_memory().expect("database opens");
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE scan_state (
+                    key TEXT PRIMARY KEY NOT NULL,
+                    value TEXT NOT NULL
+                );
+                INSERT INTO scan_state VALUES ('last_scan_completed', '0');
+                ",
+            )
+            .expect("schema should be created");
+
+        let error = load_hotspots_report_from_connection(&connection, 20)
+            .expect_err("incomplete index should fail");
+
+        assert!(matches!(error, HotspotsError::IncompleteIndex));
+    }
+
+    #[test]
+    fn loader_sorts_by_score_then_path_and_limits_rows() {
+        let connection = Connection::open_in_memory().expect("database opens");
+        create_hotspots_schema(&connection);
+        connection
+            .execute_batch(
+                "
+                INSERT INTO scan_state VALUES ('last_scan_completed', '1');
+                INSERT INTO project_risk_summary VALUES ('hotpath.project_risk.go.v1', 'bounded');
+                INSERT INTO file_risk_scores VALUES
+                    ('z.go', 'z.go', 1, 'hotpath.score.go.v1', 3, 0.8, 8.0, 'high', 0, 0, 0),
+                    ('a.go', 'a.go', 1, 'hotpath.score.go.v1', 2, 0.8, 8.0, 'high', 0, 0, 0),
+                    ('m.go', 'm.go', 1, 'hotpath.score.go.v1', 1, 0.9, 9.0, 'extreme', 0, 0, 0);
+                INSERT INTO file_risk_facts VALUES
+                    ('m.go', 'hotpath.score.go.v1', 0, 'summary', 'M fact'),
+                    ('a.go', 'hotpath.score.go.v1', 0, 'summary', 'A fact');
+                INSERT INTO file_risk_terms VALUES
+                    ('m.go', 'hotpath.score.go.v1', 'churn', 1.0),
+                    ('a.go', 'hotpath.score.go.v1', 'complexity_pressure', 1.0);
+                ",
+            )
+            .expect("rows should insert");
+
+        let report =
+            load_hotspots_report_from_connection(&connection, 2).expect("hotspots should load");
+
+        assert_eq!(report.rows.len(), 2);
+        assert_eq!(report.rows[0].relative_path, "m.go");
+        assert_eq!(report.rows[1].relative_path, "a.go");
+        assert_eq!(report.rows[0].rank, 1);
+        assert_eq!(report.rows[1].rank, 2);
+        assert_eq!(report.rows[0].confidence, "bounded");
+        assert_eq!(report.rows[0].drivers, vec!["M fact"]);
+        assert_eq!(report.rows[0].tags, vec!["CHURN"]);
+    }
+
+    fn create_hotspots_schema(connection: &Connection) {
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE scan_state (
+                    key TEXT PRIMARY KEY NOT NULL,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE project_risk_summary (
+                    formula_id TEXT PRIMARY KEY NOT NULL,
+                    confidence TEXT NOT NULL
+                );
+                CREATE TABLE file_risk_scores (
+                    relative_path TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    active_scan_id INTEGER NOT NULL,
+                    formula_id TEXT NOT NULL,
+                    rank INTEGER NOT NULL,
+                    score REAL NOT NULL,
+                    risk_10 REAL NOT NULL,
+                    risk_band TEXT NOT NULL,
+                    is_generated INTEGER NOT NULL,
+                    is_vendor INTEGER NOT NULL,
+                    is_test INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (relative_path, formula_id)
+                );
+                CREATE TABLE file_risk_facts (
+                    relative_path TEXT NOT NULL,
+                    formula_id TEXT NOT NULL,
+                    fact_index INTEGER NOT NULL,
+                    fact_kind TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    PRIMARY KEY (relative_path, formula_id, fact_index)
+                );
+                CREATE TABLE file_risk_terms (
+                    relative_path TEXT NOT NULL,
+                    formula_id TEXT NOT NULL,
+                    term_name TEXT NOT NULL,
+                    normalized_value REAL,
+                    PRIMARY KEY (relative_path, formula_id, term_name)
+                );
+                ",
+            )
+            .expect("schema should be created");
+    }
+}

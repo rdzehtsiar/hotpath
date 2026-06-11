@@ -25,6 +25,8 @@ enum Commands {
     Scan(ScanArgs),
     /// Explain indexed metrics and score context for one file.
     Explain(ExplainArgs),
+    /// Show ranked Go file hotspots from the latest complete local index.
+    Hotspots,
     /// Open the read-only Hotpath terminal UI for the current index.
     Tui,
 }
@@ -57,6 +59,7 @@ fn main() -> ExitCode {
     match cli.command {
         Commands::Scan(args) => run_scan(args),
         Commands::Explain(args) => run_explain(args),
+        Commands::Hotspots => run_hotspots(),
         Commands::Tui => run_tui(),
     }
 }
@@ -158,6 +161,26 @@ fn run_explain(args: ExplainArgs) -> ExitCode {
             }
         },
     }
+}
+
+fn run_hotspots() -> ExitCode {
+    let current_dir = match env::current_dir() {
+        Ok(current_dir) => current_dir,
+        Err(error) => {
+            eprintln!("hotpath: failed to read current directory: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let report = match hotpath::hotspots::load_hotspots_report(&current_dir) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("hotpath: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("{}", hotpath::hotspots::render_hotspots_table(&report));
+    ExitCode::SUCCESS
 }
 
 #[derive(Debug, Serialize)]
