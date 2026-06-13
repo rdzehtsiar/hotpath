@@ -2278,6 +2278,10 @@ mod tests {
                     ownership_share REAL NOT NULL,
                     touch_count INTEGER NOT NULL
                 );
+                CREATE TABLE stage_metadata (
+                    key TEXT PRIMARY KEY NOT NULL,
+                    value TEXT NOT NULL
+                );
 
                 INSERT INTO project_risk_summary VALUES
                     ('hotpath.project_risk.go.v1', 1, 0.72, 7.2, 'high', 'high', 2, 2, 2, 1.0, 1.0, 0.90, 0.55, 1, 1, 'churn', 0.8, 'available');

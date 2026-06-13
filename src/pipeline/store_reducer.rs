@@ -2764,9 +2764,9 @@ fn materialize_package_risk_scores(
                 score.score,
                 facts.total_churn_lines,
                 facts.recent_churn_lines,
-                facts.cognitive_complexity,
-                facts.source_coupling_in,
-                facts.source_coupling_out
+                facts.complexity_pressure,
+                facts.source_coupling_pressure_in,
+                facts.source_coupling_pressure_out
             FROM file_facts facts
             INNER JOIN file_risk_scores score
                 ON score.relative_path = facts.relative_path

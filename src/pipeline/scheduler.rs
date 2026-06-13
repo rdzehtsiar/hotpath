@@ -263,7 +263,7 @@ impl TaskQueue {
             .lock()
             .expect("task queue mutex should not poison");
         loop {
-            if let Some(task) = state.tasks.pop_front() {
+            if let Some(task) = state.pop_next() {
                 self.has_capacity.notify_one();
                 return Some(task);
             }
@@ -294,6 +294,20 @@ impl TaskQueue {
 struct TaskQueueState {
     tasks: VecDeque<PipelineTask>,
     closed: bool,
+}
+
+impl TaskQueueState {
+    fn pop_next(&mut self) -> Option<PipelineTask> {
+        let git_task_index = self
+            .tasks
+            .iter()
+            .position(|task| matches!(task, PipelineTask::AnalyzeGitHistory(_)));
+
+        match git_task_index {
+            Some(index) => self.tasks.remove(index),
+            None => self.tasks.pop_front(),
+        }
+    }
 }
 
 fn worker_loop(queue: Arc<TaskQueue>, context: WorkerContext) {
@@ -555,6 +569,24 @@ mod tests {
     }
 
     #[test]
+    fn queue_prioritizes_pending_git_history_over_file_backlog() {
+        let queue = TaskQueue::new(4);
+        queue.push(task(0)).expect("first file task should push");
+        queue.push(task(1)).expect("second file task should push");
+        queue
+            .push(git_history_task())
+            .expect("git history task should push");
+
+        assert!(matches!(
+            queue.pop(),
+            Some(PipelineTask::AnalyzeGitHistory(_))
+        ));
+        assert_eq!(queue.pop(), Some(task(0)));
+        assert_eq!(queue.pop(), Some(task(1)));
+        queue.close();
+    }
+
+    #[test]
     fn stats_can_be_read_before_finish() {
         let scheduler = Scheduler::start(SchedulerOptions {
             worker_count: 1,
@@ -644,6 +676,19 @@ mod tests {
     fn task(index: usize) -> PipelineTask {
         PipelineTask::AnalyzeFile(EnumeratedFile {
             path: PathBuf::from(format!("file-{index}.go")),
+        })
+    }
+
+    fn git_history_task() -> PipelineTask {
+        PipelineTask::AnalyzeGitHistory(GitHistoryScan {
+            root: PathBuf::from("definitely-not-a-git-root"),
+            revision: None,
+            head_timestamp: 0,
+            max_commits: Some(0),
+            max_age_days: None,
+            detect_renames: true,
+            cochange_max_files_per_commit: 100,
+            delta_batch_size: 10_000,
         })
     }
 }

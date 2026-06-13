@@ -314,6 +314,7 @@ fn ascii_only_terminal_for(no_color: bool, term: Option<&str>, platform: Termina
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalPlatform {
     Windows { output_utf8: bool },
+    #[cfg_attr(windows, allow(dead_code))]
     Other,
 }
 
