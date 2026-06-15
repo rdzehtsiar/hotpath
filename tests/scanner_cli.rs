@@ -1212,6 +1212,21 @@ fn explain_unknown_indexed_path_fails_actionably() {
 }
 
 #[test]
+fn explain_path_outside_index_root_fails_actionably() {
+    let fixture = Fixture::new("explain-outside-root");
+    fixture.write("main.go", "package main\n\nfunc main() {}\n");
+    let scan = hotpath(&["scan"], &fixture.path);
+    assert!(scan.status.success());
+
+    let output = hotpath(&["explain", "../escape.go"], &fixture.path);
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert!(stderr.contains("is outside indexed repository"));
+}
+
+#[test]
 fn explain_generated_go_file_returns_unavailable_score() {
     let fixture = Fixture::new("explain-generated");
     fixture.write(

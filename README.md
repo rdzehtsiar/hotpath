@@ -12,6 +12,30 @@ without uploading source code or depending on hosted services.
 The implementation is currently much narrower than that product direction. This
 README documents only what exists in the current codebase.
 
+## Quick Start
+
+```powershell
+# Index the current repository
+hotpath scan
+
+# Show top production Go file hotspots
+hotpath hotspots
+
+# Explain a single file
+hotpath explain internal/service/service.go
+
+# Emit a machine-readable JSON summary instead of terminal output
+hotpath scan --json
+
+# Delete and fully rebuild the local index
+Remove-Item -Recurse -Force .hotpath; hotpath scan
+```
+
+Scores are **experimental advisory signals**, not objective truth. Confidence
+and calibration vary with repository size and Git history shape. If Git
+confidence is `bounded` or `first_parent_only`, churn and age metrics reflect
+only the reachable first-parent history within the collection window.
+
 ## Current CLI
 
 The CLI currently exposes these subcommands:
@@ -37,8 +61,26 @@ hotpath tui
 - persists derived local data to the Hotpath index
 - prints terminal progress for file and Git processing
 
-`hotpath scan --json` writes a compact JSON scan summary. There is no current CI
-gate or stable report schema beyond the explicitly versioned command JSON.
+`hotpath scan --json` writes a compact JSON scan summary to stdout with no
+terminal progress output. There is no current CI gate or stable report schema
+beyond the explicitly versioned command JSON.
+
+The v1 schema fields are:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `schema_version` | integer | Schema version identifier. Currently `1`. |
+| `command` | string | Always `"scan"`. |
+| `files.detected` | integer | Total repository files enumerated (after ignore rules). |
+| `files.analyzed` | integer | Files that completed analysis. |
+| `git.skipped` | boolean | `true` when Git analysis was not attempted. |
+| `git.mode` | string or null | Collection mode: `"full"`, `"incremental"`, or `"up_to_date"`. Null when skipped. |
+| `git.confidence` | string or null | Advisory confidence signal: `"full"`, `"bounded"`, `"incremental"`, `"first_parent_only"`, `"shallow_skipped"`, `"not_git"`, or `"error_skipped"`. Null when skipped. |
+| `git.commits_total` | integer or null | Total reachable commits available to Git. Null when skipped. |
+| `git.commits_processed` | integer | Commits actually processed in this scan. `0` when skipped or reused. |
+| `git.diagnostic` | string or null | Diagnostic code (no message text) when a Git limitation was recorded, e.g. `"merge_heavy"`. Null when none. |
+| `git.index_action` | string or null | How the Git index was handled: `"fully_rebuilt"`, `"incrementally_updated"`, `"reused"`, `"cleared_not_git"`, or `"cleared_options_changed"`. Null when skipped. |
+| `index.records_stored` | integer | Total database records written to the local index. |
 
 ### `hotpath hotspots`
 
@@ -155,9 +197,11 @@ Current Go processing is intentionally limited:
 ## Go Metric Formulas
 
 The Go metric formulas below describe the current `hotpath.score.go.v1` inputs.
-They are approximate, parser-backed signals for hotspot ranking rather than Go
-language specifications or stable public APIs. All normalized values are clamped
-to the `0.0..=1.0` range.
+They are **experimental**: the formula weights, normalization thresholds, and
+term selection are subject to change as the tool matures. Treat scores as
+approximate, parser-backed advisory signals for hotspot ranking — not as Go
+language specifications, stable public APIs, or objective measures of code
+quality. All normalized values are clamped to the `0.0..=1.0` range.
 
 ### Approximate cognitive complexity
 
