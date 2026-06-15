@@ -82,12 +82,17 @@ fn scan_prints_file_and_git_progress_summary() {
     assert!(final_lines[1].contains("commits/sec"));
     assert!(final_lines[2].starts_with("time"));
     assert!(final_lines[2].contains("elapsed"));
-    assert!(stdout.contains("summary"));
-    assert!(stdout.contains("top_go_hotspots"));
-    assert!(stdout.contains("project_coverage production_go 100.0%"));
-    assert!(stdout.contains("git confidence not_git"));
-    assert!(stdout.contains("git: Git analysis skipped"));
-    assert!(stdout.contains(&format!("index {}", index_display(&fixture.path))));
+    assert!(stdout.contains("Hotpath scan complete"));
+    assert!(stdout.contains("Repository Risk"));
+    assert!(stdout.contains("Coverage"));
+    assert!(stdout.contains("Production Go       2/2 scored  (100.0%)"));
+    assert!(stdout.contains("Confidence"));
+    assert!(stdout.contains("Git history  Unavailable; scores use file and parser signals only."));
+    assert!(stdout.contains("Top Hotspots"));
+    assert!(stdout.contains("Index\n  .hotpath/index.sqlite"));
+    assert!(!stdout.contains("git confidence not_git"));
+    assert!(!stdout.contains("diagnostic not_git"));
+    assert!(!stdout.contains(&fixture.path.display().to_string()));
 
     let connection =
         Connection::open(fixture.path.join(".hotpath").join("index.sqlite")).expect("db opens");
@@ -114,7 +119,7 @@ fn scan_json_reports_stable_non_git_summary_without_progress() {
     assert!(stdout.ends_with('\n'));
     assert_eq!(stdout.lines().count(), 1);
     assert!(!stdout.contains("| speed"));
-    assert!(!stdout.contains("summary"));
+    assert!(!stdout.contains("Hotpath scan complete"));
 
     let json: Value = serde_json::from_str(&stdout).expect("stdout should be JSON");
     assert_eq!(json["schema_version"], 1);
@@ -188,12 +193,13 @@ fn scan_summary_reports_no_go_coverage_and_limitation() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
-    assert!(stdout.contains("top_go_hotspots none"));
-    assert!(stdout.contains(
-        "project_coverage production_go 0.0%  scored 0/0 production Go files  active_files 1  confidence none"
-    ));
-    assert!(stdout.contains("limitations no_scored_files: No Go file risk scores are available."));
-    assert!(stdout.contains(&format!("index {}", index_display(&fixture.path))));
+    assert!(stdout.contains("Advisory score  unavailable"));
+    assert!(stdout.contains("Hotspot spread  no scored production Go files"));
+    assert!(stdout.contains("Production Go       0/0 scored  (0.0%)"));
+    assert!(stdout.contains("Other active files  1 indexed, not scored by Go risk model"));
+    assert!(stdout.contains("Top Hotspots\n  none"));
+    assert!(stdout.contains("  - No Go file risk scores are available."));
+    assert!(stdout.contains("Index\n  .hotpath/index.sqlite"));
 }
 
 #[test]
@@ -498,12 +504,10 @@ fn scan_reports_actionable_non_git_diagnostic() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
-    assert!(stdout.contains("diagnostic not_git"));
-    assert!(stdout.contains(
-        "git confidence not_git  mode skipped_not_git  collection unavailable  index_action cleared_not_git"
-    ));
-    assert!(stdout.contains("git: Git analysis skipped"));
-    assert!(stdout.contains(&format!("index {}", index_display(&fixture.path))));
+    assert!(stdout.contains("Git history  Unavailable; scores use file and parser signals only."));
+    assert!(stdout.contains("Git analysis skipped: current directory is not a Git worktree."));
+    assert!(!stdout.contains("diagnostic not_git"));
+    assert!(!stdout.contains("index_action cleared_not_git"));
 
     let connection =
         Connection::open(fixture.path.join(".hotpath").join("index.sqlite")).expect("db opens");
@@ -529,6 +533,24 @@ fn scan_reports_actionable_non_git_diagnostic() {
 }
 
 #[test]
+fn scan_verbose_reports_raw_git_and_index_details() {
+    let fixture = Fixture::new("scan-verbose-non-git");
+    fixture.write("main.go", "package main\n");
+
+    let output = hotpath(&["scan", "--verbose"], &fixture.path);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.contains("Hotpath scan complete"));
+    assert!(stdout.contains("git   diagnostic not_git"));
+    assert!(stdout.contains("git   index_action cleared_not_git"));
+    assert!(stdout.contains("Verbose"));
+    assert!(stdout.contains("git mode skipped_not_git  confidence not_git  collection unavailable"));
+    assert!(stdout.contains("index action cleared_not_git"));
+    assert!(stdout.contains(&fixture.path.display().to_string()));
+}
+
+#[test]
 fn scan_reports_actionable_empty_git_repository_diagnostic() {
     let fixture = GitFixture::new("scan-empty-git-diagnostic");
     fixture.write("main.go", "package main\n");
@@ -537,7 +559,7 @@ fn scan_reports_actionable_empty_git_repository_diagnostic() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
-    assert!(stdout.contains("diagnostic no_head"));
+    assert!(stdout.contains("repository has no HEAD commit"));
 
     let connection =
         Connection::open(fixture.path().join(".hotpath").join("index.sqlite")).expect("db opens");
@@ -574,7 +596,7 @@ fn scan_reports_git_progress_for_git_repository() {
         "2024-01-02T00:00:00Z",
     ));
 
-    let output = hotpath(&["scan"], fixture.path());
+    let output = hotpath(&["scan", "--verbose"], fixture.path());
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
@@ -684,7 +706,7 @@ fn scan_bounds_git_history_to_730_days_from_head() {
         "2025-01-02T00:00:00Z",
     ));
 
-    let output = hotpath(&["scan"], fixture.path());
+    let output = hotpath(&["scan", "--verbose"], fixture.path());
 
     assert!(
         output.status.success(),
@@ -830,7 +852,7 @@ fn scan_warns_when_first_parent_history_hides_side_branch_work() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
-    assert!(stdout.contains("warning all reachable history is much larger"));
+    assert!(stdout.contains("all reachable history is much larger"));
 
     let connection =
         Connection::open(fixture.path().join(".hotpath").join("index.sqlite")).expect("db opens");
@@ -1011,15 +1033,13 @@ func Stop(enabled bool) int {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
-    assert!(stdout.contains("summary"));
-    assert!(stdout.contains("top_go_hotspots"));
+    assert!(stdout.contains("Hotpath scan complete"));
+    assert!(stdout.contains("Top Hotspots"));
     assert!(stdout.contains("cmd/app/main.go"));
     assert!(stdout.contains("internal/service/a.go"));
-    assert!(
-        stdout.contains("project_coverage production_go 100.0%  scored 3/3 production Go files")
-    );
-    assert!(stdout.contains("git confidence not_git"));
-    assert!(stdout.contains(&format!("index {}", index_display(&fixture.path))));
+    assert!(stdout.contains("Production Go       3/3 scored  (100.0%)"));
+    assert!(stdout.contains("Git history  Unavailable; scores use file and parser signals only."));
+    assert!(stdout.contains("Index\n  .hotpath/index.sqlite"));
 }
 
 #[test]
@@ -1388,6 +1408,7 @@ fn scan_json_flag_is_recognized_by_clap() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     assert!(stdout.contains("Usage:"));
     assert!(stdout.contains("--json"));
+    assert!(stdout.contains("--verbose"));
 }
 
 fn final_scan_lines(stdout: &str) -> Vec<String> {
@@ -1464,12 +1485,4 @@ fn scalar_f64(connection: &Connection, sql: &str) -> f64 {
     connection
         .query_row(sql, [], |row| row.get(0))
         .expect("scalar query should run")
-}
-
-fn index_display(root: &Path) -> String {
-    let index = root.join(".hotpath").join("index.sqlite");
-    fs::canonicalize(&index)
-        .unwrap_or(index)
-        .display()
-        .to_string()
 }

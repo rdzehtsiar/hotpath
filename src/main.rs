@@ -36,6 +36,9 @@ struct ScanArgs {
     /// Write a stable JSON scan summary instead of terminal progress.
     #[arg(long)]
     json: bool,
+    /// Include raw Git collection and local index details in text output.
+    #[arg(long)]
+    verbose: bool,
 }
 
 #[derive(Debug, Args)]
@@ -115,7 +118,7 @@ fn run_scan(args: ScanArgs) -> ExitCode {
         }
     }
 
-    let mut reporter = StdioReporter::stdout();
+    let mut reporter = StdioReporter::stdout().with_final_git_status(args.verbose);
     if let Err(error) = engine.scan_with_reporter(&mut reporter) {
         eprintln!("hotpath: {error}");
         return ExitCode::FAILURE;
@@ -125,7 +128,10 @@ fn run_scan(args: ScanArgs) -> ExitCode {
         Ok(summary) => {
             println!(
                 "{}",
-                hotpath::pipeline::scan_summary::render_scan_summary(&summary)
+                hotpath::pipeline::scan_summary::render_scan_summary_with_options(
+                    &summary,
+                    args.verbose
+                )
             );
             ExitCode::SUCCESS
         }
@@ -241,7 +247,7 @@ impl ScanJsonOutput {
                 confidence: state.git_status.confidence.clone(),
                 commits_total: state.total_git_commits,
                 commits_processed: state.git_commits_processed,
-                diagnostic: state.git_status.diagnostic.clone(),
+                diagnostic: state.git_status.diagnostic.as_deref().map(diagnostic_code),
                 index_action: state.git_status.index_action.clone(),
             },
             index: ScanJsonIndex {
@@ -249,4 +255,12 @@ impl ScanJsonOutput {
             },
         }
     }
+}
+
+fn diagnostic_code(diagnostic: &str) -> String {
+    diagnostic
+        .split_once(':')
+        .map(|(code, _)| code)
+        .unwrap_or(diagnostic)
+        .to_owned()
 }

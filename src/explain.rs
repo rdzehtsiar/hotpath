@@ -1164,7 +1164,7 @@ pub(crate) fn normalize_index_relative_path(
     let absolute = if input_path.is_absolute() {
         canonical_or_lexical(input_path)
     } else {
-        canonical_or_lexical(&current_dir.join(input_path))
+        normalize_lexical(&canonical_or_lexical(current_dir).join(input_path))
     };
     let relative = absolute
         .strip_prefix(&root)

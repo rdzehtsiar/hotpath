@@ -33,6 +33,7 @@ pub struct StdioReporter<W: Write> {
     writer: W,
     rendered_once: bool,
     finished: bool,
+    final_git_status: bool,
     last_rendered_at: Option<Instant>,
     min_render_interval: Duration,
     bar_style: ProgressBarStyle,
@@ -50,10 +51,16 @@ impl<W: Write> StdioReporter<W> {
             writer,
             rendered_once: false,
             finished: false,
+            final_git_status: false,
             last_rendered_at: None,
             min_render_interval: MIN_RENDER_INTERVAL,
             bar_style: ProgressBarStyle::detect(),
         }
+    }
+
+    pub fn with_final_git_status(mut self, final_git_status: bool) -> Self {
+        self.final_git_status = final_git_status;
+        self
     }
 
     #[cfg(test)]
@@ -62,6 +69,7 @@ impl<W: Write> StdioReporter<W> {
             writer,
             rendered_once: false,
             finished: false,
+            final_git_status: false,
             last_rendered_at: None,
             min_render_interval,
             bar_style: ProgressBarStyle::Unicode,
@@ -108,12 +116,14 @@ impl<W: Write> PipelineReporter for StdioReporter<W> {
             self.render_now(state);
         }
         if self.rendered_once && !self.finished {
-            let status_lines = render_git_status_lines(state);
-            for (index, line) in status_lines.iter().enumerate() {
-                if index == 0 {
-                    let _ = writeln!(self.writer, "\n{line}");
-                } else {
-                    let _ = writeln!(self.writer, "{line}");
+            if self.final_git_status {
+                let status_lines = render_git_status_lines(state);
+                for (index, line) in status_lines.iter().enumerate() {
+                    if index == 0 {
+                        let _ = writeln!(self.writer, "\n{line}");
+                    } else {
+                        let _ = writeln!(self.writer, "{line}");
+                    }
                 }
             }
             let _ = writeln!(self.writer);
@@ -313,7 +323,9 @@ fn ascii_only_terminal_for(no_color: bool, term: Option<&str>, platform: Termina
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalPlatform {
-    Windows { output_utf8: bool },
+    Windows {
+        output_utf8: bool,
+    },
     #[cfg_attr(windows, allow(dead_code))]
     Other,
 }

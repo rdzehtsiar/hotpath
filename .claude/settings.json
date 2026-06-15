@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Edit(src/**)",
+      "Edit(tests/**)",
+      "Edit(.claude)",
+      "Edit(Cargo.toml)",
+      "Edit(Cargo.lock)",
+      "Edit(**/*.rs)",
+      "Edit(**/*.toml)",
+      "Write(src/**)",
+      "Write(tests/**)",
+      "Write(**/*.rs)",
+      "Bash(cargo *)",
+      "Bash(cargo build)",
+      "Bash(cargo run *)",
+      "Bash(cargo test *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo fmt *)",
+      "Bash(git *)",
+      "Bash(rustfmt *)",
+      "Bash(curl *)",
+      "Bash(npm *)",
+      "Glob",
+      "Grep"
+    ]
+  }
+}
