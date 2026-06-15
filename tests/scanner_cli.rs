@@ -395,6 +395,29 @@ fn hotspots_completed_index_without_scored_go_files_prints_empty_state() {
 }
 
 #[test]
+fn hotspots_json_reports_versioned_schema() {
+    let fixture = Fixture::new("hotspots-json");
+    fixture.write("main.go", "package main\n\nfunc main() {}\n");
+    let scan = hotpath(&["scan"], &fixture.path);
+    assert!(scan.status.success());
+
+    let output = hotpath(&["hotspots", "--json"], &fixture.path);
+
+    assert!(
+        output.status.success(),
+        "hotspots --json failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let json: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["command"], "hotspots");
+    assert_eq!(json["include_tests"], false);
+    assert!(json["hotspots"].is_array());
+}
+
+#[test]
 fn scan_separates_go_test_files_from_production_risk_output() {
     let fixture = Fixture::new("scan-go-test-files");
     fixture.write("service.go", "package main\n\nfunc Service() {}\n");
@@ -468,13 +491,14 @@ fn scan_separates_go_test_files_from_production_risk_output() {
     assert!(production_stdout.contains("service.go"));
     assert!(!production_stdout.contains("service_test.go"));
 
-    let tests = hotpath(&["hotspots", "--tests"], &fixture.path);
-    assert!(tests.status.success());
-    let test_stdout = String::from_utf8(tests.stdout).expect("stdout should be UTF-8");
-    assert!(test_stdout.contains("Go test-file hotspots"));
-    assert!(test_stdout.contains("service_test.go"));
-    assert!(test_stdout.contains("TEST"));
-    assert!(!test_stdout.contains("service.go"));
+    let with_tests = hotpath(&["hotspots", "--include-tests"], &fixture.path);
+    assert!(with_tests.status.success());
+    let with_tests_stdout =
+        String::from_utf8(with_tests.stdout).expect("stdout should be UTF-8");
+    assert!(with_tests_stdout.contains("Go hotspots (production + tests)"));
+    assert!(with_tests_stdout.contains("service.go"));
+    assert!(with_tests_stdout.contains("service_test.go"));
+    assert!(with_tests_stdout.contains("TEST"));
 }
 
 #[test]

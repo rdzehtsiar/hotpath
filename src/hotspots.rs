@@ -5,22 +5,18 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OpenFlags};
+use serde::Serialize;
 
 const INDEX_DB: &str = ".hotpath/index.sqlite";
 const DEFAULT_HOTSPOT_LIMIT: usize = 20;
 const FORMULA_ID: &str = "hotpath.score.go.v1";
 const DRIVER_LIMIT: usize = 4;
+const HOTSPOTS_JSON_SCHEMA_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HotspotsReport {
-    pub scope: HotspotScope,
+    pub include_tests: bool,
     pub rows: Vec<HotspotRow>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HotspotScope {
-    Production,
-    Tests,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -28,9 +24,29 @@ pub struct HotspotRow {
     pub rank: u64,
     pub score: f64,
     pub relative_path: String,
+    pub is_test: bool,
     pub drivers: Vec<String>,
     pub tags: Vec<String>,
     pub confidence: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HotspotsJsonOutput {
+    schema_version: u64,
+    command: &'static str,
+    include_tests: bool,
+    hotspots: Vec<HotspotsJsonHotspot>,
+}
+
+#[derive(Debug, Serialize)]
+struct HotspotsJsonHotspot {
+    rank: u64,
+    score: f64,
+    path: String,
+    is_test: bool,
+    tags: Vec<String>,
+    drivers: Vec<String>,
+    confidence: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -90,7 +106,7 @@ impl std::error::Error for HotspotsError {
 
 pub fn load_hotspots_report(
     current_dir: impl AsRef<Path>,
-    scope: HotspotScope,
+    include_tests: bool,
 ) -> Result<HotspotsReport, HotspotsError> {
     let index_root = find_index_root(current_dir.as_ref()).ok_or(HotspotsError::NoIndex)?;
     let index_path = index_root.join(INDEX_DB);
@@ -100,20 +116,20 @@ pub fn load_hotspots_report(
             source,
         })?;
 
-    load_hotspots_report_from_connection(&connection, DEFAULT_HOTSPOT_LIMIT, scope)
+    load_hotspots_report_from_connection(&connection, DEFAULT_HOTSPOT_LIMIT, include_tests)
 }
 
 fn load_hotspots_report_from_connection(
     connection: &Connection,
     limit: usize,
-    scope: HotspotScope,
+    include_tests: bool,
 ) -> Result<HotspotsReport, HotspotsError> {
     if !index_is_complete(connection)? {
         return Err(HotspotsError::IncompleteIndex);
     }
 
     let confidence = load_project_confidence(connection)?.unwrap_or_else(|| "none".to_owned());
-    let score_rows = load_score_rows(connection, limit, scope)?;
+    let score_rows = load_score_rows(connection, limit, include_tests)?;
     let facts = load_facts(connection)?;
     let terms = load_terms(connection)?;
 
@@ -126,6 +142,7 @@ fn load_hotspots_report_from_connection(
                 rank: index as u64 + 1,
                 score: row.score,
                 relative_path: row.relative_path.clone(),
+                is_test: row.is_test,
                 drivers: facts
                     .get(&row.relative_path)
                     .cloned()
@@ -139,20 +156,22 @@ fn load_hotspots_report_from_connection(
         })
         .collect();
 
-    Ok(HotspotsReport { scope, rows })
+    Ok(HotspotsReport { include_tests, rows })
 }
 
 pub fn render_hotspots_table(report: &HotspotsReport) -> String {
     if report.rows.is_empty() {
-        return match report.scope {
-            HotspotScope::Production => "No scored production Go file hotspots found.".to_owned(),
-            HotspotScope::Tests => "No scored Go test-file hotspots found.".to_owned(),
+        return if report.include_tests {
+            "No scored Go file hotspots found.".to_owned()
+        } else {
+            "No scored production Go file hotspots found.".to_owned()
         };
     }
 
-    let title = match report.scope {
-        HotspotScope::Production => "Production Go hotspots",
-        HotspotScope::Tests => "Go test-file hotspots",
+    let title = if report.include_tests {
+        "Go hotspots (production + tests)"
+    } else {
+        "Production Go hotspots"
     };
     let mut lines = vec![
         title.to_owned(),
@@ -160,6 +179,28 @@ pub fn render_hotspots_table(report: &HotspotsReport) -> String {
     ];
     lines.extend(report.rows.iter().map(render_hotspot_row));
     lines.join("\n")
+}
+
+pub fn render_hotspots_json(report: &HotspotsReport) -> String {
+    let output = HotspotsJsonOutput {
+        schema_version: HOTSPOTS_JSON_SCHEMA_VERSION,
+        command: "hotspots",
+        include_tests: report.include_tests,
+        hotspots: report
+            .rows
+            .iter()
+            .map(|row| HotspotsJsonHotspot {
+                rank: row.rank,
+                score: row.score,
+                path: row.relative_path.clone(),
+                is_test: row.is_test,
+                tags: row.tags.clone(),
+                drivers: row.drivers.clone(),
+                confidence: row.confidence.clone(),
+            })
+            .collect(),
+    };
+    serde_json::to_string(&output).expect("hotspots JSON serialization should not fail")
 }
 
 fn render_hotspot_row(row: &HotspotRow) -> String {
@@ -237,7 +278,7 @@ fn load_project_confidence(connection: &Connection) -> Result<Option<String>, Ho
 fn load_score_rows(
     connection: &Connection,
     limit: usize,
-    scope: HotspotScope,
+    include_tests: bool,
 ) -> Result<Vec<HotspotScoreRow>, HotspotsError> {
     let mut statement = connection
         .prepare(
@@ -250,26 +291,25 @@ fn load_score_rows(
                 is_test
             FROM file_risk_scores
             WHERE formula_id = ?1
-                AND is_test = ?2
+                AND (?2 = 1 OR is_test = 0)
             ORDER BY score DESC, relative_path ASC
             LIMIT ?3
             ",
         )
         .map_err(HotspotsError::QueryDatabase)?;
-    let test_flag = match scope {
-        HotspotScope::Production => 0_i64,
-        HotspotScope::Tests => 1_i64,
-    };
     let rows = statement
-        .query_map(params![FORMULA_ID, test_flag, limit as i64], |row| {
-            Ok(HotspotScoreRow {
-                score: row.get(0)?,
-                relative_path: row.get(1)?,
-                is_generated: row.get::<_, i64>(2)? != 0,
-                is_vendor: row.get::<_, i64>(3)? != 0,
-                is_test: row.get::<_, i64>(4)? != 0,
-            })
-        })
+        .query_map(
+            params![FORMULA_ID, include_tests as i64, limit as i64],
+            |row| {
+                Ok(HotspotScoreRow {
+                    score: row.get(0)?,
+                    relative_path: row.get(1)?,
+                    is_generated: row.get::<_, i64>(2)? != 0,
+                    is_vendor: row.get::<_, i64>(3)? != 0,
+                    is_test: row.get::<_, i64>(4)? != 0,
+                })
+            },
+        )
         .map_err(HotspotsError::QueryDatabase)?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(HotspotsError::QueryDatabase)
@@ -389,18 +429,19 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        load_hotspots_report_from_connection, render_hotspots_table, tags_for_row, HotspotRow,
-        HotspotScope, HotspotScoreRow, HotspotTerm, HotspotsError, HotspotsReport,
+        load_hotspots_report_from_connection, render_hotspots_json, render_hotspots_table,
+        tags_for_row, HotspotRow, HotspotScoreRow, HotspotTerm, HotspotsError, HotspotsReport,
     };
 
     #[test]
     fn renders_hotspots_table_with_requested_columns() {
         let report = HotspotsReport {
-            scope: HotspotScope::Production,
+            include_tests: false,
             rows: vec![HotspotRow {
                 rank: 1,
                 score: 0.875,
                 relative_path: "internal/service/risky.go".to_owned(),
+                is_test: false,
                 drivers: vec!["High total churn".to_owned()],
                 tags: vec!["CHURN".to_owned(), "CMPX PRESS".to_owned()],
                 confidence: "high".to_owned(),
@@ -421,11 +462,42 @@ mod tests {
     #[test]
     fn empty_report_renders_empty_state() {
         let rendered = render_hotspots_table(&HotspotsReport {
-            scope: HotspotScope::Production,
+            include_tests: false,
             rows: Vec::new(),
         });
 
         assert_eq!(rendered, "No scored production Go file hotspots found.");
+    }
+
+    #[test]
+    fn renders_hotspots_json_with_versioned_schema() {
+        let report = HotspotsReport {
+            include_tests: true,
+            rows: vec![HotspotRow {
+                rank: 1,
+                score: 0.875,
+                relative_path: "internal/service/risky_test.go".to_owned(),
+                is_test: true,
+                drivers: vec!["High total churn".to_owned()],
+                tags: vec!["CHURN".to_owned(), "TEST".to_owned()],
+                confidence: "medium".to_owned(),
+            }],
+        };
+
+        let json = render_hotspots_json(&report);
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("output should be valid JSON");
+
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["command"], "hotspots");
+        assert_eq!(value["include_tests"], true);
+        let hotspots = value["hotspots"].as_array().expect("hotspots should be array");
+        assert_eq!(hotspots.len(), 1);
+        assert_eq!(hotspots[0]["rank"], 1);
+        assert_eq!(hotspots[0]["score"], 0.875);
+        assert_eq!(hotspots[0]["path"], "internal/service/risky_test.go");
+        assert_eq!(hotspots[0]["is_test"], true);
+        assert_eq!(hotspots[0]["confidence"], "medium");
     }
 
     #[test]
@@ -473,7 +545,7 @@ mod tests {
             )
             .expect("schema should be created");
 
-        let error = load_hotspots_report_from_connection(&connection, 20, HotspotScope::Production)
+        let error = load_hotspots_report_from_connection(&connection, 20, false)
             .expect_err("incomplete index should fail");
 
         assert!(matches!(error, HotspotsError::IncompleteIndex));
@@ -503,21 +575,22 @@ mod tests {
             )
             .expect("rows should insert");
 
-        let report = load_hotspots_report_from_connection(&connection, 2, HotspotScope::Production)
-            .expect("hotspots should load");
+        let report =
+            load_hotspots_report_from_connection(&connection, 2, false).expect("hotspots should load");
 
         assert_eq!(report.rows.len(), 2);
         assert_eq!(report.rows[0].relative_path, "m.go");
         assert_eq!(report.rows[1].relative_path, "a.go");
         assert_eq!(report.rows[0].rank, 1);
         assert_eq!(report.rows[1].rank, 2);
+        assert_eq!(report.rows[0].is_test, false);
         assert_eq!(report.rows[0].confidence, "bounded");
         assert_eq!(report.rows[0].drivers, vec!["M fact"]);
         assert_eq!(report.rows[0].tags, vec!["CHURN"]);
     }
 
     #[test]
-    fn loader_can_return_test_hotspots_separately() {
+    fn loader_excludes_test_files_by_default() {
         let connection = Connection::open_in_memory().expect("database opens");
         create_hotspots_schema(&connection);
         connection
@@ -532,13 +605,40 @@ mod tests {
             )
             .expect("rows should insert");
 
-        let report = load_hotspots_report_from_connection(&connection, 20, HotspotScope::Tests)
-            .expect("test hotspots should load");
+        let report = load_hotspots_report_from_connection(&connection, 20, false)
+            .expect("hotspots should load");
 
-        assert_eq!(report.scope, HotspotScope::Tests);
         assert_eq!(report.rows.len(), 1);
-        assert_eq!(report.rows[0].relative_path, "prod_test.go");
-        assert_eq!(report.rows[0].tags, vec!["TEST"]);
+        assert_eq!(report.rows[0].relative_path, "prod.go");
+        assert_eq!(report.rows[0].is_test, false);
+    }
+
+    #[test]
+    fn loader_includes_test_files_when_requested() {
+        let connection = Connection::open_in_memory().expect("database opens");
+        create_hotspots_schema(&connection);
+        connection
+            .execute_batch(
+                "
+                INSERT INTO scan_state VALUES ('last_scan_completed', '1');
+                INSERT INTO project_risk_summary VALUES ('hotpath.project_risk.go.v1', 'bounded');
+                INSERT INTO file_risk_scores VALUES
+                    ('prod.go', 'prod.go', 1, 'hotpath.score.go.v1', 1, 0.9, 9.0, 'extreme', 0, 0, 0),
+                    ('prod_test.go', 'prod_test.go', 1, 'hotpath.score.go.v1', 2, 0.8, 8.0, 'high', 0, 0, 1);
+                ",
+            )
+            .expect("rows should insert");
+
+        let report = load_hotspots_report_from_connection(&connection, 20, true)
+            .expect("hotspots should load");
+
+        assert_eq!(report.include_tests, true);
+        assert_eq!(report.rows.len(), 2);
+        assert_eq!(report.rows[0].relative_path, "prod.go");
+        assert_eq!(report.rows[0].is_test, false);
+        assert_eq!(report.rows[1].relative_path, "prod_test.go");
+        assert_eq!(report.rows[1].is_test, true);
+        assert!(report.rows[1].tags.contains(&"TEST".to_owned()));
     }
 
     fn create_hotspots_schema(connection: &Connection) {

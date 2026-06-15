@@ -52,9 +52,12 @@ struct ExplainArgs {
 
 #[derive(Debug, Args)]
 struct HotspotsArgs {
-    /// Show Go test-file hotspots instead of production Go hotspots.
+    /// Include Go test-file hotspots alongside production Go hotspots.
     #[arg(long)]
-    tests: bool,
+    include_tests: bool,
+    /// Write a JSON hotspot summary to stdout instead of a text table.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -184,12 +187,7 @@ fn run_hotspots(args: HotspotsArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let scope = if args.tests {
-        hotpath::hotspots::HotspotScope::Tests
-    } else {
-        hotpath::hotspots::HotspotScope::Production
-    };
-    let report = match hotpath::hotspots::load_hotspots_report(&current_dir, scope) {
+    let report = match hotpath::hotspots::load_hotspots_report(&current_dir, args.include_tests) {
         Ok(report) => report,
         Err(error) => {
             eprintln!("hotpath: {error}");
@@ -197,7 +195,11 @@ fn run_hotspots(args: HotspotsArgs) -> ExitCode {
         }
     };
 
-    println!("{}", hotpath::hotspots::render_hotspots_table(&report));
+    if args.json {
+        println!("{}", hotpath::hotspots::render_hotspots_json(&report));
+    } else {
+        println!("{}", hotpath::hotspots::render_hotspots_table(&report));
+    }
     ExitCode::SUCCESS
 }
 
