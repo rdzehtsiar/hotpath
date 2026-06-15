@@ -323,6 +323,7 @@ fn ascii_only_terminal_for(no_color: bool, term: Option<&str>, platform: Termina
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalPlatform {
+    #[cfg_attr(not(windows), allow(dead_code))]
     Windows {
         output_utf8: bool,
     },

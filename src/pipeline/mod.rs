@@ -2,8 +2,6 @@
 
 pub mod analysis_engine;
 pub mod code_metrics_analyzer;
-mod dependency_analyzer;
-mod diff_risk_assessor;
 pub mod enumerator;
 pub mod events;
 pub mod file_analyzer;
