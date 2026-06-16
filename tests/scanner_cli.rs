@@ -253,10 +253,19 @@ fn hotspots_prints_ranked_go_file_table_from_completed_index() {
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     assert!(stdout.starts_with("Production Go hotspots"));
-    assert!(stdout.contains(" 1  0.900  risky.go  [high]"));
+    assert!(stdout.contains("git confidence:"));
+    assert!(stdout.contains(" 1  risky.go"));
+    assert!(!stdout.contains("0.900"));
     assert!(stdout.contains("high churn"));
-    assert!(stdout.contains("High total churn: 2500 changed lines"));
+    assert!(!stdout.contains("High total churn: 2500 changed lines"));
     assert!(!stdout.contains(&fixture.path.display().to_string()));
+
+    let verbose = hotpath(&["hotspots", "--verbose"], &fixture.path);
+    assert!(verbose.status.success());
+    let verbose_stdout = String::from_utf8(verbose.stdout).expect("stdout should be UTF-8");
+    assert!(verbose_stdout.contains("0.900"));
+    assert!(verbose_stdout.contains("[high]"));
+    assert!(verbose_stdout.contains("High total churn: 2500 changed lines"));
 }
 
 #[test]
@@ -320,9 +329,13 @@ fn hotspots_breaks_score_ties_by_path() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
-    let rows = stdout.lines().skip(2).collect::<Vec<_>>();
-    assert!(rows[0].contains("a.go"), "stdout:\n{stdout}");
-    assert!(rows[1].contains("b.go"), "stdout:\n{stdout}");
+    let entry_lines: Vec<&str> = stdout
+        .lines()
+        .skip(1)
+        .filter(|l| !l.is_empty() && !l.starts_with(' '))
+        .collect();
+    assert!(entry_lines[0].contains("a.go"), "stdout:\n{stdout}");
+    assert!(entry_lines[1].contains("b.go"), "stdout:\n{stdout}");
 }
 
 #[test]

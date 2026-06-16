@@ -159,7 +159,7 @@ fn load_hotspots_report_from_connection(
     Ok(HotspotsReport { include_tests, rows })
 }
 
-pub fn render_hotspots_table(report: &HotspotsReport) -> String {
+pub fn render_hotspots_table(report: &HotspotsReport, verbose: bool) -> String {
     if report.rows.is_empty() {
         return if report.include_tests {
             "No scored Go file hotspots found.".to_owned()
@@ -168,23 +168,39 @@ pub fn render_hotspots_table(report: &HotspotsReport) -> String {
         };
     }
 
-    let title = if report.include_tests {
+    let title_base = if report.include_tests {
         "Go hotspots (production + tests)"
     } else {
         "Production Go hotspots"
     };
-    let mut lines = vec![title.to_owned()];
+    let header = if verbose {
+        title_base.to_owned()
+    } else {
+        let confidence = report
+            .rows
+            .first()
+            .map(|r| r.confidence.as_str())
+            .unwrap_or("none");
+        format!("{title_base}  [git confidence: {confidence}]")
+    };
+    let mut lines = vec![header];
     for row in &report.rows {
         lines.push(String::new());
-        lines.push(format!(
-            "{:>2}  {:.3}  {}  [{}]",
-            row.rank, row.score, row.relative_path, row.confidence
-        ));
+        if verbose {
+            lines.push(format!(
+                "{:>2}  {:.3}  {}  [{}]",
+                row.rank, row.score, row.relative_path, row.confidence
+            ));
+        } else {
+            lines.push(format!("{:>2}  {}", row.rank, row.relative_path));
+        }
         if !row.tags.is_empty() {
             lines.push(format!("    {}", row.tags.join(" · ")));
         }
-        for driver in &row.drivers {
-            lines.push(format!("    {driver}"));
+        if verbose {
+            for driver in &row.drivers {
+                lines.push(format!("    {driver}"));
+            }
         }
     }
     lines.join("\n")
@@ -438,22 +454,30 @@ mod tests {
             }],
         };
 
-        let rendered = render_hotspots_table(&report);
+        let default = render_hotspots_table(&report, false);
+        assert!(default.starts_with("Production Go hotspots"));
+        assert!(default.contains("git confidence: high"));
+        assert!(!default.contains("0.875"));
+        assert!(default.contains("internal/service/risky.go"));
+        assert!(!default.contains("[high]"));
+        assert!(default.contains("high churn · complexity pressure"));
+        assert!(!default.contains("High total churn"));
 
-        assert!(rendered.starts_with("Production Go hotspots"));
-        assert!(rendered.contains("0.875"));
-        assert!(rendered.contains("internal/service/risky.go"));
-        assert!(rendered.contains("[high]"));
-        assert!(rendered.contains("high churn · complexity pressure"));
-        assert!(rendered.contains("High total churn"));
+        let verbose = render_hotspots_table(&report, true);
+        assert!(verbose.contains("0.875"));
+        assert!(verbose.contains("[high]"));
+        assert!(verbose.contains("High total churn"));
     }
 
     #[test]
     fn empty_report_renders_empty_state() {
-        let rendered = render_hotspots_table(&HotspotsReport {
-            include_tests: false,
-            rows: Vec::new(),
-        });
+        let rendered = render_hotspots_table(
+            &HotspotsReport {
+                include_tests: false,
+                rows: Vec::new(),
+            },
+            false,
+        );
 
         assert_eq!(rendered, "No scored production Go file hotspots found.");
     }

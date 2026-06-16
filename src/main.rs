@@ -58,6 +58,9 @@ struct HotspotsArgs {
     /// Write a JSON hotspot summary to stdout instead of a text table.
     #[arg(long)]
     json: bool,
+    /// Include scores, confidence, and driver details in text output.
+    #[arg(long)]
+    verbose: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -198,7 +201,7 @@ fn run_hotspots(args: HotspotsArgs) -> ExitCode {
     if args.json {
         println!("{}", hotpath::hotspots::render_hotspots_json(&report));
     } else {
-        println!("{}", hotpath::hotspots::render_hotspots_table(&report));
+        println!("{}", hotpath::hotspots::render_hotspots_table(&report, args.verbose));
     }
     ExitCode::SUCCESS
 }
