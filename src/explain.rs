@@ -6,10 +6,8 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use rusqlite::{params, Connection, OpenFlags};
-use serde::Serialize;
 
 const INDEX_DB: &str = ".hotpath/index.sqlite";
-const SCHEMA_VERSION: &str = "hotpath.explain.v1";
 const COCHANGE_LIMIT: i64 = 10;
 
 #[derive(Debug)]
@@ -69,14 +67,9 @@ impl std::error::Error for ExplainError {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExplainReport {
-    pub schema_version: &'static str,
-    pub command: &'static str,
-    pub index_root: String,
-    pub index_path: String,
     pub file: ExplainFile,
-    pub score_status: ScoreStatus,
     pub score_unavailable_reasons: Vec<ExplainLimitation>,
     pub score: Option<ExplainScore>,
     pub terms: Vec<ExplainTerm>,
@@ -89,7 +82,7 @@ pub struct ExplainReport {
     pub source_coupling: SourceCoupling,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExplainFile {
     pub relative_path: String,
     pub absolute_path: String,
@@ -104,14 +97,7 @@ pub struct ExplainFile {
     pub parser_recognition_attempts: u64,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ScoreStatus {
-    Available,
-    Unavailable,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExplainScore {
     pub formula_id: String,
     pub rank: u64,
@@ -120,7 +106,7 @@ pub struct ExplainScore {
     pub risk_band: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExplainTerm {
     pub name: String,
     pub raw_value: Option<f64>,
@@ -129,7 +115,7 @@ pub struct ExplainTerm {
     pub contribution: f64,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RawMetrics {
     pub byte_size: Option<u64>,
     pub mtime_ms: Option<u64>,
@@ -160,19 +146,19 @@ pub struct RawMetrics {
     pub source_coupling_pressure_out: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplainFact {
     pub kind: String,
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplainLimitation {
     pub code: String,
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExplainOwner {
     pub rank: u64,
     pub author: String,
@@ -181,20 +167,20 @@ pub struct ExplainOwner {
     pub touch_count: u64,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitContext {
     pub metadata: BTreeMap<String, String>,
     pub limitations: Vec<ExplainLimitation>,
     pub cochanges: Vec<CochangePartner>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CochangePartner {
     pub path: String,
     pub co_change_count: u64,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceCoupling {
     pub package_path: Option<String>,
     pub inbound_count: Option<u64>,
@@ -204,7 +190,7 @@ pub struct SourceCoupling {
     pub inbound_sources: Vec<SourceEdge>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceReference {
     pub reference_index: u64,
     pub reference_kind: String,
@@ -213,7 +199,7 @@ pub struct SourceReference {
     pub is_resolved: bool,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceEdge {
     pub source_path: String,
     pub source_package: String,
@@ -280,13 +266,11 @@ pub fn load_explain_report(
             path: index_path.clone(),
             source,
         })?;
-    load_explain_report_from_connection(&connection, &index_root, index_path, &relative_path)
+    load_explain_report_from_connection(&connection, &relative_path)
 }
 
 fn load_explain_report_from_connection(
     connection: &Connection,
-    index_root: &Path,
-    index_path: PathBuf,
     relative_path: &str,
 ) -> Result<ExplainReport, ExplainError> {
     let metadata = load_stage_metadata(connection)?;
@@ -322,10 +306,6 @@ fn load_explain_report_from_connection(
     };
 
     Ok(ExplainReport {
-        schema_version: SCHEMA_VERSION,
-        command: "explain",
-        index_root: index_root.display().to_string(),
-        index_path: index_path.display().to_string(),
         file: ExplainFile {
             relative_path: file.relative_path.clone(),
             absolute_path: file.absolute_path.clone(),
@@ -338,11 +318,6 @@ fn load_explain_report_from_connection(
             is_test: file.is_test,
             parser_status: file.parser_status.clone(),
             parser_recognition_attempts: file.parser_recognition_attempts,
-        },
-        score_status: if score.is_some() {
-            ScoreStatus::Available
-        } else {
-            ScoreStatus::Unavailable
         },
         score_unavailable_reasons,
         score,
@@ -1239,8 +1214,8 @@ mod tests {
     use super::{
         normalize_index_relative_path, parse_diagnostics_json, render_explain_text,
         CochangePartner, ExplainFact, ExplainFile, ExplainLimitation, ExplainOwner, ExplainReport,
-        ExplainScore, ExplainTerm, GitContext, RawMetrics, ScoreStatus, SourceCoupling, SourceEdge,
-        SourceReference, SCHEMA_VERSION,
+        ExplainScore, ExplainTerm, GitContext, RawMetrics, SourceCoupling, SourceEdge,
+        SourceReference,
     };
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -1291,10 +1266,6 @@ mod tests {
         let mut metadata = BTreeMap::new();
         metadata.insert("git_confidence".to_owned(), "bounded".to_owned());
         let report = ExplainReport {
-            schema_version: SCHEMA_VERSION,
-            command: "explain",
-            index_root: "C:/repo".to_owned(),
-            index_path: "C:/repo/.hotpath/index.sqlite".to_owned(),
             file: ExplainFile {
                 relative_path: "src/risky.go".to_owned(),
                 absolute_path: "C:/repo/src/risky.go".to_owned(),
@@ -1308,7 +1279,6 @@ mod tests {
                 parser_status: "parsed".to_owned(),
                 parser_recognition_attempts: 1,
             },
-            score_status: ScoreStatus::Available,
             score_unavailable_reasons: Vec::new(),
             score: Some(ExplainScore {
                 formula_id: "hotpath.score.go.v1".to_owned(),

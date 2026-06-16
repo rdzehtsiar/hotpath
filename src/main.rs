@@ -4,7 +4,7 @@ use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 use hotpath::pipeline::events::PipelineState;
 use hotpath::pipeline::reporter::StdioReporter;
 use serde::Serialize;
@@ -43,9 +43,6 @@ struct ScanArgs {
 struct ExplainArgs {
     /// Repository-relative path, or an absolute path under the indexed repository root.
     path: PathBuf,
-    /// Output format.
-    #[arg(long, value_enum, default_value_t = ExplainFormat::Text)]
-    format: ExplainFormat,
 }
 
 #[derive(Debug, Args)]
@@ -65,12 +62,6 @@ struct HotspotsArgs {
     /// Show all scored hotspots without a limit.
     #[arg(long, conflicts_with = "top")]
     all: bool,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum ExplainFormat {
-    Text,
-    Json,
 }
 
 fn main() -> ExitCode {
@@ -157,22 +148,8 @@ fn run_explain(args: ExplainArgs) -> ExitCode {
         }
     };
 
-    match args.format {
-        ExplainFormat::Text => {
-            println!("{}", hotpath::explain::render_explain_text(&report));
-            ExitCode::SUCCESS
-        }
-        ExplainFormat::Json => match serde_json::to_string_pretty(&report) {
-            Ok(json) => {
-                println!("{json}");
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("hotpath: failed to serialize explain JSON: {error}");
-                ExitCode::FAILURE
-            }
-        },
-    }
+    println!("{}", hotpath::explain::render_explain_text(&report));
+    ExitCode::SUCCESS
 }
 
 fn run_hotspots(args: HotspotsArgs) -> ExitCode {
@@ -188,18 +165,22 @@ fn run_hotspots(args: HotspotsArgs) -> ExitCode {
     } else {
         Some(args.top.unwrap_or(hotpath::hotspots::DEFAULT_HOTSPOT_LIMIT))
     };
-    let report = match hotpath::hotspots::load_hotspots_report(&current_dir, args.include_tests, limit) {
-        Ok(report) => report,
-        Err(error) => {
-            eprintln!("hotpath: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let report =
+        match hotpath::hotspots::load_hotspots_report(&current_dir, args.include_tests, limit) {
+            Ok(report) => report,
+            Err(error) => {
+                eprintln!("hotpath: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
 
     if args.json {
         println!("{}", hotpath::hotspots::render_hotspots_json(&report));
     } else {
-        println!("{}", hotpath::hotspots::render_hotspots_table(&report, args.verbose));
+        println!(
+            "{}",
+            hotpath::hotspots::render_hotspots_table(&report, args.verbose)
+        );
     }
     ExitCode::SUCCESS
 }

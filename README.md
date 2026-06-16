@@ -99,12 +99,10 @@ index, rerun analysis, or mutate `.hotpath/`. If the index is missing, stale, or
 does not contain the requested file, run `hotpath scan` first.
 
 The path may be repository-relative or an absolute path under the indexed
-repository root. Output defaults to terminal text:
+repository root:
 
 ```powershell
 hotpath explain internal/service/service.go
-hotpath explain internal/service/service.go --format text
-hotpath explain internal/service/service.go --format json
 ```
 
 Text output includes file facts, raw metrics, normalized score terms, weights,

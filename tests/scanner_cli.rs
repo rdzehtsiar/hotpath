@@ -1195,26 +1195,6 @@ func main() {
 }
 
 #[test]
-fn explain_json_reports_versioned_schema() {
-    let fixture = Fixture::new("explain-json");
-    fixture.write("main.go", "package main\n\nfunc main() {}\n");
-    let scan = hotpath(&["scan"], &fixture.path);
-    assert!(scan.status.success());
-
-    let output = hotpath(&["explain", "main.go", "--format", "json"], &fixture.path);
-
-    assert!(output.status.success());
-    let json: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
-    assert_eq!(json["schema_version"], "hotpath.explain.v1");
-    assert_eq!(json["command"], "explain");
-    assert_eq!(json["file"]["relative_path"], "main.go");
-    assert_eq!(json["score_status"], "available");
-    assert!(json["terms"]
-        .as_array()
-        .is_some_and(|terms| !terms.is_empty()));
-}
-
-#[test]
 fn explain_accepts_absolute_path_under_index_root() {
     let fixture = Fixture::new("explain-absolute-path");
     fixture.write("main.go", "package main\n\nfunc main() {}\n");
@@ -1283,10 +1263,7 @@ fn explain_generated_go_file_returns_unavailable_score() {
     let scan = hotpath(&["scan"], &fixture.path);
     assert!(scan.status.success());
 
-    let output = hotpath(
-        &["explain", "generated.go", "--format", "json"],
-        &fixture.path,
-    );
+    let output = hotpath(&["explain", "generated.go"], &fixture.path);
 
     assert!(
         output.status.success(),
@@ -1294,14 +1271,9 @@ fn explain_generated_go_file_returns_unavailable_score() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let json: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
-    assert_eq!(json["score_status"], "unavailable");
-    assert_eq!(json["score"], Value::Null);
-    assert!(json["score_unavailable_reasons"]
-        .as_array()
-        .expect("reasons should be array")
-        .iter()
-        .any(|reason| reason["code"] == "generated_or_vendor_excluded"));
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.contains("unavailable"));
+    assert!(stdout.contains("generated_or_vendor_excluded"));
 }
 
 #[test]
