@@ -201,13 +201,15 @@ pub fn render_hotspots_table(report: &HotspotsReport, verbose: bool) -> String {
         } else {
             lines.push(format!("{:>2}  {}", row.rank, row.relative_path));
         }
-        if !row.tags.is_empty() {
-            lines.push(format!("    {}", row.tags.join(" · ")));
-        }
         if verbose {
+            if !row.tags.is_empty() {
+                lines.push(format!("    {}", row.tags.join(" · ")));
+            }
             for driver in &row.drivers {
                 lines.push(format!("    {driver}"));
             }
+        } else if let Some(phrase) = phrase_for_tags(&row.tags) {
+            lines.push(format!("    {phrase}"));
         }
     }
     if !verbose && report.total_available > report.rows.len() as u64 {
@@ -409,6 +411,43 @@ fn load_terms(
     Ok(terms)
 }
 
+fn phrase_for_tags(tags: &[String]) -> Option<String> {
+    let first = tags.first().map(String::as_str)?;
+    let second = tags.get(1).map(String::as_str);
+
+    let phrase = match (first, second) {
+        // high churn leads
+        ("high churn", Some("coupling pressure")) => "Frequently changed coordination point — edits here ripple widely",
+        ("high churn", Some("ownership risk"))    => "Frequently changed under divided ownership",
+        ("high churn", Some("large file"))        => "Large, frequently changed file",
+        ("high churn", Some("complexity pressure")) => "Frequently changed, high-complexity file",
+        ("high churn", _)                         => "Frequently changed — top churn signal",
+        // coupling pressure leads
+        ("coupling pressure", Some("ownership risk"))    => "Widely depended on under divided ownership",
+        ("coupling pressure", Some("large file"))        => "Large, widely depended on file",
+        ("coupling pressure", Some("complexity pressure")) => "Complex, widely depended on file",
+        ("coupling pressure", _)                         => "High coupling pressure — changes here spread",
+        // ownership risk leads
+        ("ownership risk", Some("large file"))        => "Large file under divided ownership",
+        ("ownership risk", Some("complexity pressure")) => "Complex file under divided ownership",
+        ("ownership risk", _)                         => "Divided ownership — coordination risk",
+        // large file leads
+        ("large file", Some("complexity pressure")) => "Large, high-complexity file",
+        ("large file", _)                           => "Large file — size pressure",
+        // complexity alone
+        ("complexity pressure", _) => "High control-flow complexity",
+        // recent churn alone (lower priority than the above)
+        ("recent churn", _) => "Recently active — high recent churn",
+        // special file kinds
+        ("test file",  _) => "Test file",
+        ("generated",  _) => "Generated file",
+        ("vendor",     _) => "Vendor file",
+        _ => return None,
+    };
+
+    Some(phrase.to_owned())
+}
+
 fn tags_for_row(row: &HotspotScoreRow, terms: &[HotspotTerm]) -> Vec<String> {
     let mut signals = Vec::new();
     if row.is_generated {
@@ -465,8 +504,9 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        load_hotspots_report_from_connection, render_hotspots_json, render_hotspots_table,
-        tags_for_row, HotspotRow, HotspotScoreRow, HotspotTerm, HotspotsError, HotspotsReport,
+        load_hotspots_report_from_connection, phrase_for_tags, render_hotspots_json,
+        render_hotspots_table, tags_for_row, HotspotRow, HotspotScoreRow, HotspotTerm,
+        HotspotsError, HotspotsReport,
     };
 
     #[test]
@@ -491,13 +531,15 @@ mod tests {
         assert!(!default.contains("0.875"));
         assert!(default.contains("internal/service/risky.go"));
         assert!(!default.contains("[high]"));
-        assert!(default.contains("high churn · complexity pressure"));
+        assert!(default.contains("Frequently changed, high-complexity file"));
+        assert!(!default.contains("high churn · complexity pressure"));
         assert!(!default.contains("High total churn"));
         assert!(!default.contains("more"));
 
         let verbose = render_hotspots_table(&report, true);
         assert!(verbose.contains("0.875"));
         assert!(verbose.contains("[high]"));
+        assert!(verbose.contains("high churn · complexity pressure"));
         assert!(verbose.contains("High total churn"));
     }
 
@@ -600,6 +642,43 @@ mod tests {
         );
 
         assert_eq!(tags, vec!["high churn", "complexity pressure", "test file"]);
+    }
+
+    #[test]
+    fn phrase_covers_dominant_signal_combinations() {
+        let p = |tags: &[&str]| {
+            phrase_for_tags(&tags.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+
+        assert_eq!(
+            p(&["high churn", "coupling pressure"]),
+            Some("Frequently changed coordination point — edits here ripple widely".to_owned())
+        );
+        assert_eq!(
+            p(&["high churn", "ownership risk"]),
+            Some("Frequently changed under divided ownership".to_owned())
+        );
+        assert_eq!(
+            p(&["high churn", "complexity pressure"]),
+            Some("Frequently changed, high-complexity file".to_owned())
+        );
+        assert_eq!(
+            p(&["coupling pressure", "large file"]),
+            Some("Large, widely depended on file".to_owned())
+        );
+        assert_eq!(
+            p(&["ownership risk"]),
+            Some("Divided ownership — coordination risk".to_owned())
+        );
+        assert_eq!(
+            p(&["large file", "complexity pressure"]),
+            Some("Large, high-complexity file".to_owned())
+        );
+        assert_eq!(
+            p(&["test file"]),
+            Some("Test file".to_owned())
+        );
+        assert_eq!(p(&[]), None);
     }
 
     #[test]

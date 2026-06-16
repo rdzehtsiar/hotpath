@@ -256,7 +256,7 @@ fn hotspots_prints_ranked_go_file_table_from_completed_index() {
     assert!(stdout.contains("git confidence:"));
     assert!(stdout.contains(" 1  risky.go"));
     assert!(!stdout.contains("0.900"));
-    assert!(stdout.contains("high churn"));
+    assert!(stdout.contains("Frequently changed"));
     assert!(!stdout.contains("High total churn: 2500 changed lines"));
     assert!(!stdout.contains(&fixture.path.display().to_string()));
 
@@ -288,8 +288,7 @@ fn hotspots_default_output_is_limited_to_top_five() {
 
     let default_output = hotpath(&["hotspots"], &fixture.path);
     assert!(default_output.status.success());
-    let default_stdout =
-        String::from_utf8(default_output.stdout).expect("stdout should be UTF-8");
+    let default_stdout = String::from_utf8(default_output.stdout).expect("stdout should be UTF-8");
     let default_entries: Vec<&str> = default_stdout
         .lines()
         .filter(|l| !l.is_empty() && !l.starts_with("    ") && l.contains("file-"))
@@ -518,12 +517,11 @@ fn scan_separates_go_test_files_from_production_risk_output() {
 
     let with_tests = hotpath(&["hotspots", "--include-tests"], &fixture.path);
     assert!(with_tests.status.success());
-    let with_tests_stdout =
-        String::from_utf8(with_tests.stdout).expect("stdout should be UTF-8");
+    let with_tests_stdout = String::from_utf8(with_tests.stdout).expect("stdout should be UTF-8");
     assert!(with_tests_stdout.contains("Go hotspots (production + tests)"));
     assert!(with_tests_stdout.contains("service.go"));
     assert!(with_tests_stdout.contains("service_test.go"));
-    assert!(with_tests_stdout.contains("test file"));
+    assert!(with_tests_stdout.contains("Test file"));
 }
 
 #[test]
