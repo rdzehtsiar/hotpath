@@ -269,9 +269,9 @@ fn hotspots_prints_ranked_go_file_table_from_completed_index() {
 }
 
 #[test]
-fn hotspots_default_output_is_limited_to_top_twenty() {
+fn hotspots_default_output_is_limited_to_top_five() {
     let fixture = Fixture::new("hotspots-limit");
-    for index in 0..25 {
+    for index in 0..10 {
         fixture.write(
             format!("file-{index:02}.go"),
             &format!("package main\n\nfunc File{index}() {{}}\n"),
@@ -286,19 +286,33 @@ fn hotspots_default_output_is_limited_to_top_twenty() {
         String::from_utf8_lossy(&scan.stderr)
     );
 
-    let output = hotpath(&["hotspots"], &fixture.path);
+    let default_output = hotpath(&["hotspots"], &fixture.path);
+    assert!(default_output.status.success());
+    let default_stdout =
+        String::from_utf8(default_output.stdout).expect("stdout should be UTF-8");
+    let default_entries: Vec<&str> = default_stdout
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with(' ') && l.contains("file-"))
+        .collect();
+    assert_eq!(default_entries.len(), 5);
 
-    assert!(
-        output.status.success(),
-        "hotspots failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
-    assert_eq!(stdout.lines().count(), 22);
-    assert!(stdout.contains("file-00.go"));
-    assert!(stdout.contains("file-19.go"));
-    assert!(!stdout.contains("file-20.go"));
+    let top_output = hotpath(&["hotspots", "--top", "8"], &fixture.path);
+    assert!(top_output.status.success());
+    let top_stdout = String::from_utf8(top_output.stdout).expect("stdout should be UTF-8");
+    let top_entries: Vec<&str> = top_stdout
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with(' ') && l.contains("file-"))
+        .collect();
+    assert_eq!(top_entries.len(), 8);
+
+    let all_output = hotpath(&["hotspots", "--all"], &fixture.path);
+    assert!(all_output.status.success());
+    let all_stdout = String::from_utf8(all_output.stdout).expect("stdout should be UTF-8");
+    let all_entries: Vec<&str> = all_stdout
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with(' ') && l.contains("file-"))
+        .collect();
+    assert_eq!(all_entries.len(), 10);
 }
 
 #[test]

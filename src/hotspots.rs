@@ -8,7 +8,7 @@ use rusqlite::{params, Connection, OpenFlags};
 use serde::Serialize;
 
 const INDEX_DB: &str = ".hotpath/index.sqlite";
-const DEFAULT_HOTSPOT_LIMIT: usize = 20;
+pub const DEFAULT_HOTSPOT_LIMIT: usize = 5;
 const FORMULA_ID: &str = "hotpath.score.go.v1";
 const DRIVER_LIMIT: usize = 4;
 const HOTSPOTS_JSON_SCHEMA_VERSION: u64 = 1;
@@ -107,6 +107,7 @@ impl std::error::Error for HotspotsError {
 pub fn load_hotspots_report(
     current_dir: impl AsRef<Path>,
     include_tests: bool,
+    limit: Option<usize>,
 ) -> Result<HotspotsReport, HotspotsError> {
     let index_root = find_index_root(current_dir.as_ref()).ok_or(HotspotsError::NoIndex)?;
     let index_path = index_root.join(INDEX_DB);
@@ -116,12 +117,12 @@ pub fn load_hotspots_report(
             source,
         })?;
 
-    load_hotspots_report_from_connection(&connection, DEFAULT_HOTSPOT_LIMIT, include_tests)
+    load_hotspots_report_from_connection(&connection, limit, include_tests)
 }
 
 fn load_hotspots_report_from_connection(
     connection: &Connection,
-    limit: usize,
+    limit: Option<usize>,
     include_tests: bool,
 ) -> Result<HotspotsReport, HotspotsError> {
     if !index_is_complete(connection)? {
@@ -129,7 +130,7 @@ fn load_hotspots_report_from_connection(
     }
 
     let confidence = load_project_confidence(connection)?.unwrap_or_else(|| "none".to_owned());
-    let score_rows = load_score_rows(connection, limit, include_tests)?;
+    let score_rows = load_score_rows(connection, include_tests, limit)?;
     let facts = load_facts(connection)?;
     let terms = load_terms(connection)?;
 
@@ -283,9 +284,10 @@ fn load_project_confidence(connection: &Connection) -> Result<Option<String>, Ho
 
 fn load_score_rows(
     connection: &Connection,
-    limit: usize,
     include_tests: bool,
+    limit: Option<usize>,
 ) -> Result<Vec<HotspotScoreRow>, HotspotsError> {
+    let sql_limit: i64 = limit.map(|n| n as i64).unwrap_or(-1);
     let mut statement = connection
         .prepare(
             "
@@ -305,7 +307,7 @@ fn load_score_rows(
         .map_err(HotspotsError::QueryDatabase)?;
     let rows = statement
         .query_map(
-            params![FORMULA_ID, include_tests as i64, limit as i64],
+            params![FORMULA_ID, include_tests as i64, sql_limit],
             |row| {
                 Ok(HotspotScoreRow {
                     score: row.get(0)?,
@@ -558,7 +560,7 @@ mod tests {
             )
             .expect("schema should be created");
 
-        let error = load_hotspots_report_from_connection(&connection, 20, false)
+        let error = load_hotspots_report_from_connection(&connection, None, false)
             .expect_err("incomplete index should fail");
 
         assert!(matches!(error, HotspotsError::IncompleteIndex));
@@ -589,7 +591,7 @@ mod tests {
             .expect("rows should insert");
 
         let report =
-            load_hotspots_report_from_connection(&connection, 2, false).expect("hotspots should load");
+            load_hotspots_report_from_connection(&connection, Some(2), false).expect("hotspots should load");
 
         assert_eq!(report.rows.len(), 2);
         assert_eq!(report.rows[0].relative_path, "m.go");
@@ -618,7 +620,7 @@ mod tests {
             )
             .expect("rows should insert");
 
-        let report = load_hotspots_report_from_connection(&connection, 20, false)
+        let report = load_hotspots_report_from_connection(&connection, None, false)
             .expect("hotspots should load");
 
         assert_eq!(report.rows.len(), 1);
@@ -642,7 +644,7 @@ mod tests {
             )
             .expect("rows should insert");
 
-        let report = load_hotspots_report_from_connection(&connection, 20, true)
+        let report = load_hotspots_report_from_connection(&connection, None, true)
             .expect("hotspots should load");
 
         assert_eq!(report.include_tests, true);

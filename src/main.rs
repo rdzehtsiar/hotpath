@@ -61,6 +61,12 @@ struct HotspotsArgs {
     /// Include scores, confidence, and driver details in text output.
     #[arg(long)]
     verbose: bool,
+    /// Show top N hotspots (default: 5).
+    #[arg(long, conflicts_with = "all")]
+    top: Option<usize>,
+    /// Show all scored hotspots without a limit.
+    #[arg(long, conflicts_with = "top")]
+    all: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -190,7 +196,12 @@ fn run_hotspots(args: HotspotsArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let report = match hotpath::hotspots::load_hotspots_report(&current_dir, args.include_tests) {
+    let limit = if args.all {
+        None
+    } else {
+        Some(args.top.unwrap_or(hotpath::hotspots::DEFAULT_HOTSPOT_LIMIT))
+    };
+    let report = match hotpath::hotspots::load_hotspots_report(&current_dir, args.include_tests, limit) {
         Ok(report) => report,
         Err(error) => {
             eprintln!("hotpath: {error}");
