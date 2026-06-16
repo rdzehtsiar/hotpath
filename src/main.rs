@@ -27,8 +27,6 @@ enum Commands {
     Explain(ExplainArgs),
     /// Show ranked Go file hotspots from the latest complete local index.
     Hotspots(HotspotsArgs),
-    /// Open the read-only Hotpath terminal UI for the current index.
-    Tui,
 }
 
 #[derive(Debug, Args)]
@@ -82,17 +80,6 @@ fn main() -> ExitCode {
         Commands::Scan(args) => run_scan(args),
         Commands::Explain(args) => run_explain(args),
         Commands::Hotspots(args) => run_hotspots(args),
-        Commands::Tui => run_tui(),
-    }
-}
-
-fn run_tui() -> ExitCode {
-    match hotpath::tui::run_tui() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("hotpath: {error}");
-            ExitCode::FAILURE
-        }
     }
 }
 

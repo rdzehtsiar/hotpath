@@ -44,7 +44,6 @@ The CLI currently exposes these subcommands:
 hotpath scan
 hotpath explain <path>
 hotpath hotspots
-hotpath tui
 ```
 
 ### `hotpath scan`
@@ -117,12 +116,6 @@ Files that were scanned but not scored still explain their indexed facts and
 return success. Their score is reported as unavailable with reasons such as
 unsupported language, generated/vendor exclusion, missing parser metrics, or a
 missing score row.
-
-### `hotpath tui`
-
-`hotpath tui` opens an early read-only terminal UI over the local Hotpath index.
-It is keyboard-first and unstable. It should not be treated as a stable UI
-contract.
 
 ## Local Index
 

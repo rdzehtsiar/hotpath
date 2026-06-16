@@ -1441,23 +1441,6 @@ fn removed_commands_fail_as_unknown_commands() {
 }
 
 #[test]
-fn tui_command_is_recognized_by_clap() {
-    let fixture = Fixture::new("tui-help");
-
-    let output = hotpath(&["tui", "--help"], &fixture.path);
-
-    assert!(
-        output.status.success(),
-        "hotpath tui --help failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
-    assert!(stdout.contains("Usage:"));
-    assert!(stdout.contains("tui"));
-}
-
-#[test]
 fn scan_json_flag_is_recognized_by_clap() {
     let fixture = Fixture::new("scan-json-help");
 
