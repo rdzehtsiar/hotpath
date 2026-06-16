@@ -845,19 +845,19 @@ fn inspector_lines(row: &RiskRow, width: u16) -> Vec<Line<'static>> {
             severity_for_score(row.score),
         ),
         metric_bar_line(
-            "FRAGILITY",
+            "ownership risk",
             ownership_risk(row),
             ownership_risk_label(row).to_owned(),
             severity_for_score(ownership_risk(row)),
         ),
         metric_bar_line(
-            "COORD PRESS",
+            "coupling pressure",
             coordination_pressure(row),
             coordination_severity_label(coordination_pressure(row)).to_owned(),
             severity_for_score(coordination_pressure(row)),
         ),
         metric_bar_line(
-            "CMPX PRESS",
+            "complexity pressure",
             complexity_pressure(row),
             complexity_severity_label(row.max_function_complexity_pressure.unwrap_or(0) as f64)
                 .to_owned(),
@@ -1292,16 +1292,16 @@ fn tags_for_row(row: &RiskRow) -> Vec<String> {
 fn inspector_tags(row: &RiskRow) -> Vec<String> {
     let mut signals = Vec::new();
     if row.is_generated {
-        signals.push(("GEN", 1.0, 10));
+        signals.push(("generated", 1.0, 10));
     }
     if row.is_vendor {
-        signals.push(("VENDOR", 1.0, 10));
+        signals.push(("vendor", 1.0, 10));
     }
     if row.is_test {
-        signals.push(("TEST", 1.0, 20));
+        signals.push(("test file", 1.0, 20));
     }
     if !row.parser_diagnostics.is_empty() {
-        signals.push(("PARSER", 1.0, 95));
+        signals.push(("parser errors", 1.0, 95));
     }
     for term in &row.terms {
         let value = term.normalized_value.unwrap_or_default();
@@ -1309,14 +1309,14 @@ fn inspector_tags(row: &RiskRow) -> Vec<String> {
             continue;
         }
         match term.name.as_str() {
-            "churn" => signals.push(("CHURN", value, 90)),
-            "recent_churn" => signals.push(("VOLATILITY", value, 65)),
-            "size" => signals.push(("SIZE", value, 75)),
-            "ownership_risk" => signals.push(("FRAGILITY", value, 80)),
+            "churn" => signals.push(("high churn", value, 90)),
+            "recent_churn" => signals.push(("recent churn", value, 65)),
+            "size" => signals.push(("large file", value, 75)),
+            "ownership_risk" => signals.push(("ownership risk", value, 80)),
             "cochange_pressure" | "source_coupling_pressure" => {
-                signals.push(("COORD PRESS", value, 85))
+                signals.push(("coupling pressure", value, 85))
             }
-            "complexity_pressure" => signals.push(("CMPX PRESS", value, 70)),
+            "complexity_pressure" => signals.push(("complexity pressure", value, 70)),
             _ => {}
         }
     }
@@ -1925,7 +1925,7 @@ mod tests {
         assert!(snapshot.rows[0].is_generated);
         assert!(inspector_tags(&snapshot.rows[0])
             .iter()
-            .any(|tag| tag == "GEN"));
+            .any(|tag| tag == "generated"));
         assert_eq!(snapshot.rows[0].terms.len(), 2);
         assert_eq!(snapshot.rows[0].facts.len(), 1);
         assert_eq!(snapshot.rows[0].limitations.len(), 1);
@@ -1961,7 +1961,7 @@ mod tests {
         assert_eq!(snapshot.test_rows[0].relative_path, "src/risky_test.go");
         assert!(inspector_tags(&snapshot.test_rows[0])
             .iter()
-            .any(|tag| tag == "TEST"));
+            .any(|tag| tag == "test file"));
 
         reduce_key(&mut state, &snapshot, KeyEvent::from(KeyCode::Char('t')));
 
@@ -2058,7 +2058,7 @@ mod tests {
         assert!(output.contains("Top Factor"));
         assert!(output.contains("Inspector"));
         assert!(output.contains("src/risky.go"));
-        assert!(output.contains("CHURN"));
+        assert!(output.contains("high churn"));
         assert!(output.contains("Parser diagnostics"));
         assert!(output.contains("parse_error"));
     }

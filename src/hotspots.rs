@@ -173,11 +173,20 @@ pub fn render_hotspots_table(report: &HotspotsReport) -> String {
     } else {
         "Production Go hotspots"
     };
-    let mut lines = vec![
-        title.to_owned(),
-        "Rank  Score  Path  Drivers  Tags  Confidence".to_owned(),
-    ];
-    lines.extend(report.rows.iter().map(render_hotspot_row));
+    let mut lines = vec![title.to_owned()];
+    for row in &report.rows {
+        lines.push(String::new());
+        lines.push(format!(
+            "{:>2}  {:.3}  {}  [{}]",
+            row.rank, row.score, row.relative_path, row.confidence
+        ));
+        if !row.tags.is_empty() {
+            lines.push(format!("    {}", row.tags.join(" · ")));
+        }
+        for driver in &row.drivers {
+            lines.push(format!("    {driver}"));
+        }
+    }
     lines.join("\n")
 }
 
@@ -203,25 +212,6 @@ pub fn render_hotspots_json(report: &HotspotsReport) -> String {
     serde_json::to_string(&output).expect("hotspots JSON serialization should not fail")
 }
 
-fn render_hotspot_row(row: &HotspotRow) -> String {
-    format!(
-        "{:<4}  {:>5.3}  {}  {}  {}  {}",
-        row.rank,
-        row.score,
-        row.relative_path,
-        display_list(&row.drivers),
-        display_list(&row.tags),
-        row.confidence
-    )
-}
-
-fn display_list(values: &[String]) -> String {
-    if values.is_empty() {
-        "none".to_owned()
-    } else {
-        values.join("; ")
-    }
-}
 
 fn find_index_root(current_dir: &Path) -> Option<PathBuf> {
     current_dir
@@ -376,13 +366,13 @@ fn load_terms(
 fn tags_for_row(row: &HotspotScoreRow, terms: &[HotspotTerm]) -> Vec<String> {
     let mut signals = Vec::new();
     if row.is_generated {
-        signals.push(("GEN", 1.0, 10));
+        signals.push(("generated", 1.0, 10));
     }
     if row.is_vendor {
-        signals.push(("VENDOR", 1.0, 10));
+        signals.push(("vendor", 1.0, 10));
     }
     if row.is_test {
-        signals.push(("TEST", 1.0, 20));
+        signals.push(("test file", 1.0, 20));
     }
     for term in terms {
         let value = term.normalized_value.unwrap_or_default();
@@ -390,14 +380,14 @@ fn tags_for_row(row: &HotspotScoreRow, terms: &[HotspotTerm]) -> Vec<String> {
             continue;
         }
         match term.name.as_str() {
-            "churn" => signals.push(("CHURN", value, 90)),
-            "recent_churn" => signals.push(("VOLATILITY", value, 65)),
-            "size" => signals.push(("SIZE", value, 75)),
-            "ownership_risk" => signals.push(("FRAGILITY", value, 80)),
+            "churn" => signals.push(("high churn", value, 90)),
+            "recent_churn" => signals.push(("recent churn", value, 65)),
+            "size" => signals.push(("large file", value, 75)),
+            "ownership_risk" => signals.push(("ownership risk", value, 80)),
             "cochange_pressure" | "source_coupling_pressure" => {
-                signals.push(("COORD PRESS", value, 85));
+                signals.push(("coupling pressure", value, 85));
             }
-            "complexity_pressure" => signals.push(("CMPX PRESS", value, 70)),
+            "complexity_pressure" => signals.push(("complexity pressure", value, 70)),
             _ => {}
         }
     }
@@ -443,7 +433,7 @@ mod tests {
                 relative_path: "internal/service/risky.go".to_owned(),
                 is_test: false,
                 drivers: vec!["High total churn".to_owned()],
-                tags: vec!["CHURN".to_owned(), "CMPX PRESS".to_owned()],
+                tags: vec!["high churn".to_owned(), "complexity pressure".to_owned()],
                 confidence: "high".to_owned(),
             }],
         };
@@ -451,12 +441,11 @@ mod tests {
         let rendered = render_hotspots_table(&report);
 
         assert!(rendered.starts_with("Production Go hotspots"));
-        assert!(rendered.contains("Rank  Score  Path  Drivers  Tags  Confidence"));
         assert!(rendered.contains("0.875"));
         assert!(rendered.contains("internal/service/risky.go"));
+        assert!(rendered.contains("[high]"));
+        assert!(rendered.contains("high churn · complexity pressure"));
         assert!(rendered.contains("High total churn"));
-        assert!(rendered.contains("CHURN; CMPX PRESS"));
-        assert!(rendered.contains("high"));
     }
 
     #[test]
@@ -479,7 +468,7 @@ mod tests {
                 relative_path: "internal/service/risky_test.go".to_owned(),
                 is_test: true,
                 drivers: vec!["High total churn".to_owned()],
-                tags: vec!["CHURN".to_owned(), "TEST".to_owned()],
+                tags: vec!["high churn".to_owned(), "test file".to_owned()],
                 confidence: "medium".to_owned(),
             }],
         };
@@ -527,7 +516,7 @@ mod tests {
             ],
         );
 
-        assert_eq!(tags, vec!["CHURN", "CMPX PRESS", "TEST"]);
+        assert_eq!(tags, vec!["high churn", "complexity pressure", "test file"]);
     }
 
     #[test]
@@ -586,7 +575,7 @@ mod tests {
         assert_eq!(report.rows[0].is_test, false);
         assert_eq!(report.rows[0].confidence, "bounded");
         assert_eq!(report.rows[0].drivers, vec!["M fact"]);
-        assert_eq!(report.rows[0].tags, vec!["CHURN"]);
+        assert_eq!(report.rows[0].tags, vec!["high churn"]);
     }
 
     #[test]
@@ -638,7 +627,7 @@ mod tests {
         assert_eq!(report.rows[0].is_test, false);
         assert_eq!(report.rows[1].relative_path, "prod_test.go");
         assert_eq!(report.rows[1].is_test, true);
-        assert!(report.rows[1].tags.contains(&"TEST".to_owned()));
+        assert!(report.rows[1].tags.contains(&"test file".to_owned()));
     }
 
     fn create_hotspots_schema(connection: &Connection) {

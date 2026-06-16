@@ -253,11 +253,9 @@ fn hotspots_prints_ranked_go_file_table_from_completed_index() {
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     assert!(stdout.starts_with("Production Go hotspots"));
-    assert!(stdout.contains("Rank  Score  Path  Drivers  Tags  Confidence"));
-    assert!(stdout.contains("1     0.900  risky.go"));
+    assert!(stdout.contains(" 1  0.900  risky.go  [high]"));
+    assert!(stdout.contains("high churn"));
     assert!(stdout.contains("High total churn: 2500 changed lines"));
-    assert!(stdout.contains("CHURN"));
-    assert!(stdout.contains("high"));
     assert!(!stdout.contains(&fixture.path.display().to_string()));
 }
 
@@ -498,7 +496,7 @@ fn scan_separates_go_test_files_from_production_risk_output() {
     assert!(with_tests_stdout.contains("Go hotspots (production + tests)"));
     assert!(with_tests_stdout.contains("service.go"));
     assert!(with_tests_stdout.contains("service_test.go"));
-    assert!(with_tests_stdout.contains("TEST"));
+    assert!(with_tests_stdout.contains("test file"));
 }
 
 #[test]
