@@ -4,7 +4,12 @@ use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use clap::builder::styling;
 use clap::{Args, Parser, Subcommand};
+
+const CLI_STYLES: styling::Styles = styling::Styles::styled()
+    .header(styling::Style::new().bold())
+    .usage(styling::Style::new().bold());
 use hotpath::pipeline::events::PipelineState;
 use hotpath::pipeline::reporter::StdioReporter;
 use serde::Serialize;
@@ -13,7 +18,8 @@ const SCAN_JSON_SCHEMA_VERSION: u64 = 1;
 
 #[derive(Debug, Parser)]
 #[command(name = "hotpath")]
-#[command(about = "Offline local-first codebase intelligence CLI")]
+#[command(about = "Find risky files in your Go codebase using local Git and parser signals.")]
+#[command(styles = CLI_STYLES)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -21,11 +27,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Enumerate repository files and print scan throughput.
+    /// Analyze files and Git history; reruns are incremental.
     Scan(ScanArgs),
-    /// Explain indexed metrics and score context for one file.
+    /// Show why a specific file scored as a hotspot.
     Explain(ExplainArgs),
-    /// Show ranked Go file hotspots from the latest complete local index.
+    /// List the top Go file hotspots by risk score.
     Hotspots(HotspotsArgs),
 }
 
