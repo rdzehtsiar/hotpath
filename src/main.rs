@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::builder::styling;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 const CLI_STYLES: styling::Styles = styling::Styles::styled()
     .header(styling::Style::new().bold())
@@ -18,6 +18,9 @@ const SCAN_JSON_SCHEMA_VERSION: u64 = 1;
 
 #[derive(Debug, Parser)]
 #[command(name = "hotpath")]
+#[command(version)]
+#[command(disable_version_flag = true)]
+#[command(override_usage = "hotpath <COMMAND> [OPTIONS]")]
 #[command(about = "Find risky files in your Go codebase using local Git and parser signals.")]
 #[command(styles = CLI_STYLES)]
 struct Cli {
@@ -71,7 +74,19 @@ struct HotspotsArgs {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let matches = Cli::command()
+        .arg(
+            clap::Arg::new("version")
+                .short('v')
+                .long("version")
+                .action(clap::ArgAction::Version)
+                .help("Print version"),
+        )
+        .get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
 
     match cli.command {
         Commands::Scan(args) => run_scan(args),
