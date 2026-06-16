@@ -16,6 +16,7 @@ const HOTSPOTS_JSON_SCHEMA_VERSION: u64 = 1;
 #[derive(Debug, Clone, PartialEq)]
 pub struct HotspotsReport {
     pub include_tests: bool,
+    pub total_available: u64,
     pub rows: Vec<HotspotRow>,
 }
 
@@ -130,6 +131,7 @@ fn load_hotspots_report_from_connection(
     }
 
     let confidence = load_project_confidence(connection)?.unwrap_or_else(|| "none".to_owned());
+    let total_available = count_score_rows(connection, include_tests)?;
     let score_rows = load_score_rows(connection, include_tests, limit)?;
     let facts = load_facts(connection)?;
     let terms = load_terms(connection)?;
@@ -157,7 +159,11 @@ fn load_hotspots_report_from_connection(
         })
         .collect();
 
-    Ok(HotspotsReport { include_tests, rows })
+    Ok(HotspotsReport {
+        include_tests,
+        total_available,
+        rows,
+    })
 }
 
 pub fn render_hotspots_table(report: &HotspotsReport, verbose: bool) -> String {
@@ -204,6 +210,13 @@ pub fn render_hotspots_table(report: &HotspotsReport, verbose: bool) -> String {
             }
         }
     }
+    if !verbose && report.total_available > report.rows.len() as u64 {
+        let remaining = report.total_available - report.rows.len() as u64;
+        lines.push(String::new());
+        lines.push(format!(
+            "+ {remaining} more  (--top N or --all to see them)"
+        ));
+    }
     lines.join("\n")
 }
 
@@ -228,7 +241,6 @@ pub fn render_hotspots_json(report: &HotspotsReport) -> String {
     };
     serde_json::to_string(&output).expect("hotspots JSON serialization should not fail")
 }
-
 
 fn find_index_root(current_dir: &Path) -> Option<PathBuf> {
     current_dir
@@ -280,6 +292,22 @@ fn load_project_confidence(connection: &Connection) -> Result<Option<String>, Ho
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(source) => Err(HotspotsError::QueryDatabase(source)),
     }
+}
+
+fn count_score_rows(connection: &Connection, include_tests: bool) -> Result<u64, HotspotsError> {
+    connection
+        .query_row(
+            "
+            SELECT COUNT(*)
+            FROM file_risk_scores
+            WHERE formula_id = ?1
+                AND (?2 = 1 OR is_test = 0)
+            ",
+            params![FORMULA_ID, include_tests as i64],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n as u64)
+        .map_err(HotspotsError::QueryDatabase)
 }
 
 fn load_score_rows(
@@ -445,6 +473,7 @@ mod tests {
     fn renders_hotspots_table_with_requested_columns() {
         let report = HotspotsReport {
             include_tests: false,
+            total_available: 1,
             rows: vec![HotspotRow {
                 rank: 1,
                 score: 0.875,
@@ -464,6 +493,7 @@ mod tests {
         assert!(!default.contains("[high]"));
         assert!(default.contains("high churn · complexity pressure"));
         assert!(!default.contains("High total churn"));
+        assert!(!default.contains("more"));
 
         let verbose = render_hotspots_table(&report, true);
         assert!(verbose.contains("0.875"));
@@ -472,10 +502,34 @@ mod tests {
     }
 
     #[test]
+    fn renders_trailing_more_line_when_results_are_truncated() {
+        let report = HotspotsReport {
+            include_tests: false,
+            total_available: 8,
+            rows: vec![HotspotRow {
+                rank: 1,
+                score: 0.9,
+                relative_path: "hot.go".to_owned(),
+                is_test: false,
+                drivers: vec![],
+                tags: vec![],
+                confidence: "full".to_owned(),
+            }],
+        };
+
+        let rendered = render_hotspots_table(&report, false);
+        assert!(rendered.contains("+ 7 more  (--top N or --all to see them)"));
+
+        let verbose = render_hotspots_table(&report, true);
+        assert!(!verbose.contains("more"));
+    }
+
+    #[test]
     fn empty_report_renders_empty_state() {
         let rendered = render_hotspots_table(
             &HotspotsReport {
                 include_tests: false,
+                total_available: 0,
                 rows: Vec::new(),
             },
             false,
@@ -488,6 +542,7 @@ mod tests {
     fn renders_hotspots_json_with_versioned_schema() {
         let report = HotspotsReport {
             include_tests: true,
+            total_available: 1,
             rows: vec![HotspotRow {
                 rank: 1,
                 score: 0.875,
@@ -506,7 +561,9 @@ mod tests {
         assert_eq!(value["schema_version"], 1);
         assert_eq!(value["command"], "hotspots");
         assert_eq!(value["include_tests"], true);
-        let hotspots = value["hotspots"].as_array().expect("hotspots should be array");
+        let hotspots = value["hotspots"]
+            .as_array()
+            .expect("hotspots should be array");
         assert_eq!(hotspots.len(), 1);
         assert_eq!(hotspots[0]["rank"], 1);
         assert_eq!(hotspots[0]["score"], 0.875);
@@ -590,9 +647,10 @@ mod tests {
             )
             .expect("rows should insert");
 
-        let report =
-            load_hotspots_report_from_connection(&connection, Some(2), false).expect("hotspots should load");
+        let report = load_hotspots_report_from_connection(&connection, Some(2), false)
+            .expect("hotspots should load");
 
+        assert_eq!(report.total_available, 3);
         assert_eq!(report.rows.len(), 2);
         assert_eq!(report.rows[0].relative_path, "m.go");
         assert_eq!(report.rows[1].relative_path, "a.go");
