@@ -292,7 +292,7 @@ fn hotspots_default_output_is_limited_to_top_five() {
         String::from_utf8(default_output.stdout).expect("stdout should be UTF-8");
     let default_entries: Vec<&str> = default_stdout
         .lines()
-        .filter(|l| !l.is_empty() && !l.starts_with(' ') && l.contains("file-"))
+        .filter(|l| !l.is_empty() && !l.starts_with("    ") && l.contains("file-"))
         .collect();
     assert_eq!(default_entries.len(), 5);
 
@@ -301,7 +301,7 @@ fn hotspots_default_output_is_limited_to_top_five() {
     let top_stdout = String::from_utf8(top_output.stdout).expect("stdout should be UTF-8");
     let top_entries: Vec<&str> = top_stdout
         .lines()
-        .filter(|l| !l.is_empty() && !l.starts_with(' ') && l.contains("file-"))
+        .filter(|l| !l.is_empty() && !l.starts_with("    ") && l.contains("file-"))
         .collect();
     assert_eq!(top_entries.len(), 8);
 
@@ -310,7 +310,7 @@ fn hotspots_default_output_is_limited_to_top_five() {
     let all_stdout = String::from_utf8(all_output.stdout).expect("stdout should be UTF-8");
     let all_entries: Vec<&str> = all_stdout
         .lines()
-        .filter(|l| !l.is_empty() && !l.starts_with(' ') && l.contains("file-"))
+        .filter(|l| !l.is_empty() && !l.starts_with("    ") && l.contains("file-"))
         .collect();
     assert_eq!(all_entries.len(), 10);
 }
@@ -346,7 +346,7 @@ fn hotspots_breaks_score_ties_by_path() {
     let entry_lines: Vec<&str> = stdout
         .lines()
         .skip(1)
-        .filter(|l| !l.is_empty() && !l.starts_with(' '))
+        .filter(|l| !l.is_empty() && !l.starts_with("    "))
         .collect();
     assert!(entry_lines[0].contains("a.go"), "stdout:\n{stdout}");
     assert!(entry_lines[1].contains("b.go"), "stdout:\n{stdout}");

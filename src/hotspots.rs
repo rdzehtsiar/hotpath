@@ -598,7 +598,7 @@ mod tests {
         assert_eq!(report.rows[1].relative_path, "a.go");
         assert_eq!(report.rows[0].rank, 1);
         assert_eq!(report.rows[1].rank, 2);
-        assert_eq!(report.rows[0].is_test, false);
+        assert!(!report.rows[0].is_test);
         assert_eq!(report.rows[0].confidence, "bounded");
         assert_eq!(report.rows[0].drivers, vec!["M fact"]);
         assert_eq!(report.rows[0].tags, vec!["high churn"]);
@@ -625,7 +625,7 @@ mod tests {
 
         assert_eq!(report.rows.len(), 1);
         assert_eq!(report.rows[0].relative_path, "prod.go");
-        assert_eq!(report.rows[0].is_test, false);
+        assert!(!report.rows[0].is_test);
     }
 
     #[test]
@@ -647,12 +647,12 @@ mod tests {
         let report = load_hotspots_report_from_connection(&connection, None, true)
             .expect("hotspots should load");
 
-        assert_eq!(report.include_tests, true);
+        assert!(report.include_tests);
         assert_eq!(report.rows.len(), 2);
         assert_eq!(report.rows[0].relative_path, "prod.go");
-        assert_eq!(report.rows[0].is_test, false);
+        assert!(!report.rows[0].is_test);
         assert_eq!(report.rows[1].relative_path, "prod_test.go");
-        assert_eq!(report.rows[1].is_test, true);
+        assert!(report.rows[1].is_test);
         assert!(report.rows[1].tags.contains(&"test file".to_owned()));
     }
 
