@@ -417,31 +417,35 @@ fn phrase_for_tags(tags: &[String]) -> Option<String> {
 
     let phrase = match (first, second) {
         // high churn leads
-        ("high churn", Some("coupling pressure")) => "Frequently changed coordination point — edits here ripple widely",
-        ("high churn", Some("ownership risk"))    => "Frequently changed under divided ownership",
-        ("high churn", Some("large file"))        => "Large, frequently changed file",
+        ("high churn", Some("coupling pressure")) => {
+            "Frequently changed coordination point — edits here ripple widely"
+        }
+        ("high churn", Some("ownership risk")) => "Frequently changed under divided ownership",
+        ("high churn", Some("large file")) => "Large, frequently changed file",
         ("high churn", Some("complexity pressure")) => "Frequently changed, high-complexity file",
-        ("high churn", _)                         => "Frequently changed — top churn signal",
+        ("high churn", _) => "Frequently changed — top churn signal",
         // coupling pressure leads
-        ("coupling pressure", Some("ownership risk"))    => "Widely depended on under divided ownership",
-        ("coupling pressure", Some("large file"))        => "Large, widely depended on file",
+        ("coupling pressure", Some("ownership risk")) => {
+            "Widely depended on under divided ownership"
+        }
+        ("coupling pressure", Some("large file")) => "Large, widely depended on file",
         ("coupling pressure", Some("complexity pressure")) => "Complex, widely depended on file",
-        ("coupling pressure", _)                         => "High coupling pressure — changes here spread",
+        ("coupling pressure", _) => "High coupling pressure — changes here spread",
         // ownership risk leads
-        ("ownership risk", Some("large file"))        => "Large file under divided ownership",
+        ("ownership risk", Some("large file")) => "Large file under divided ownership",
         ("ownership risk", Some("complexity pressure")) => "Complex file under divided ownership",
-        ("ownership risk", _)                         => "Divided ownership — coordination risk",
+        ("ownership risk", _) => "Divided ownership — coordination risk",
         // large file leads
         ("large file", Some("complexity pressure")) => "Large, high-complexity file",
-        ("large file", _)                           => "Large file — size pressure",
+        ("large file", _) => "Large file — size pressure",
         // complexity alone
         ("complexity pressure", _) => "High control-flow complexity",
         // recent churn alone (lower priority than the above)
         ("recent churn", _) => "Recently active — high recent churn",
         // special file kinds
-        ("test file",  _) => "Test file",
-        ("generated",  _) => "Generated file",
-        ("vendor",     _) => "Vendor file",
+        ("test file", _) => "Test file",
+        ("generated", _) => "Generated file",
+        ("vendor", _) => "Vendor file",
         _ => return None,
     };
 
@@ -674,10 +678,7 @@ mod tests {
             p(&["large file", "complexity pressure"]),
             Some("Large, high-complexity file".to_owned())
         );
-        assert_eq!(
-            p(&["test file"]),
-            Some("Test file".to_owned())
-        );
+        assert_eq!(p(&["test file"]), Some("Test file".to_owned()));
         assert_eq!(p(&[]), None);
     }
 
