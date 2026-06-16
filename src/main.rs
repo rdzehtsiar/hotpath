@@ -43,6 +43,9 @@ struct ScanArgs {
     /// Write a stable JSON scan summary instead of terminal progress.
     #[arg(long)]
     json: bool,
+    /// Force a complete scan, ignoring any prior results.
+    #[arg(long)]
+    full: bool,
 }
 
 #[derive(Debug, Args)]
@@ -103,6 +106,16 @@ fn run_scan(args: ScanArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    if args.full {
+        let index_path = root.join(".hotpath").join("index.sqlite");
+        if let Err(e) = std::fs::remove_file(&index_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("hotpath: failed to remove index: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     let engine = hotpath::pipeline::analysis_engine::AnalysisEngine::new(&root);
     if args.json {
