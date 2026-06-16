@@ -148,10 +148,6 @@ fn load_scan_summary_from_connection(
 }
 
 pub fn render_scan_summary(summary: &ScanSummary) -> String {
-    render_scan_summary_with_options(summary, false)
-}
-
-pub fn render_scan_summary_with_options(summary: &ScanSummary, verbose: bool) -> String {
     let mut lines = Vec::new();
     lines.push("Hotpath scan complete".to_owned());
     lines.push(String::new());
@@ -166,12 +162,6 @@ pub fn render_scan_summary_with_options(summary: &ScanSummary, verbose: bool) ->
     lines.extend(render_limitations(&summary.limitations));
     lines.push(String::new());
     lines.extend(render_index());
-
-    if verbose {
-        lines.push(String::new());
-        lines.extend(render_verbose(summary));
-    }
-
     lines.join("\n")
 }
 
@@ -522,37 +512,6 @@ fn render_index() -> Vec<String> {
     vec!["Index".to_owned(), format!("  {INDEX_DISPLAY_PATH}")]
 }
 
-fn render_verbose(summary: &ScanSummary) -> Vec<String> {
-    let git = &summary.git;
-    vec![
-        "Verbose".to_owned(),
-        format!(
-            "  git mode {}  confidence {}  collection {}",
-            display_option(&git.mode),
-            display_option(&git.confidence),
-            display_option(&git.collection)
-        ),
-        format!(
-            "  git bounds max_commits {}  max_age_days {}  first_parent {}  renames {}",
-            display_option(&git.max_commits),
-            display_option(&git.max_age_days),
-            display_option(&git.first_parent),
-            display_option(&git.renames)
-        ),
-        format!(
-            "  git windows recent_churn_window_days {}  cochange_max_files_per_commit {}",
-            display_option(&git.recent_churn_window_days),
-            display_option(&git.cochange_max_files_per_commit)
-        ),
-        format!(
-            "  git reference head_committer_timestamp {}",
-            display_option(&git.head_timestamp)
-        ),
-        format!("  index action {}", display_option(&git.index_action)),
-        format!("  index path {}", summary.index_path.display()),
-    ]
-}
-
 fn display_option(value: &Option<String>) -> &str {
     value.as_deref().unwrap_or("unknown")
 }
@@ -568,8 +527,8 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        load_scan_summary_from_connection, render_scan_summary, render_scan_summary_with_options,
-        GitSummary, GoHotspot, ProjectRiskSummary, ScanSummary, SummaryLimitation,
+        load_scan_summary_from_connection, render_scan_summary, GitSummary, GoHotspot,
+        ProjectRiskSummary, ScanSummary, SummaryLimitation,
     };
 
     #[test]
@@ -633,40 +592,6 @@ mod tests {
         assert!(rendered.contains("Index\n  .hotpath/index.sqlite"));
         assert!(!rendered.contains("fully_rebuilt"));
         assert!(!rendered.contains("C:\\repo\\.hotpath\\index.sqlite"));
-    }
-
-    #[test]
-    fn renders_verbose_appendix_with_raw_git_and_index_details() {
-        let summary = ScanSummary {
-            index_path: PathBuf::from("C:\\repo\\.hotpath\\index.sqlite"),
-            hotspots: Vec::new(),
-            project: None,
-            git: GitSummary {
-                confidence: Some("bounded".to_owned()),
-                mode: Some("full".to_owned()),
-                collection: Some("bounded_recent_stream".to_owned()),
-                index_action: Some("fully_rebuilt".to_owned()),
-                max_commits: Some("50000".to_owned()),
-                max_age_days: Some("730".to_owned()),
-                first_parent: Some("true".to_owned()),
-                renames: Some("false".to_owned()),
-                cochange_max_files_per_commit: Some("100".to_owned()),
-                recent_churn_window_days: Some("90".to_owned()),
-                head_timestamp: Some("1700000000".to_owned()),
-            },
-            limitations: Vec::new(),
-        };
-
-        let rendered = render_scan_summary_with_options(&summary, true);
-
-        assert!(rendered.contains("Verbose"));
-        assert!(rendered
-            .contains("git mode full  confidence bounded  collection bounded_recent_stream"));
-        assert!(rendered.contains(
-            "git bounds max_commits 50000  max_age_days 730  first_parent true  renames false"
-        ));
-        assert!(rendered.contains("index action fully_rebuilt"));
-        assert!(rendered.contains("index path C:\\repo\\.hotpath\\index.sqlite"));
     }
 
     #[test]

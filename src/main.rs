@@ -43,9 +43,6 @@ struct ScanArgs {
     /// Write a stable JSON scan summary instead of terminal progress.
     #[arg(long)]
     json: bool,
-    /// Include raw Git collection and local index details in text output.
-    #[arg(long)]
-    verbose: bool,
 }
 
 #[derive(Debug, Args)]
@@ -129,7 +126,7 @@ fn run_scan(args: ScanArgs) -> ExitCode {
         }
     }
 
-    let mut reporter = StdioReporter::stdout().with_final_git_status(args.verbose);
+    let mut reporter = StdioReporter::stdout();
     if let Err(error) = engine.scan_with_reporter(&mut reporter) {
         eprintln!("hotpath: {error}");
         return ExitCode::FAILURE;
@@ -139,10 +136,7 @@ fn run_scan(args: ScanArgs) -> ExitCode {
         Ok(summary) => {
             println!(
                 "{}",
-                hotpath::pipeline::scan_summary::render_scan_summary_with_options(
-                    &summary,
-                    args.verbose
-                )
+                hotpath::pipeline::scan_summary::render_scan_summary(&summary)
             );
             ExitCode::SUCCESS
         }

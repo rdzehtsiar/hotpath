@@ -580,24 +580,6 @@ fn scan_reports_actionable_non_git_diagnostic() {
 }
 
 #[test]
-fn scan_verbose_reports_raw_git_and_index_details() {
-    let fixture = Fixture::new("scan-verbose-non-git");
-    fixture.write("main.go", "package main\n");
-
-    let output = hotpath(&["scan", "--verbose"], &fixture.path);
-
-    assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
-    assert!(stdout.contains("Hotpath scan complete"));
-    assert!(stdout.contains("git   diagnostic not_git"));
-    assert!(stdout.contains("git   index_action cleared_not_git"));
-    assert!(stdout.contains("Verbose"));
-    assert!(stdout.contains("git mode skipped_not_git  confidence not_git  collection unavailable"));
-    assert!(stdout.contains("index action cleared_not_git"));
-    assert!(stdout.contains(&fixture.path.display().to_string()));
-}
-
-#[test]
 fn scan_reports_actionable_empty_git_repository_diagnostic() {
     let fixture = GitFixture::new("scan-empty-git-diagnostic");
     fixture.write("main.go", "package main\n");
@@ -643,7 +625,7 @@ fn scan_reports_git_progress_for_git_repository() {
         "2024-01-02T00:00:00Z",
     ));
 
-    let output = hotpath(&["scan", "--verbose"], fixture.path());
+    let output = hotpath(&["scan"], fixture.path());
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
@@ -653,12 +635,6 @@ fn scan_reports_git_progress_for_git_repository() {
     assert!(final_lines[1].contains("2/2"));
     assert!(final_lines[1].contains("commits/sec"));
     assert!(final_lines[2].starts_with("time"));
-    assert!(stdout.contains("confidence bounded"));
-    assert!(stdout.contains("max_commits 50000"));
-    assert!(stdout.contains("max_age_days 730"));
-    assert!(stdout.contains("first_parent true"));
-    assert!(stdout.contains("renames true"));
-    assert!(stdout.contains("cochange_max_files_per_commit 100"));
 
     let connection =
         Connection::open(fixture.path().join(".hotpath").join("index.sqlite")).expect("db opens");
@@ -753,7 +729,7 @@ fn scan_bounds_git_history_to_730_days_from_head() {
         "2025-01-02T00:00:00Z",
     ));
 
-    let output = hotpath(&["scan", "--verbose"], fixture.path());
+    let output = hotpath(&["scan"], fixture.path());
 
     assert!(
         output.status.success(),
@@ -762,7 +738,7 @@ fn scan_bounds_git_history_to_730_days_from_head() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
-    assert!(stdout.contains("max_age_days 730"));
+    assert!(stdout.contains("Hotpath scan complete"));
 
     let connection =
         Connection::open(fixture.path().join(".hotpath").join("index.sqlite")).expect("db opens");
@@ -1425,7 +1401,7 @@ fn scan_json_flag_is_recognized_by_clap() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     assert!(stdout.contains("Usage:"));
     assert!(stdout.contains("--json"));
-    assert!(stdout.contains("--verbose"));
+    assert!(!stdout.contains("--verbose"));
 }
 
 fn final_scan_lines(stdout: &str) -> Vec<String> {
