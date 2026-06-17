@@ -282,11 +282,11 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ascii_only_terminal_for, render_progress_bar, render_progress_row,
-        render_report_lines, render_report_lines_with_style, PipelineReporter, ProgressBarStyle,
-        StdioReporter, TerminalPlatform,
+        ascii_only_terminal_for, render_progress_bar, render_progress_row, render_report_lines,
+        render_report_lines_with_style, PipelineReporter, ProgressBarStyle, StdioReporter,
+        TerminalPlatform,
     };
-    use crate::pipeline::events::{GitStatus, PipelineState};
+    use crate::pipeline::events::PipelineState;
 
     #[test]
     fn render_lines_show_estimating_before_totals_are_known() {

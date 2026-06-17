@@ -123,17 +123,49 @@ fn scan_json_reports_stable_non_git_summary_without_progress() {
 
     let json: Value = serde_json::from_str(&stdout).expect("stdout should be JSON");
     assert_eq!(json["schema_version"], 1);
-    assert_eq!(json["command"], "scan");
-    assert_eq!(json["files"]["detected"], 2);
-    assert_eq!(json["files"]["analyzed"], 2);
-    assert_eq!(json["git"]["skipped"], true);
-    assert_eq!(json["git"]["mode"], "skipped_not_git");
-    assert_eq!(json["git"]["confidence"], "not_git");
-    assert_eq!(json["git"]["commits_total"], 0);
-    assert_eq!(json["git"]["commits_processed"], 0);
-    assert_eq!(json["git"]["diagnostic"], "not_git");
-    assert_eq!(json["git"]["index_action"], "cleared_not_git");
-    assert!(json["index"]["records_stored"].as_u64().unwrap_or_default() > 0);
+    assert_eq!(json["hotpath_version"], env!("CARGO_PKG_VERSION"));
+    let scanned_at = json["scanned_at"]
+        .as_str()
+        .expect("scanned_at should be string");
+    assert!(
+        scanned_at.ends_with('Z'),
+        "scanned_at should be UTC: {scanned_at}"
+    );
+    assert!(
+        scanned_at.contains('T'),
+        "scanned_at should be ISO 8601: {scanned_at}"
+    );
+    assert_eq!(json["assessment_reliable"], false);
+    assert_eq!(json["scoring_confidence"], "high");
+    assert!(
+        json["risk"]["score"].is_number(),
+        "risk.score should be a number"
+    );
+    let risk_band = json["risk"]["band"]
+        .as_str()
+        .expect("risk.band should be string");
+    assert!(["low", "medium", "high", "extreme", "unavailable"].contains(&risk_band));
+    let fbb = &json["risk"]["files_by_band"];
+    assert_eq!(
+        fbb["extreme"].as_u64().unwrap_or_default()
+            + fbb["high"].as_u64().unwrap_or_default()
+            + fbb["medium"].as_u64().unwrap_or_default()
+            + fbb["low"].as_u64().unwrap_or_default(),
+        2
+    );
+    assert_eq!(json["scan"]["type"], "full");
+    assert!(json["scan"]["duration_ms"].as_u64().is_some());
+    assert_eq!(json["scan"]["files_detected"], 2);
+    assert_eq!(json["scan"]["files_analyzed"], 2);
+    assert_eq!(json["scan"]["git_history"], "absent");
+    assert_eq!(json["scan"]["commits_processed"], 0);
+    assert_eq!(json["scan"]["commits_total"], 0);
+    assert!(json["top_hotspots"].is_array());
+    let hotspots = json["top_hotspots"].as_array().unwrap();
+    assert!(hotspots.len() <= 5);
+    assert!(json["limitations"].is_array());
+    assert!(!json["limitations"].as_array().unwrap().is_empty());
+    assert_json_limitation_messages_are_sentences(&json);
 }
 
 #[test]
@@ -167,15 +199,29 @@ fn scan_json_reports_stable_git_summary() {
     let json: Value = serde_json::from_str(&stdout).expect("stdout should be JSON");
 
     assert_eq!(json["schema_version"], 1);
-    assert_eq!(json["files"]["detected"], 1);
-    assert_eq!(json["files"]["analyzed"], 1);
-    assert_eq!(json["git"]["skipped"], false);
-    assert_eq!(json["git"]["mode"], "full");
-    assert_eq!(json["git"]["confidence"], "bounded");
-    assert_eq!(json["git"]["commits_total"], 2);
-    assert_eq!(json["git"]["commits_processed"], 2);
-    assert_eq!(json["git"]["diagnostic"], Value::Null);
-    assert_eq!(json["git"]["index_action"], "fully_rebuilt");
+    assert_eq!(json["hotpath_version"], env!("CARGO_PKG_VERSION"));
+    let scanned_at = json["scanned_at"]
+        .as_str()
+        .expect("scanned_at should be string");
+    assert!(scanned_at.ends_with('Z'));
+    assert_eq!(json["assessment_reliable"], true);
+    assert_eq!(json["scoring_confidence"], "high");
+    assert!(json["risk"]["score"].is_number());
+    let risk_band = json["risk"]["band"]
+        .as_str()
+        .expect("risk.band should be string");
+    assert!(["low", "medium", "high", "extreme", "unavailable"].contains(&risk_band));
+    assert!(json["risk"]["files_by_band"].is_object());
+    assert_eq!(json["scan"]["type"], "full");
+    assert!(json["scan"]["duration_ms"].as_u64().is_some());
+    assert_eq!(json["scan"]["files_detected"], 1);
+    assert_eq!(json["scan"]["files_analyzed"], 1);
+    assert_eq!(json["scan"]["git_history"], "bounded");
+    assert_eq!(json["scan"]["commits_processed"], 2);
+    assert_eq!(json["scan"]["commits_total"], 2);
+    assert!(json["top_hotspots"].is_array());
+    assert!(json["limitations"].is_array());
+    assert_json_limitation_messages_are_sentences(&json);
 }
 
 #[test]
@@ -1446,6 +1492,29 @@ fn strip_ansi(input: &str) -> String {
     }
 
     output
+}
+
+fn assert_json_limitation_messages_are_sentences(json: &Value) {
+    for limitation in json["limitations"]
+        .as_array()
+        .expect("limitations should be an array")
+    {
+        let message = limitation["message"]
+            .as_str()
+            .expect("limitation message should be a string");
+        let first_alphabetic = message
+            .chars()
+            .find(|character| character.is_ascii_alphabetic())
+            .expect("limitation message should contain a letter");
+        assert!(
+            first_alphabetic.is_ascii_uppercase(),
+            "limitation message should start as a sentence: {message}"
+        );
+        assert!(
+            message.ends_with('.'),
+            "limitation message should end with a period: {message}"
+        );
+    }
 }
 
 fn row_count(connection: &Connection, table: &str) -> i64 {

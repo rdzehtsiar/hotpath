@@ -3,6 +3,7 @@
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::builder::styling;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -127,7 +128,25 @@ fn run_scan(args: ScanArgs) -> ExitCode {
             }
         };
 
-        match serde_json::to_string(&ScanJsonOutput::from_state(&outcome.state)) {
+        let summary = match hotpath::pipeline::scan_summary::load_scan_summary(&root) {
+            Ok(summary) => Some(summary),
+            Err(error) => {
+                eprintln!("hotpath: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        let band_counts = match hotpath::pipeline::scan_summary::load_band_counts(&root) {
+            Ok(counts) => counts,
+            Err(error) => {
+                eprintln!("hotpath: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        let output = ScanJsonOutput::build(&outcome.state, summary.as_ref(), &band_counts);
+
+        match serde_json::to_string(&output) {
             Ok(json) => {
                 println!("{json}");
                 return ExitCode::SUCCESS;
@@ -216,63 +235,243 @@ fn run_hotspots(args: HotspotsArgs) -> ExitCode {
 #[derive(Debug, Serialize)]
 struct ScanJsonOutput {
     schema_version: u64,
-    command: &'static str,
-    files: ScanJsonFiles,
-    git: ScanJsonGit,
-    index: ScanJsonIndex,
+    hotpath_version: String,
+    scanned_at: String,
+    assessment_reliable: bool,
+    scoring_confidence: String,
+    risk: ScanJsonRisk,
+    scan: ScanJsonScanInfo,
+    top_hotspots: Vec<ScanJsonHotspot>,
+    limitations: Vec<ScanJsonLimitation>,
 }
 
 #[derive(Debug, Serialize)]
-struct ScanJsonFiles {
-    detected: u64,
-    analyzed: u64,
+struct ScanJsonRisk {
+    score: Option<f64>,
+    band: String,
+    primary_driver: Option<ScanJsonPrimaryDriver>,
+    files_by_band: ScanJsonFilesByBand,
 }
 
 #[derive(Debug, Serialize)]
-struct ScanJsonGit {
-    skipped: bool,
-    mode: Option<String>,
-    confidence: Option<String>,
-    commits_total: Option<u64>,
+struct ScanJsonPrimaryDriver {
+    id: String,
+    label: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ScanJsonFilesByBand {
+    extreme: u64,
+    high: u64,
+    medium: u64,
+    low: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ScanJsonScanInfo {
+    #[serde(rename = "type")]
+    scan_type: String,
+    duration_ms: u64,
+    files_detected: u64,
+    files_analyzed: u64,
+    git_history: String,
     commits_processed: u64,
-    diagnostic: Option<String>,
-    index_action: Option<String>,
+    commits_total: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
-struct ScanJsonIndex {
-    records_stored: u64,
+struct ScanJsonHotspot {
+    rank: u64,
+    path: String,
+    score: f64,
+    band: String,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ScanJsonLimitation {
+    code: String,
+    message: String,
 }
 
 impl ScanJsonOutput {
-    fn from_state(state: &PipelineState) -> Self {
+    fn build(
+        state: &PipelineState,
+        summary: Option<&hotpath::pipeline::scan_summary::ScanSummary>,
+        band_counts: &hotpath::pipeline::scan_summary::BandCounts,
+    ) -> Self {
+        let scoring_confidence = summary
+            .and_then(|s| s.project.as_ref())
+            .map(|p| p.confidence.as_str())
+            .unwrap_or("none")
+            .to_owned();
+
+        let git_history = derive_git_history(state).to_owned();
+        let assessment_reliable =
+            matches!(scoring_confidence.as_str(), "high" | "medium") && git_history != "absent";
+
+        let project = summary.and_then(|s| s.project.as_ref());
+
+        let (risk_score, risk_band) = match project {
+            Some(p) if scoring_confidence != "none" => (Some(p.risk_10), p.risk_band.clone()),
+            _ => (None, "unavailable".to_owned()),
+        };
+
+        let primary_driver =
+            project.and_then(|p| map_primary_driver(p.dominant_dimension.as_deref()));
+
+        let risk = ScanJsonRisk {
+            score: risk_score,
+            band: risk_band,
+            primary_driver,
+            files_by_band: ScanJsonFilesByBand {
+                extreme: band_counts.extreme,
+                high: band_counts.high,
+                medium: band_counts.medium,
+                low: band_counts.low,
+            },
+        };
+
+        let scan = ScanJsonScanInfo {
+            scan_type: derive_scan_type(state).to_owned(),
+            duration_ms: state.total_elapsed.as_millis() as u64,
+            files_detected: state.total_files.unwrap_or(state.enumerated_files),
+            files_analyzed: state.analyzed_files,
+            git_history,
+            commits_processed: state.git_commits_processed,
+            commits_total: state.total_git_commits,
+        };
+
+        let top_hotspots = summary
+            .map(|s| {
+                s.hotspots
+                    .iter()
+                    .map(|h| ScanJsonHotspot {
+                        rank: h.rank,
+                        path: h.relative_path.clone(),
+                        score: h.risk_10,
+                        band: h.risk_band.clone(),
+                        reason: h.fact.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let limitations = summary
+            .map(|s| {
+                s.limitations
+                    .iter()
+                    .map(|l| ScanJsonLimitation {
+                        code: l.code.clone(),
+                        message: normalize_json_limitation_message(&l.message),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let scanned_at = format_utc_iso8601(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        );
+
         Self {
             schema_version: SCAN_JSON_SCHEMA_VERSION,
-            command: "scan",
-            files: ScanJsonFiles {
-                detected: state.total_files.unwrap_or(state.enumerated_files),
-                analyzed: state.analyzed_files,
-            },
-            git: ScanJsonGit {
-                skipped: state.git_skipped,
-                mode: state.git_status.mode.clone(),
-                confidence: state.git_status.confidence.clone(),
-                commits_total: state.total_git_commits,
-                commits_processed: state.git_commits_processed,
-                diagnostic: state.git_status.diagnostic.as_deref().map(diagnostic_code),
-                index_action: state.git_status.index_action.clone(),
-            },
-            index: ScanJsonIndex {
-                records_stored: state.stored_records,
-            },
+            hotpath_version: env!("CARGO_PKG_VERSION").to_owned(),
+            scanned_at,
+            assessment_reliable,
+            scoring_confidence,
+            risk,
+            scan,
+            top_hotspots,
+            limitations,
         }
     }
 }
 
-fn diagnostic_code(diagnostic: &str) -> String {
-    diagnostic
-        .split_once(':')
-        .map(|(code, _)| code)
-        .unwrap_or(diagnostic)
-        .to_owned()
+fn normalize_json_limitation_message(message: &str) -> String {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return "Limitation details are unavailable.".to_owned();
+    }
+
+    let mut normalized = String::new();
+    let mut capitalized = false;
+    for character in trimmed.chars() {
+        if !capitalized && character.is_ascii_alphabetic() {
+            normalized.push(character.to_ascii_uppercase());
+            capitalized = true;
+        } else {
+            normalized.push(character);
+        }
+    }
+
+    while normalized.ends_with(['.', '!', '?']) {
+        normalized.pop();
+    }
+    normalized.push('.');
+    normalized
+}
+
+fn format_utc_iso8601(epoch_secs: u64) -> String {
+    let days = (epoch_secs / 86400) as i64;
+    let time_of_day = epoch_secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!(
+        "{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z",
+        year = y,
+        month = m,
+        day = d,
+        hours = hours,
+        minutes = minutes,
+        seconds = seconds,
+    )
+}
+
+fn derive_git_history(state: &PipelineState) -> &'static str {
+    if state.git_skipped {
+        return "absent";
+    }
+    match state.git_status.confidence.as_deref() {
+        Some("full") | Some("up_to_date") => "full",
+        Some("bounded") => "bounded",
+        _ => "absent",
+    }
+}
+
+fn derive_scan_type(state: &PipelineState) -> &'static str {
+    match state.git_status.index_action.as_deref() {
+        Some("reused") | Some("incrementally_updated") => "incremental",
+        _ => "full",
+    }
+}
+
+fn map_primary_driver(dominant_dimension: Option<&str>) -> Option<ScanJsonPrimaryDriver> {
+    let dimension = dominant_dimension?;
+    let (id, label) = match dimension {
+        "churn" => ("churn", "Churn"),
+        "recent_churn" => ("churn", "Recent churn"),
+        "complexity_pressure" => ("complexity", "Complexity"),
+        "cochange_pressure" => ("cochange", "Co-change"),
+        _ => return None,
+    };
+    Some(ScanJsonPrimaryDriver {
+        id: id.to_owned(),
+        label: label.to_owned(),
+    })
 }

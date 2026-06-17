@@ -65,6 +65,14 @@ pub struct SummaryLimitation {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BandCounts {
+    pub extreme: u64,
+    pub high: u64,
+    pub medium: u64,
+    pub low: u64,
+}
+
 #[derive(Debug)]
 pub enum ScanSummaryError {
     OpenDatabase {
@@ -108,6 +116,54 @@ pub fn load_scan_summary(root: impl AsRef<Path>) -> Result<ScanSummary, ScanSumm
             source,
         })?;
     load_scan_summary_from_connection(&connection, index_path)
+}
+
+pub fn load_band_counts(root: impl AsRef<Path>) -> Result<BandCounts, ScanSummaryError> {
+    let index_path = index_path(root.as_ref());
+    let connection =
+        Connection::open(&index_path).map_err(|source| ScanSummaryError::OpenDatabase {
+            path: index_path.clone(),
+            source,
+        })?;
+    load_band_counts_from_connection(&connection)
+}
+
+fn load_band_counts_from_connection(
+    connection: &Connection,
+) -> Result<BandCounts, ScanSummaryError> {
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT risk_band, COUNT(*)
+            FROM file_risk_scores
+            WHERE is_test = 0
+            GROUP BY risk_band
+            ",
+        )
+        .map_err(ScanSummaryError::QueryDatabase)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(ScanSummaryError::QueryDatabase)?;
+    let mut counts = BandCounts {
+        extreme: 0,
+        high: 0,
+        medium: 0,
+        low: 0,
+    };
+    for row in rows {
+        let (band, count) = row.map_err(ScanSummaryError::QueryDatabase)?;
+        let count = u64::try_from(count).unwrap_or_default();
+        match band.as_str() {
+            "extreme" => counts.extreme = count,
+            "high" => counts.high = count,
+            "medium" => counts.medium = count,
+            "low" => counts.low = count,
+            _ => {}
+        }
+    }
+    Ok(counts)
 }
 
 fn load_scan_summary_from_connection(
@@ -512,6 +568,7 @@ fn render_index() -> Vec<String> {
     vec!["Index".to_owned(), format!("  {INDEX_DISPLAY_PATH}")]
 }
 
+#[allow(dead_code)]
 fn display_option(value: &Option<String>) -> &str {
     value.as_deref().unwrap_or("unknown")
 }
