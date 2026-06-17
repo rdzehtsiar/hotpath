@@ -207,11 +207,13 @@ impl PipelineState {
                 self.git_status = status.clone();
             }
             PipelineEvent::GitHistorySkipped { .. } => {
-                self.total_git_commits = Some(0);
-                self.total_git_chunks = Some(0);
+                if !self.is_git_index_reused() {
+                    self.total_git_commits = Some(0);
+                    self.total_git_chunks = Some(0);
+                    self.git_skipped = true;
+                }
                 self.git_commits_processed = 0;
                 self.git_completed = true;
-                self.git_skipped = true;
             }
             PipelineEvent::GitHistoryChunkCompleted {
                 processed_commits,
@@ -232,9 +234,10 @@ impl PipelineState {
                 elapsed,
             } => {
                 self.git_commits_processed = self.git_commits_processed.max(*processed_commits);
-                if self
-                    .total_git_commits
-                    .is_some_and(|total| self.git_commits_processed != total)
+                if !self.is_git_index_reused()
+                    && self
+                        .total_git_commits
+                        .is_some_and(|total| self.git_commits_processed != total)
                 {
                     self.total_git_commits = Some(self.git_commits_processed);
                 }
@@ -273,9 +276,10 @@ impl PipelineState {
                 self.enumerated_files = *files_detected;
                 self.analyzed_files = *analyzed_files;
                 self.git_commits_processed = self.git_commits_processed.max(*git_commits_processed);
-                if self
-                    .total_git_commits
-                    .is_some_and(|total| self.git_commits_processed != total)
+                if !self.is_git_index_reused()
+                    && self
+                        .total_git_commits
+                        .is_some_and(|total| self.git_commits_processed != total)
                 {
                     self.total_git_commits = Some(self.git_commits_processed);
                 }
@@ -289,6 +293,10 @@ impl PipelineState {
 
     pub fn enumeration_files_per_second(&self) -> f64 {
         files_per_second(self.enumerated_files, self.enumeration_elapsed)
+    }
+
+    pub(crate) fn is_git_index_reused(&self) -> bool {
+        matches!(self.git_status.index_action.as_deref(), Some("reused"))
     }
 
     pub fn analysis_files_per_second(&self) -> f64 {

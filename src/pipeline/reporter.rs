@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use crate::pipeline::events::PipelineState;
@@ -36,16 +36,21 @@ pub struct StdioReporter<W: Write> {
     last_rendered_at: Option<Instant>,
     min_render_interval: Duration,
     bar_style: ProgressBarStyle,
+    enabled: bool,
 }
 
 impl StdioReporter<io::Stdout> {
     pub fn stdout() -> Self {
-        Self::new(io::stdout())
+        Self::with_enabled(io::stdout(), io::stdout().is_terminal())
     }
 }
 
 impl<W: Write> StdioReporter<W> {
     pub fn new(writer: W) -> Self {
+        Self::with_enabled(writer, true)
+    }
+
+    fn with_enabled(writer: W, enabled: bool) -> Self {
         Self {
             writer,
             rendered_once: false,
@@ -53,6 +58,7 @@ impl<W: Write> StdioReporter<W> {
             last_rendered_at: None,
             min_render_interval: MIN_RENDER_INTERVAL,
             bar_style: ProgressBarStyle::detect(),
+            enabled,
         }
     }
 
@@ -65,6 +71,7 @@ impl<W: Write> StdioReporter<W> {
             last_rendered_at: None,
             min_render_interval,
             bar_style: ProgressBarStyle::Unicode,
+            enabled: true,
         }
     }
 
@@ -94,6 +101,9 @@ impl<W: Write> StdioReporter<W> {
 
 impl<W: Write> PipelineReporter for StdioReporter<W> {
     fn update(&mut self, state: &PipelineState) {
+        if !self.enabled {
+            return;
+        }
         if self.finished {
             return;
         }
@@ -104,6 +114,10 @@ impl<W: Write> PipelineReporter for StdioReporter<W> {
     }
 
     fn finish(&mut self, state: &PipelineState) {
+        if !self.enabled {
+            self.finished = true;
+            return;
+        }
         if !self.finished {
             self.render_now(state);
         }
@@ -128,7 +142,7 @@ fn render_report_lines_with_style(state: &PipelineState, style: ProgressBarStyle
         "files/sec",
         style,
     );
-    let (git_processed, git_total) = if state.git_skipped {
+    let (git_processed, git_total) = if state.git_skipped || state.is_git_index_reused() {
         (1, Some(1))
     } else {
         (state.git_commits_processed, state.total_git_commits)
@@ -286,7 +300,7 @@ mod tests {
         render_report_lines_with_style, PipelineReporter, ProgressBarStyle, StdioReporter,
         TerminalPlatform,
     };
-    use crate::pipeline::events::PipelineState;
+    use crate::pipeline::events::{GitStatus, PipelineState};
 
     #[test]
     fn render_lines_show_estimating_before_totals_are_known() {
@@ -352,6 +366,36 @@ mod tests {
         let lines = render_report_lines(&state);
 
         assert!(lines[1].contains("        1/1"));
+        assert_eq!(
+            lines[1],
+            render_progress_row(
+                "git",
+                1,
+                Some(1),
+                0.0,
+                "commits/sec",
+                ProgressBarStyle::Unicode
+            )
+        );
+    }
+
+    #[test]
+    fn reused_git_index_renders_as_complete() {
+        let state = PipelineState {
+            total_git_commits: Some(5733),
+            git_commits_processed: 0,
+            git_completed: true,
+            git_status: GitStatus {
+                index_action: Some("reused".to_owned()),
+                ..GitStatus::default()
+            },
+            ..PipelineState::default()
+        };
+
+        let lines = render_report_lines(&state);
+
+        assert!(lines[1].contains("        1/1"));
+        assert!(!lines[1].contains("        0/5733"));
         assert_eq!(
             lines[1],
             render_progress_row(

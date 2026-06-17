@@ -2,5 +2,6 @@
 
 pub mod explain;
 pub mod hotspots;
+pub mod index_lock;
 pub mod languages;
 pub mod pipeline;

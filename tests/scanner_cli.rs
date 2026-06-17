@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -70,26 +71,23 @@ fn scan_prints_file_and_git_progress_summary() {
 
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     assert!(stdout.ends_with('\n'));
+    assert!(!stdout.contains("\u{1b}["));
+    assert!(!stdout.contains("| speed"));
     let final_lines = final_scan_lines(&stdout);
 
-    assert_eq!(final_lines.len(), 3);
-    assert!(final_lines[0].starts_with("files"));
-    assert!(final_lines[0].contains("2/2"));
-    assert!(!final_lines[0].contains("remaining"));
-    assert!(final_lines[0].ends_with(" files/sec"));
-    assert!(final_lines[1].starts_with("git"));
-    assert!(final_lines[1].contains("1/1"));
-    assert!(final_lines[1].contains("commits/sec"));
-    assert!(final_lines[2].starts_with("time"));
-    assert!(final_lines[2].contains("elapsed"));
+    assert!(final_lines.is_empty());
     assert!(stdout.contains("Hotpath scan complete"));
-    assert!(stdout.contains("Repository Risk"));
-    assert!(stdout.contains("Coverage"));
-    assert!(stdout.contains("Production Go       2/2 scored  (100.0%)"));
-    assert!(stdout.contains("Confidence"));
-    assert!(stdout.contains("Git history  Unavailable; scores use file and parser signals only."));
+    assert!(stdout.contains("Assessment"));
+    assert!(stdout.contains("  Reliable: false"));
+    assert!(stdout.contains("  Scoring confidence: high"));
+    assert!(stdout.contains("Risk"));
+    assert!(stdout.contains("  Files by band:"));
+    assert!(!stdout.contains("\nScan\n"));
+    assert!(!stdout.contains("files_detected"));
+    assert!(!stdout.contains("files_analyzed"));
+    assert!(!stdout.contains("git_history"));
     assert!(stdout.contains("Top Hotspots"));
-    assert!(stdout.contains("Index\n  .hotpath/index.sqlite"));
+    assert!(!stdout.contains("Index\n  .hotpath/index.sqlite"));
     assert!(!stdout.contains("git confidence not_git"));
     assert!(!stdout.contains("diagnostic not_git"));
     assert!(!stdout.contains(&fixture.path.display().to_string()));
@@ -135,8 +133,14 @@ fn scan_json_reports_stable_non_git_summary_without_progress() {
         scanned_at.contains('T'),
         "scanned_at should be ISO 8601: {scanned_at}"
     );
-    assert_eq!(json["assessment_reliable"], false);
-    assert_eq!(json["scoring_confidence"], "high");
+    assert_eq!(json["assessment"]["is_reliable"], false);
+    assert_eq!(json["assessment"]["scoring_confidence"], "high");
+    assert_eq!(
+        json["assessment"]["reason"],
+        "High scoring coverage, but repository context is unavailable."
+    );
+    assert!(json.get("assessment_reliable").is_none());
+    assert!(json.get("scoring_confidence").is_none());
     assert!(
         json["risk"]["score"].is_number(),
         "risk.score should be a number"
@@ -157,14 +161,15 @@ fn scan_json_reports_stable_non_git_summary_without_progress() {
     assert!(json["scan"]["duration_ms"].as_u64().is_some());
     assert_eq!(json["scan"]["files_detected"], 2);
     assert_eq!(json["scan"]["files_analyzed"], 2);
-    assert_eq!(json["scan"]["git_history"], "absent");
-    assert_eq!(json["scan"]["commits_processed"], 0);
-    assert_eq!(json["scan"]["commits_total"], 0);
+    assert!(json["scan"].get("git_history").is_none());
+    assert!(json["scan"].get("commits_processed").is_none());
+    assert!(json["scan"].get("commits_total").is_none());
     assert!(json["top_hotspots"].is_array());
     let hotspots = json["top_hotspots"].as_array().unwrap();
     assert!(hotspots.len() <= 5);
     assert!(json["limitations"].is_array());
     assert!(!json["limitations"].as_array().unwrap().is_empty());
+    assert_json_has_no_empty_or_placeholder_limitations(&json);
     assert_json_limitation_messages_are_sentences(&json);
 }
 
@@ -204,8 +209,14 @@ fn scan_json_reports_stable_git_summary() {
         .as_str()
         .expect("scanned_at should be string");
     assert!(scanned_at.ends_with('Z'));
-    assert_eq!(json["assessment_reliable"], true);
-    assert_eq!(json["scoring_confidence"], "high");
+    assert_eq!(json["assessment"]["is_reliable"], true);
+    assert_eq!(json["assessment"]["scoring_confidence"], "high");
+    assert_eq!(
+        json["assessment"]["reason"],
+        "High scoring coverage and repository context are available."
+    );
+    assert!(json.get("assessment_reliable").is_none());
+    assert!(json.get("scoring_confidence").is_none());
     assert!(json["risk"]["score"].is_number());
     let risk_band = json["risk"]["band"]
         .as_str()
@@ -216,11 +227,12 @@ fn scan_json_reports_stable_git_summary() {
     assert!(json["scan"]["duration_ms"].as_u64().is_some());
     assert_eq!(json["scan"]["files_detected"], 1);
     assert_eq!(json["scan"]["files_analyzed"], 1);
-    assert_eq!(json["scan"]["git_history"], "bounded");
-    assert_eq!(json["scan"]["commits_processed"], 2);
-    assert_eq!(json["scan"]["commits_total"], 2);
+    assert!(json["scan"].get("git_history").is_none());
+    assert!(json["scan"].get("commits_processed").is_none());
+    assert!(json["scan"].get("commits_total").is_none());
     assert!(json["top_hotspots"].is_array());
     assert!(json["limitations"].is_array());
+    assert_json_has_no_empty_or_placeholder_limitations(&json);
     assert_json_limitation_messages_are_sentences(&json);
 }
 
@@ -239,13 +251,17 @@ fn scan_summary_reports_no_go_coverage_and_limitation() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
-    assert!(stdout.contains("Advisory score  unavailable"));
-    assert!(stdout.contains("Hotspot spread  no scored production Go files"));
-    assert!(stdout.contains("Production Go       0/0 scored  (0.0%)"));
-    assert!(stdout.contains("Other active files  1 indexed, not scored by Go risk model"));
+    assert!(stdout.contains("  Reliable: false"));
+    assert!(stdout.contains("  Score: unavailable"));
+    assert!(stdout.contains("  Band: unavailable"));
+    assert!(stdout.contains("  Primary driver: none"));
+    assert!(!stdout.contains("files_detected"));
+    assert!(!stdout.contains("files_analyzed"));
     assert!(stdout.contains("Top Hotspots\n  none"));
-    assert!(stdout.contains("  - No Go file risk scores are available."));
-    assert!(stdout.contains("Index\n  .hotpath/index.sqlite"));
+    assert!(stdout.contains("  - No Go file risk scores are available"));
+    assert!(!stdout.contains("  - \n"));
+    assert!(!stdout.contains("  - No Go file risk scores are available."));
+    assert!(!stdout.contains("Index\n  .hotpath/index.sqlite"));
 }
 
 #[test]
@@ -582,10 +598,9 @@ fn scan_respects_ignore_rules_in_file_count() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     let final_lines = final_scan_lines(&stdout);
-    assert!(final_lines[0].starts_with("files"));
-    assert!(final_lines[0].contains("2/2"));
-    assert!(final_lines[1].starts_with("git"));
-    assert!(final_lines[2].starts_with("time"));
+    assert!(final_lines.is_empty());
+    assert!(stdout.contains("Hotpath scan complete"));
+    assert!(stdout.contains("Assessment"));
 }
 
 #[test]
@@ -597,8 +612,8 @@ fn scan_reports_actionable_non_git_diagnostic() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
-    assert!(stdout.contains("Git history  Unavailable; scores use file and parser signals only."));
-    assert!(stdout.contains("Git analysis skipped: current directory is not a Git worktree."));
+    assert!(!stdout.contains("\nScan\n"));
+    assert!(stdout.contains("Git analysis skipped: current directory is not a Git worktree"));
     assert!(!stdout.contains("diagnostic not_git"));
     assert!(!stdout.contains("index_action cleared_not_git"));
 
@@ -655,6 +670,48 @@ fn scan_reports_actionable_empty_git_repository_diagnostic() {
 }
 
 #[test]
+fn scan_does_not_store_empty_git_warning_metadata_when_warnings_are_absent() {
+    let fixture = GitFixture::new("scan-no-empty-git-warnings");
+    let first = GitIdentity::new("First Author", "first.author@example.invalid");
+    let second = GitIdentity::new("Second Author", "second.author@example.invalid");
+    fixture.write("first.go", "package main\n\nfunc first() {}\n");
+    fixture.commit(CommitOptions::new(
+        "Add first",
+        first,
+        "2025-01-01T00:00:00Z",
+    ));
+    fixture.write("second.go", "package main\n\nfunc second() {}\n");
+    fixture.commit(CommitOptions::new(
+        "Add second",
+        second,
+        "2025-01-02T00:00:00Z",
+    ));
+
+    let output = hotpath(&["scan"], fixture.path());
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(!stdout.contains("  - \n"));
+
+    let connection =
+        Connection::open(fixture.path().join(".hotpath").join("index.sqlite")).expect("db opens");
+    assert_eq!(
+        scalar_i64(
+            &connection,
+            "SELECT COUNT(*) FROM stage_metadata WHERE key IN ('git_broad_commit_warning', 'git_author_concentration_warning')",
+        ),
+        0
+    );
+    assert_eq!(
+        scalar_i64(
+            &connection,
+            "SELECT COUNT(*) FROM stage_metadata WHERE key LIKE 'git_%warning' AND trim(value) = ''",
+        ),
+        0
+    );
+}
+
+#[test]
 fn scan_reports_git_progress_for_git_repository() {
     let fixture = GitFixture::new("scan-git-progress");
     let author = GitIdentity::new("Hotpath Test", "hotpath.test@example.invalid");
@@ -676,11 +733,9 @@ fn scan_reports_git_progress_for_git_repository() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     let final_lines = final_scan_lines(&stdout);
-    assert!(final_lines[0].contains("1/1"));
-    assert!(final_lines[1].starts_with("git"));
-    assert!(final_lines[1].contains("2/2"));
-    assert!(final_lines[1].contains("commits/sec"));
-    assert!(final_lines[2].starts_with("time"));
+    assert!(final_lines.is_empty());
+    assert!(stdout.contains("Hotpath scan complete"));
+    assert!(stdout.contains("Assessment"));
 
     let connection =
         Connection::open(fixture.path().join(".hotpath").join("index.sqlite")).expect("db opens");
@@ -747,6 +802,70 @@ fn scan_reports_git_progress_for_git_repository() {
         "SELECT value FROM stage_metadata WHERE key = 'git_ownership_weighting'",
     )
     .contains("bulk_change_dampening"));
+}
+
+#[test]
+fn scan_fails_when_index_lock_exists() {
+    let fixture = Fixture::new("scan-index-lock");
+    fixture.write("main.go", "package main\n");
+    create_index_lock(&fixture.path, "pid=1\ncommand=test\n");
+
+    let output = hotpath(&["scan"], &fixture.path);
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert!(stderr.contains("another Hotpath process is using the index lock"));
+    assert!(fixture.path.join(".hotpath").join("index.lock").exists());
+}
+
+#[test]
+fn scan_full_fails_before_removing_index_when_index_lock_exists() {
+    let fixture = Fixture::new("scan-full-index-lock");
+    fs::create_dir_all(fixture.path.join(".hotpath")).expect("index dir should be created");
+    let index_path = fixture.path.join(".hotpath").join("index.sqlite");
+    fs::write(&index_path, "sentinel").expect("sentinel index should be written");
+    create_index_lock(&fixture.path, "pid=1\ncommand=test\n");
+
+    let output = hotpath(&["scan", "--full"], &fixture.path);
+
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read_to_string(index_path).expect("sentinel index should remain"),
+        "sentinel"
+    );
+}
+
+#[test]
+fn read_commands_fail_when_index_lock_exists() {
+    let fixture = Fixture::new("read-index-lock");
+    fixture.write("main.go", "package main\n");
+    let scan = hotpath(&["scan"], &fixture.path);
+    assert!(scan.status.success());
+    create_index_lock(&fixture.path, "pid=1\ncommand=test\n");
+
+    let hotspots = hotpath(&["hotspots"], &fixture.path);
+    assert!(!hotspots.status.success());
+    assert!(String::from_utf8(hotspots.stderr)
+        .expect("stderr should be UTF-8")
+        .contains("another Hotpath process is using the index lock"));
+
+    let explain = hotpath(&["explain", "main.go"], &fixture.path);
+    assert!(!explain.status.success());
+    assert!(String::from_utf8(explain.stderr)
+        .expect("stderr should be UTF-8")
+        .contains("another Hotpath process is using the index lock"));
+}
+
+#[test]
+fn scan_removes_index_lock_after_success() {
+    let fixture = Fixture::new("scan-lock-cleanup");
+    fixture.write("main.go", "package main\n");
+
+    let output = hotpath(&["scan"], &fixture.path);
+
+    assert!(output.status.success());
+    assert!(!fixture.path.join(".hotpath").join("index.lock").exists());
 }
 
 #[test]
@@ -921,7 +1040,7 @@ fn scan_warns_when_first_parent_history_hides_side_branch_work() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
-    assert!(stdout.contains("all reachable history is much larger"));
+    assert!(stdout.contains("All reachable history is much larger"));
 
     let connection =
         Connection::open(fixture.path().join(".hotpath").join("index.sqlite")).expect("db opens");
@@ -1106,9 +1225,10 @@ func Stop(enabled bool) int {
     assert!(stdout.contains("Top Hotspots"));
     assert!(stdout.contains("cmd/app/main.go"));
     assert!(stdout.contains("internal/service/a.go"));
-    assert!(stdout.contains("Production Go       3/3 scored  (100.0%)"));
-    assert!(stdout.contains("Git history  Unavailable; scores use file and parser signals only."));
-    assert!(stdout.contains("Index\n  .hotpath/index.sqlite"));
+    assert!(!stdout.contains("files_detected"));
+    assert!(!stdout.contains("files_analyzed"));
+    assert!(!stdout.contains("git_history"));
+    assert!(!stdout.contains("Index\n  .hotpath/index.sqlite"));
 }
 
 #[test]
@@ -1311,8 +1431,22 @@ fn second_scan_skips_git_when_head_is_unchanged() {
 
     let first = hotpath(&["scan"], fixture.path());
     assert!(first.status.success());
-    let second = hotpath(&["scan"], fixture.path());
+    let second = hotpath(&["scan", "--json"], fixture.path());
     assert!(second.status.success());
+    assert!(second.stderr.is_empty());
+
+    let stdout = String::from_utf8(second.stdout).expect("stdout should be UTF-8");
+    let json: Value = serde_json::from_str(&stdout).expect("stdout should be JSON");
+    assert_eq!(json["assessment"]["is_reliable"], true);
+    assert_eq!(json["assessment"]["scoring_confidence"], "high");
+    assert_eq!(
+        json["assessment"]["reason"],
+        "High scoring coverage and repository context are available."
+    );
+    assert_eq!(json["scan"]["type"], "incremental");
+    assert!(json["scan"].get("git_history").is_none());
+    assert!(json["scan"].get("commits_processed").is_none());
+    assert!(json["scan"].get("commits_total").is_none());
 
     let connection =
         Connection::open(fixture.path().join(".hotpath").join("index.sqlite")).expect("db opens");
@@ -1387,8 +1521,22 @@ fn second_scan_processes_only_new_git_commits_when_head_advances() {
         author,
         "2024-01-02T00:00:00Z",
     ));
-    let second = hotpath(&["scan"], fixture.path());
+    let second = hotpath(&["scan", "--json"], fixture.path());
     assert!(second.status.success());
+    assert!(second.stderr.is_empty());
+
+    let stdout = String::from_utf8(second.stdout).expect("stdout should be UTF-8");
+    let json: Value = serde_json::from_str(&stdout).expect("stdout should be JSON");
+    assert_eq!(json["assessment"]["is_reliable"], true);
+    assert_eq!(json["assessment"]["scoring_confidence"], "high");
+    assert_eq!(
+        json["assessment"]["reason"],
+        "High scoring coverage and repository context are available."
+    );
+    assert_eq!(json["scan"]["type"], "incremental");
+    assert!(json["scan"].get("git_history").is_none());
+    assert!(json["scan"].get("commits_processed").is_none());
+    assert!(json["scan"].get("commits_total").is_none());
 
     let connection =
         Connection::open(fixture.path().join(".hotpath").join("index.sqlite")).expect("db opens");
@@ -1462,7 +1610,7 @@ fn final_scan_lines(stdout: &str) -> Vec<String> {
     let progress_lines: Vec<_> = lines
         .iter()
         .filter(|line| {
-            line.starts_with("files")
+            line.starts_with("files") && line.contains("| speed")
                 || line.starts_with("time")
                 || (line.starts_with("git") && line.contains("| speed"))
         })
@@ -1511,10 +1659,38 @@ fn assert_json_limitation_messages_are_sentences(json: &Value) {
             "limitation message should start as a sentence: {message}"
         );
         assert!(
-            message.ends_with('.'),
-            "limitation message should end with a period: {message}"
+            !message.ends_with('.'),
+            "limitation message should not end with a period: {message}"
         );
     }
+}
+
+fn assert_json_has_no_empty_or_placeholder_limitations(json: &Value) {
+    for limitation in json["limitations"]
+        .as_array()
+        .expect("limitations should be an array")
+    {
+        let message = limitation["message"]
+            .as_str()
+            .expect("limitation message should be a string");
+        assert!(
+            !message.trim().is_empty(),
+            "limitation message should not be empty"
+        );
+        assert_ne!(message, "Limitation details are unavailable");
+    }
+}
+
+fn create_index_lock(root: &Path, contents: &str) {
+    let index_dir = root.join(".hotpath");
+    fs::create_dir_all(&index_dir).expect("index dir should be created");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(index_dir.join("index.lock"))
+        .expect("lock file should be created");
+    file.write_all(contents.as_bytes())
+        .expect("lock file should be written");
 }
 
 fn row_count(connection: &Connection, table: &str) -> i64 {

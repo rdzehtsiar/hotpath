@@ -411,7 +411,7 @@ fn load_terms(
     Ok(terms)
 }
 
-fn phrase_for_tags(tags: &[String]) -> Option<String> {
+pub(crate) fn phrase_for_tags(tags: &[String]) -> Option<String> {
     let first = tags.first().map(String::as_str)?;
     let second = tags.get(1).map(String::as_str);
 
@@ -452,15 +452,20 @@ fn phrase_for_tags(tags: &[String]) -> Option<String> {
     Some(phrase.to_owned())
 }
 
-fn tags_for_row(row: &HotspotScoreRow, terms: &[HotspotTerm]) -> Vec<String> {
+pub(crate) fn tags_for_score_signals(
+    is_generated: bool,
+    is_vendor: bool,
+    is_test: bool,
+    terms: &[HotspotTerm],
+) -> Vec<String> {
     let mut signals = Vec::new();
-    if row.is_generated {
+    if is_generated {
         signals.push(("generated", 1.0, 10));
     }
-    if row.is_vendor {
+    if is_vendor {
         signals.push(("vendor", 1.0, 10));
     }
-    if row.is_test {
+    if is_test {
         signals.push(("test file", 1.0, 20));
     }
     for term in terms {
@@ -501,6 +506,10 @@ fn tags_for_row(row: &HotspotScoreRow, terms: &[HotspotTerm]) -> Vec<String> {
         }
     }
     tags
+}
+
+fn tags_for_row(row: &HotspotScoreRow, terms: &[HotspotTerm]) -> Vec<String> {
+    tags_for_score_signals(row.is_generated, row.is_vendor, row.is_test, terms)
 }
 
 #[cfg(test)]

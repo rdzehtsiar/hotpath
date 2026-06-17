@@ -176,10 +176,10 @@ impl StoreReducerHandle {
         key: impl Into<String>,
         value: impl Into<String>,
     ) -> Result<(), StoreReducerError> {
-        self.send(StoreMessage::StageMetadata {
-            key: key.into(),
-            value: value.into(),
-        })
+        let key = key.into();
+        let value = value.into();
+        validate_stage_metadata(&key, &value)?;
+        self.send(StoreMessage::StageMetadata { key, value })
     }
 
     pub fn store_scan_state(
@@ -444,6 +444,9 @@ pub enum StoreReducerError {
         source: rusqlite::Error,
     },
     WriteDatabase(rusqlite::Error),
+    InvalidMetadata {
+        key: String,
+    },
     Startup(String),
     QueueClosed,
     ThreadPanicked,
@@ -469,6 +472,12 @@ impl fmt::Display for StoreReducerError {
             Self::WriteDatabase(source) => {
                 write!(f, "failed to write Hotpath SQLite index: {source}")
             }
+            Self::InvalidMetadata { key } => {
+                write!(
+                    f,
+                    "invalid empty Hotpath diagnostic metadata for key '{key}'"
+                )
+            }
             Self::Startup(message) => write!(f, "failed to start Hotpath store reducer: {message}"),
             Self::QueueClosed => write!(f, "store reducer queue is closed"),
             Self::ThreadPanicked => write!(f, "store reducer thread panicked"),
@@ -482,9 +491,25 @@ impl StdError for StoreReducerError {
             Self::CreateIndexDirectory { source, .. } => Some(source),
             Self::OpenDatabase { source, .. } => Some(source),
             Self::WriteDatabase(source) => Some(source),
-            Self::Startup(_) | Self::QueueClosed | Self::ThreadPanicked => None,
+            Self::InvalidMetadata { .. }
+            | Self::Startup(_)
+            | Self::QueueClosed
+            | Self::ThreadPanicked => None,
         }
     }
+}
+
+fn validate_stage_metadata(key: &str, value: &str) -> Result<(), StoreReducerError> {
+    if is_diagnostic_metadata_key(key) && value.trim().is_empty() {
+        return Err(StoreReducerError::InvalidMetadata {
+            key: key.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn is_diagnostic_metadata_key(key: &str) -> bool {
+    key.ends_with("_warning") || key.ends_with("_diagnostic_message")
 }
 
 #[derive(Debug, Default)]
@@ -2006,6 +2031,12 @@ fn finalize_git_broad_commit_metadata(
     transaction
         .execute_batch(
             "
+            DELETE FROM stage_metadata
+            WHERE key IN (
+                'git_broad_commit_warning',
+                'git_author_concentration_warning'
+            );
+
             INSERT OR REPLACE INTO stage_metadata (key, value)
             SELECT
                 'git_broad_commits_skipped_for_cochange',
@@ -2032,12 +2063,11 @@ fn finalize_git_broad_commit_metadata(
             INSERT OR REPLACE INTO stage_metadata (key, value)
             SELECT
                 'git_broad_commit_warning',
-                CASE
-                    WHEN COALESCE(SUM(broad_commits_skipped_for_cochange), 0) > 0
-                    THEN 'commits over the co-change file limit skipped co-change pair generation but still counted churn and ownership'
-                    ELSE ''
-                END
-            FROM git_chunks;
+                'commits over the co-change file limit skipped co-change pair generation but still counted churn and ownership'
+            WHERE (
+                SELECT COALESCE(SUM(broad_commits_skipped_for_cochange), 0)
+                FROM git_chunks
+            ) > 0;
 
             INSERT OR REPLACE INTO stage_metadata (key, value)
             SELECT
@@ -2061,16 +2091,15 @@ fn finalize_git_broad_commit_metadata(
             INSERT OR REPLACE INTO stage_metadata (key, value)
             SELECT
                 'git_author_concentration_warning',
-                CASE
-                    WHEN COALESCE(MAX(touches) * 100.0 / NULLIF(SUM(touches), 0), 0) >= 80
-                    THEN 'one author accounts for at least 80 percent of Git file touches; ownership may be distorted by bulk or automated changes'
-                    ELSE ''
-                END
-            FROM (
-                SELECT author, SUM(touch_count) AS touches
-                FROM git_file_author_accumulators
-                GROUP BY author
-            );
+                'one author accounts for at least 80 percent of Git file touches; ownership may be distorted by bulk or automated changes'
+            WHERE (
+                SELECT COALESCE(MAX(touches) * 100.0 / NULLIF(SUM(touches), 0), 0)
+                FROM (
+                    SELECT author, SUM(touch_count) AS touches
+                    FROM git_file_author_accumulators
+                    GROUP BY author
+                )
+            ) >= 80;
             ",
         )
         .map(|_| ())
@@ -3957,6 +3986,25 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_metadata_rejects_empty_values() {
+        let fixture = Fixture::new("empty-diagnostic-metadata");
+        let (event_sender, _event_receiver) = mpsc::channel();
+        let reducer =
+            StoreReducer::start(&fixture.path, StoreReducerOptions::default(), event_sender)
+                .expect("reducer should start");
+        let handle = reducer.handle();
+
+        let error = handle
+            .store_metadata("git_broad_commit_warning", "   ")
+            .expect_err("empty warning metadata should fail");
+
+        assert!(error
+            .to_string()
+            .contains("invalid empty Hotpath diagnostic metadata"));
+        reducer.finish().expect("reducer should finish");
+    }
+
+    #[test]
     fn creates_database_and_expected_tables() {
         let fixture = Fixture::new("schema");
         let (event_sender, _event_receiver) = mpsc::channel();
@@ -4262,6 +4310,20 @@ mod tests {
                 "SELECT CAST(value AS INTEGER) FROM stage_metadata WHERE key = 'git_top_author_touch_share_percent'",
             ),
             67
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT COUNT(*) FROM stage_metadata WHERE key = 'git_author_concentration_warning'",
+            ),
+            0
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT COUNT(*) FROM stage_metadata WHERE key LIKE 'git_%warning' AND trim(value) = ''",
+            ),
+            0
         );
     }
 

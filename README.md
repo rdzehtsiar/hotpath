@@ -62,9 +62,11 @@ hotpath hotspots
 
 `hotpath scan --json` writes a compact JSON scan summary to stdout with no
 terminal progress output. There is no current CI gate or stable report schema
-beyond the explicitly versioned command JSON. The current schema is documented
-in [docs/scan-json.md](./docs/scan-json.md), and the machine-readable JSON
-Schema is available at [schemas/scan.schema.json](./schemas/scan.schema.json).
+beyond the explicitly versioned command JSON. The command JSON schema is
+versioned for consumers, but Hotpath is pre-1.0 and the scoring model remains
+experimental. The current schema is documented in
+[docs/scan-json.md](./docs/scan-json.md), and the machine-readable JSON Schema
+is available at [schemas/scan.schema.json](./schemas/scan.schema.json).
 
 ### `hotpath hotspots`
 
@@ -72,7 +74,7 @@ Schema is available at [schemas/scan.schema.json](./schemas/scan.schema.json).
 the top production Go file hotspots from the latest completed scan. Test files
 are excluded from this default view.
 
-Use `hotpath hotspots --tests` to print Go test-file hotspots. Test hotspot
+Use `hotpath hotspots --include-tests` to print Go test-file hotspots. Test hotspot
 scores use the same advisory formula, but they reflect test maintenance
 pressure and should not be interpreted as production runtime risk.
 
@@ -112,6 +114,10 @@ The index is local working data, not a stable public database format. It may
 contain repository-relative paths, file metadata, parser-derived Go facts, Git
 metrics, source dependency rows, and Go file, package, and project risk score
 rows. It can be deleted and rebuilt from local repository data.
+
+Hotpath also creates `.hotpath/index.lock` while commands are reading or writing
+the index. If another Hotpath process holds the lock, commands fail fast and ask
+you to retry after that process exits.
 
 Do not commit `.hotpath/`.
 

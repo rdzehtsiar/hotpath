@@ -19,8 +19,11 @@ format.
   "schema_version": 1,
   "hotpath_version": "0.1.0",
   "scanned_at": "2026-06-18T00:00:00Z",
-  "assessment_reliable": true,
-  "scoring_confidence": "high",
+  "assessment": {
+    "is_reliable": true,
+    "scoring_confidence": "high",
+    "reason": "High scoring coverage and repository context are available."
+  },
   "risk": {
     "score": 6.8,
     "band": "high",
@@ -39,10 +42,7 @@ format.
     "type": "full",
     "duration_ms": 143,
     "files_detected": 42,
-    "files_analyzed": 42,
-    "git_history": "bounded",
-    "commits_processed": 120,
-    "commits_total": 120
+    "files_analyzed": 42
   },
   "top_hotspots": [
     {
@@ -86,12 +86,21 @@ Future incompatible changes should increment `schema_version`.
 | `schema_version` | integer | yes | JSON output schema version. Currently `1`. |
 | `hotpath_version` | string | yes | Hotpath package version that produced the output. |
 | `scanned_at` | string | yes | UTC timestamp when the JSON document was created, formatted as `YYYY-MM-DDTHH:MM:SSZ`. |
-| `assessment_reliable` | boolean | yes | Convenience signal for automation. `true` only when scoring confidence is `high` or `medium` and Git history is not absent. |
-| `scoring_confidence` | string | yes | Repository-level scoring confidence. See [Scoring Confidence](#scoring-confidence). |
+| `assessment` | object | yes | Reliability, scoring confidence, and a short explanation. |
 | `risk` | object | yes | Repository-level advisory risk summary. |
-| `scan` | object | yes | Scan execution and Git collection summary. |
+| `scan` | object | yes | Scan execution summary. |
 | `top_hotspots` | array | yes | Up to five top production Go file hotspots from the scan summary. |
 | `limitations` | array | yes | Human-readable limitations and warnings that should be shown with the result. |
+
+## `assessment`
+
+`assessment` summarizes whether the scan result is a good automation signal.
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `is_reliable` | boolean | yes | Convenience signal for automation. |
+| `scoring_confidence` | string | yes | Repository-level scoring confidence. See [Scoring Confidence](#scoring-confidence). |
+| `reason` | string | yes | Short human-readable explanation for the reliability and confidence values. |
 
 ## `risk`
 
@@ -128,7 +137,7 @@ files, vendored files, or Go test files excluded from the production summary.
 
 ## `scan`
 
-`scan` describes the completed command execution and Git history availability.
+`scan` describes the completed command execution.
 
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -136,9 +145,6 @@ files, vendored files, or Go test files excluded from the production summary.
 | `duration_ms` | integer | yes | Total scan duration in milliseconds. This is runtime metadata and is not deterministic. |
 | `files_detected` | integer | yes | Repository files enumerated after local ignore rules. |
 | `files_analyzed` | integer | yes | Files that completed analysis. |
-| `git_history` | string | yes | Git history quality summary: `full`, `bounded`, or `absent`. |
-| `commits_processed` | integer | yes | Git commits processed during this scan. Reused Git data can report `0`. |
-| `commits_total` | integer or null | yes | Total Git commits known to the scan planner, or `null` if unavailable before completion. Non-Git scans currently report `0`. |
 
 ## `top_hotspots`
 
@@ -163,7 +169,7 @@ should display near any score or gate decision.
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
 | `code` | string | yes | Stable-enough limitation category for grouping. Current examples include `language_scope` and `git`. |
-| `message` | string | yes | Human-readable sentence. Messages are normalized to start with a capital letter and end with a period. |
+| `message` | string | yes | Human-readable sentence-style text. Messages are normalized to start with a capital letter and omit trailing punctuation. |
 
 Do not treat `limitations` as exhaustive proof that no other approximation
 applies. Hotpath is early-stage software and the scoring model is intentionally
@@ -171,7 +177,7 @@ advisory.
 
 ## Scoring Confidence
 
-`scoring_confidence` is a repository-level coverage signal:
+`assessment.scoring_confidence` is a repository-level coverage signal:
 
 | Value | Meaning |
 | --- | --- |
@@ -182,23 +188,10 @@ advisory.
 
 Unknown future values should be handled conservatively.
 
-## Git History Values
-
-`scan.git_history` is a compact automation-oriented summary:
-
-| Value | Meaning |
-| --- | --- |
-| `full` | Hotpath considers the available Git history complete for the current scan or reused index. |
-| `bounded` | Hotpath processed bounded recent history. This is useful for hotspot ranking, not full lifetime risk. |
-| `absent` | Git history was unavailable, skipped, shallow, unsupported, or failed. Scores use file and parser signals only. |
-
-For detailed Git collection caveats, see the Git processing limits in the root
-README.
-
 ## Consumer Guidance
 
 - Validate `schema_version` before reading the rest of the document.
-- Treat `assessment_reliable` as a quick signal, not a final policy decision.
+- Treat `assessment.is_reliable` as a quick signal, not a final policy decision.
 - Show `limitations` with any score in CI or reports.
 - Use `risk.score == null` and `risk.band == "unavailable"` as the no-score
   state.

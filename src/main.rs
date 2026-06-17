@@ -13,6 +13,9 @@ const CLI_STYLES: styling::Styles = styling::Styles::styled()
     .usage(styling::Style::new().bold());
 use hotpath::pipeline::events::PipelineState;
 use hotpath::pipeline::reporter::StdioReporter;
+use hotpath::pipeline::scan_summary::{
+    PrimaryDriverSummary, RiskSummary, ScanRunInfo, ScanRunSummary, ScanSummary,
+};
 use serde::Serialize;
 
 const SCAN_JSON_SCHEMA_VERSION: u64 = 1;
@@ -108,6 +111,14 @@ fn run_scan(args: ScanArgs) -> ExitCode {
         }
     };
 
+    let _index_lock = match hotpath::index_lock::IndexLock::acquire(&root, "scan") {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("hotpath: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     if args.full {
         let index_path = root.join(".hotpath").join("index.sqlite");
         if let Err(e) = std::fs::remove_file(&index_path) {
@@ -144,7 +155,8 @@ fn run_scan(args: ScanArgs) -> ExitCode {
             }
         };
 
-        let output = ScanJsonOutput::build(&outcome.state, summary.as_ref(), &band_counts);
+        let run_summary = build_scan_run_summary(&outcome.state, summary.as_ref(), &band_counts);
+        let output = ScanJsonOutput::build(&run_summary, summary.as_ref());
 
         match serde_json::to_string(&output) {
             Ok(json) => {
@@ -159,23 +171,85 @@ fn run_scan(args: ScanArgs) -> ExitCode {
     }
 
     let mut reporter = StdioReporter::stdout();
-    if let Err(error) = engine.scan_with_reporter(&mut reporter) {
-        eprintln!("hotpath: {error}");
-        return ExitCode::FAILURE;
-    }
-
-    match hotpath::pipeline::scan_summary::load_scan_summary(&root) {
-        Ok(summary) => {
-            println!(
-                "{}",
-                hotpath::pipeline::scan_summary::render_scan_summary(&summary)
-            );
-            ExitCode::SUCCESS
-        }
+    let outcome = match engine.scan_with_reporter_and_state(&mut reporter) {
+        Ok(outcome) => outcome,
         Err(error) => {
             eprintln!("hotpath: {error}");
-            ExitCode::FAILURE
+            return ExitCode::FAILURE;
         }
+    };
+
+    let summary = match hotpath::pipeline::scan_summary::load_scan_summary(&root) {
+        Ok(summary) => summary,
+        Err(error) => {
+            eprintln!("hotpath: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let band_counts = match hotpath::pipeline::scan_summary::load_band_counts(&root) {
+        Ok(counts) => counts,
+        Err(error) => {
+            eprintln!("hotpath: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let run_summary = build_scan_run_summary(&outcome.state, Some(&summary), &band_counts);
+    println!(
+        "{}",
+        hotpath::pipeline::scan_summary::render_scan_summary(&summary, &run_summary)
+    );
+    ExitCode::SUCCESS
+}
+
+fn build_scan_run_summary(
+    state: &PipelineState,
+    summary: Option<&ScanSummary>,
+    band_counts: &hotpath::pipeline::scan_summary::BandCounts,
+) -> ScanRunSummary {
+    let scoring_confidence = summary
+        .and_then(|s| s.project.as_ref())
+        .map(|p| p.confidence.as_str())
+        .unwrap_or("none")
+        .to_owned();
+
+    let git_history = derive_git_history(state).to_owned();
+    let assessment_reliable =
+        matches!(scoring_confidence.as_str(), "high" | "medium") && git_history != "absent";
+
+    let project = summary.and_then(|s| s.project.as_ref());
+
+    let (risk_score, risk_band) = match project {
+        Some(p) if scoring_confidence != "none" => (Some(p.risk_10), p.risk_band.clone()),
+        _ => (None, "unavailable".to_owned()),
+    };
+
+    let primary_driver = project.and_then(|p| {
+        map_primary_driver(p.dominant_dimension.as_deref()).map(|driver| PrimaryDriverSummary {
+            id: driver.id,
+            label: driver.label,
+        })
+    });
+
+    ScanRunSummary {
+        assessment_reliable,
+        scoring_confidence,
+        risk: RiskSummary {
+            score: risk_score,
+            band: risk_band,
+            primary_driver,
+            files_by_band: band_counts.clone(),
+        },
+        scan: ScanRunInfo {
+            scan_type: derive_scan_type(state).to_owned(),
+            duration_ms: state.total_elapsed.as_millis() as u64,
+            files_detected: state.total_files.unwrap_or(state.enumerated_files),
+            files_analyzed: state.analyzed_files,
+            git_history,
+            commits_processed: state.git_commits_processed,
+            commits_total: state.total_git_commits,
+        },
     }
 }
 
@@ -187,6 +261,14 @@ fn run_explain(args: ExplainArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let _index_lock = match hotpath::index_lock::IndexLock::acquire(&current_dir, "explain") {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("hotpath: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let report = match hotpath::explain::load_explain_report(&current_dir, &args.path) {
         Ok(report) => report,
         Err(error) => {
@@ -211,6 +293,13 @@ fn run_hotspots(args: HotspotsArgs) -> ExitCode {
         None
     } else {
         Some(args.top.unwrap_or(hotpath::hotspots::DEFAULT_HOTSPOT_LIMIT))
+    };
+    let _index_lock = match hotpath::index_lock::IndexLock::acquire(&current_dir, "hotspots") {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("hotpath: {error}");
+            return ExitCode::FAILURE;
+        }
     };
     let report =
         match hotpath::hotspots::load_hotspots_report(&current_dir, args.include_tests, limit) {
@@ -237,12 +326,18 @@ struct ScanJsonOutput {
     schema_version: u64,
     hotpath_version: String,
     scanned_at: String,
-    assessment_reliable: bool,
-    scoring_confidence: String,
+    assessment: ScanJsonAssessment,
     risk: ScanJsonRisk,
     scan: ScanJsonScanInfo,
     top_hotspots: Vec<ScanJsonHotspot>,
     limitations: Vec<ScanJsonLimitation>,
+}
+
+#[derive(Debug, Serialize)]
+struct ScanJsonAssessment {
+    is_reliable: bool,
+    scoring_confidence: String,
+    reason: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -274,9 +369,6 @@ struct ScanJsonScanInfo {
     duration_ms: u64,
     files_detected: u64,
     files_analyzed: u64,
-    git_history: String,
-    commits_processed: u64,
-    commits_total: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -296,50 +388,32 @@ struct ScanJsonLimitation {
 
 impl ScanJsonOutput {
     fn build(
-        state: &PipelineState,
+        run: &ScanRunSummary,
         summary: Option<&hotpath::pipeline::scan_summary::ScanSummary>,
-        band_counts: &hotpath::pipeline::scan_summary::BandCounts,
     ) -> Self {
-        let scoring_confidence = summary
-            .and_then(|s| s.project.as_ref())
-            .map(|p| p.confidence.as_str())
-            .unwrap_or("none")
-            .to_owned();
-
-        let git_history = derive_git_history(state).to_owned();
-        let assessment_reliable =
-            matches!(scoring_confidence.as_str(), "high" | "medium") && git_history != "absent";
-
-        let project = summary.and_then(|s| s.project.as_ref());
-
-        let (risk_score, risk_band) = match project {
-            Some(p) if scoring_confidence != "none" => (Some(p.risk_10), p.risk_band.clone()),
-            _ => (None, "unavailable".to_owned()),
-        };
-
-        let primary_driver =
-            project.and_then(|p| map_primary_driver(p.dominant_dimension.as_deref()));
-
-        let risk = ScanJsonRisk {
-            score: risk_score,
-            band: risk_band,
-            primary_driver,
-            files_by_band: ScanJsonFilesByBand {
-                extreme: band_counts.extreme,
-                high: band_counts.high,
-                medium: band_counts.medium,
-                low: band_counts.low,
-            },
-        };
+        let risk =
+            ScanJsonRisk {
+                score: run.risk.score,
+                band: run.risk.band.clone(),
+                primary_driver: run.risk.primary_driver.as_ref().map(|driver| {
+                    ScanJsonPrimaryDriver {
+                        id: driver.id.clone(),
+                        label: driver.label.clone(),
+                    }
+                }),
+                files_by_band: ScanJsonFilesByBand {
+                    extreme: run.risk.files_by_band.extreme,
+                    high: run.risk.files_by_band.high,
+                    medium: run.risk.files_by_band.medium,
+                    low: run.risk.files_by_band.low,
+                },
+            };
 
         let scan = ScanJsonScanInfo {
-            scan_type: derive_scan_type(state).to_owned(),
-            duration_ms: state.total_elapsed.as_millis() as u64,
-            files_detected: state.total_files.unwrap_or(state.enumerated_files),
-            files_analyzed: state.analyzed_files,
-            git_history,
-            commits_processed: state.git_commits_processed,
-            commits_total: state.total_git_commits,
+            scan_type: run.scan.scan_type.clone(),
+            duration_ms: run.scan.duration_ms,
+            files_detected: run.scan.files_detected,
+            files_analyzed: run.scan.files_analyzed,
         };
 
         let top_hotspots = summary
@@ -380,8 +454,11 @@ impl ScanJsonOutput {
             schema_version: SCAN_JSON_SCHEMA_VERSION,
             hotpath_version: env!("CARGO_PKG_VERSION").to_owned(),
             scanned_at,
-            assessment_reliable,
-            scoring_confidence,
+            assessment: ScanJsonAssessment {
+                is_reliable: run.assessment_reliable,
+                scoring_confidence: run.scoring_confidence.clone(),
+                reason: assessment_reason(run),
+            },
             risk,
             scan,
             top_hotspots,
@@ -390,11 +467,28 @@ impl ScanJsonOutput {
     }
 }
 
+fn assessment_reason(run: &ScanRunSummary) -> String {
+    match (
+        run.assessment_reliable,
+        run.scoring_confidence.as_str(),
+        run.scan.git_history.as_str(),
+    ) {
+        (true, "high", _) => "High scoring coverage and repository context are available.",
+        (true, "medium", _) => "Medium scoring coverage and repository context are available.",
+        (false, "none", _) => "No production Go files were scored.",
+        (false, "low", _) => "Scoring coverage is low.",
+        (false, confidence @ ("high" | "medium"), "absent") => match confidence {
+            "high" => "High scoring coverage, but repository context is unavailable.",
+            _ => "Medium scoring coverage, but repository context is unavailable.",
+        },
+        (true, _, _) => "Scoring coverage and repository context are available.",
+        (false, _, _) => "Assessment reliability is limited by incomplete scoring context.",
+    }
+    .to_owned()
+}
+
 fn normalize_json_limitation_message(message: &str) -> String {
     let trimmed = message.trim();
-    if trimmed.is_empty() {
-        return "Limitation details are unavailable.".to_owned();
-    }
 
     let mut normalized = String::new();
     let mut capitalized = false;
@@ -410,7 +504,6 @@ fn normalize_json_limitation_message(message: &str) -> String {
     while normalized.ends_with(['.', '!', '?']) {
         normalized.pop();
     }
-    normalized.push('.');
     normalized
 }
 
@@ -444,12 +537,13 @@ fn format_utc_iso8601(epoch_secs: u64) -> String {
 }
 
 fn derive_git_history(state: &PipelineState) -> &'static str {
-    if state.git_skipped {
-        return "absent";
-    }
     match state.git_status.confidence.as_deref() {
-        Some("full") | Some("up_to_date") => "full",
+        Some("full") => "full",
         Some("bounded") => "bounded",
+        Some("incremental") | Some("up_to_date") => "incremental",
+        Some("first_parent_only") => "first_parent_only",
+        _ if matches!(state.git_status.index_action.as_deref(), Some("reused")) => "incremental",
+        _ if state.git_skipped => "absent",
         _ => "absent",
     }
 }

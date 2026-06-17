@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
+use crate::hotspots::{phrase_for_tags, tags_for_score_signals, HotspotTerm};
+
 const INDEX_DIR: &str = ".hotpath";
 const INDEX_DB: &str = "index.sqlite";
-const INDEX_DISPLAY_PATH: &str = ".hotpath/index.sqlite";
 const TOP_HOTSPOT_LIMIT: u64 = 5;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -27,6 +28,7 @@ pub struct GoHotspot {
     pub risk_10: f64,
     pub risk_band: String,
     pub fact: Option<String>,
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -71,6 +73,39 @@ pub struct BandCounts {
     pub high: u64,
     pub medium: u64,
     pub low: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrimaryDriverSummary {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RiskSummary {
+    pub score: Option<f64>,
+    pub band: String,
+    pub primary_driver: Option<PrimaryDriverSummary>,
+    pub files_by_band: BandCounts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanRunInfo {
+    pub scan_type: String,
+    pub duration_ms: u64,
+    pub files_detected: u64,
+    pub files_analyzed: u64,
+    pub git_history: String,
+    pub commits_processed: u64,
+    pub commits_total: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScanRunSummary {
+    pub assessment_reliable: bool,
+    pub scoring_confidence: String,
+    pub risk: RiskSummary,
+    pub scan: ScanRunInfo,
 }
 
 #[derive(Debug)]
@@ -203,21 +238,17 @@ fn load_scan_summary_from_connection(
     })
 }
 
-pub fn render_scan_summary(summary: &ScanSummary) -> String {
+pub fn render_scan_summary(summary: &ScanSummary, run: &ScanRunSummary) -> String {
     let mut lines = Vec::new();
     lines.push("Hotpath scan complete".to_owned());
     lines.push(String::new());
-    lines.extend(render_repository_risk(summary.project.as_ref()));
+    lines.extend(render_assessment(run));
     lines.push(String::new());
-    lines.extend(render_coverage(summary.project.as_ref()));
-    lines.push(String::new());
-    lines.extend(render_confidence(summary.project.as_ref(), &summary.git));
+    lines.extend(render_risk(&run.risk));
     lines.push(String::new());
     lines.extend(render_hotspots(&summary.hotspots));
     lines.push(String::new());
     lines.extend(render_limitations(&summary.limitations));
-    lines.push(String::new());
-    lines.extend(render_index());
     lines.join("\n")
 }
 
@@ -226,6 +257,7 @@ fn index_path(root: &Path) -> PathBuf {
 }
 
 fn load_hotspots(connection: &Connection) -> Result<Vec<GoHotspot>, ScanSummaryError> {
+    let terms = load_hotspot_terms(connection)?;
     let mut statement = connection
         .prepare(
             "
@@ -233,7 +265,10 @@ fn load_hotspots(connection: &Connection) -> Result<Vec<GoHotspot>, ScanSummaryE
                 score.relative_path,
                 score.risk_10,
                 score.risk_band,
-                fact.message
+                fact.message,
+                score.is_generated,
+                score.is_vendor,
+                score.is_test
             FROM file_risk_scores score
             LEFT JOIN file_risk_facts fact
                 ON fact.relative_path = score.relative_path
@@ -252,22 +287,60 @@ fn load_hotspots(connection: &Connection) -> Result<Vec<GoHotspot>, ScanSummaryE
                 row.get::<_, f64>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)? != 0,
+                row.get::<_, i64>(5)? != 0,
+                row.get::<_, i64>(6)? != 0,
             ))
         })
         .map_err(ScanSummaryError::QueryDatabase)?;
     rows.enumerate()
         .map(|(index, row)| {
-            let (relative_path, risk_10, risk_band, fact) =
+            let (relative_path, risk_10, risk_band, fact, is_generated, is_vendor, is_test) =
                 row.map_err(ScanSummaryError::QueryDatabase)?;
+            let row_terms = terms.get(&relative_path).cloned().unwrap_or_default();
             Ok(GoHotspot {
                 rank: index as u64 + 1,
                 relative_path,
                 risk_10,
                 risk_band,
                 fact,
+                tags: tags_for_score_signals(is_generated, is_vendor, is_test, &row_terms),
             })
         })
         .collect()
+}
+
+fn load_hotspot_terms(
+    connection: &Connection,
+) -> Result<BTreeMap<String, Vec<HotspotTerm>>, ScanSummaryError> {
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT relative_path, term_name, normalized_value
+            FROM file_risk_terms
+            WHERE formula_id = 'hotpath.score.go.v1'
+            ORDER BY relative_path ASC, term_name ASC
+            ",
+        )
+        .map_err(ScanSummaryError::QueryDatabase)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                HotspotTerm {
+                    name: row.get(1)?,
+                    normalized_value: row.get(2)?,
+                },
+            ))
+        })
+        .map_err(ScanSummaryError::QueryDatabase)?;
+
+    let mut terms = BTreeMap::new();
+    for row in rows {
+        let (path, term) = row.map_err(ScanSummaryError::QueryDatabase)?;
+        terms.entry(path).or_insert_with(Vec::new).push(term);
+    }
+    Ok(terms)
 }
 
 fn load_project_risk_summary(
@@ -413,116 +486,60 @@ fn deduplicate_limitations(limitations: Vec<SummaryLimitation>) -> Vec<SummaryLi
         .collect()
 }
 
-fn render_repository_risk(project: Option<&ProjectRiskSummary>) -> Vec<String> {
-    let (score, spread, driver) = match project {
-        Some(project) if project.scored_file_count > 0 && project.risk_band != "unavailable" => (
-            format!("{:.1}/10  {}", project.risk_10, project.risk_band),
-            hotspot_spread(project),
-            project
-                .dominant_dimension
-                .as_deref()
-                .unwrap_or("unavailable")
-                .to_owned(),
-        ),
-        _ => (
-            "unavailable".to_owned(),
-            "no scored production Go files".to_owned(),
-            "unavailable".to_owned(),
-        ),
-    };
-
+fn render_assessment(run: &ScanRunSummary) -> Vec<String> {
     vec![
-        "Repository Risk".to_owned(),
-        format!("  Advisory score  {score}"),
-        format!("  Hotspot spread  {spread}"),
-        format!("  Primary driver  {driver}"),
+        "Assessment".to_owned(),
+        format!("  Reliable: {}", run.assessment_reliable),
+        format!("  Scoring confidence: {}", run.scoring_confidence),
+        format!("  Reason: {}", assessment_reason(run)),
     ]
 }
 
-fn hotspot_spread(project: &ProjectRiskSummary) -> String {
-    if project.medium_risk_file_count == 0 {
-        return "no medium-or-higher hotspots".to_owned();
+fn assessment_reason(run: &ScanRunSummary) -> &'static str {
+    match (
+        run.assessment_reliable,
+        run.scoring_confidence.as_str(),
+        run.scan.git_history.as_str(),
+    ) {
+        (true, "high", _) => "High scoring coverage and repository context are available.",
+        (true, "medium", _) => "Medium scoring coverage and repository context are available.",
+        (false, "none", _) => "No production Go files were scored.",
+        (false, "low", _) => "Scoring coverage is low.",
+        (false, "high", "absent") => {
+            "High scoring coverage, but repository context is unavailable."
+        }
+        (false, "medium", "absent") => {
+            "Medium scoring coverage, but repository context is unavailable."
+        }
+        (true, _, _) => "Scoring coverage and repository context are available.",
+        (false, _, _) => "Assessment reliability is limited by incomplete scoring context.",
     }
-
-    format!(
-        "{} high, {} medium-or-higher",
-        project.high_risk_file_count, project.medium_risk_file_count
-    )
 }
 
-fn render_coverage(project: Option<&ProjectRiskSummary>) -> Vec<String> {
-    let project = project.cloned().unwrap_or(ProjectRiskSummary {
-        risk_10: 0.0,
-        risk_band: "unavailable".to_owned(),
-        coverage_percent: 0.0,
-        scored_file_count: 0,
-        active_go_file_count: 0,
-        active_file_count: 0,
-        confidence: "none".to_owned(),
-        high_risk_file_count: 0,
-        medium_risk_file_count: 0,
-        dominant_dimension: None,
-        git_index_status: "unavailable".to_owned(),
-    });
-    let other_active_files = project
-        .active_file_count
-        .saturating_sub(project.active_go_file_count);
+fn render_risk(risk: &RiskSummary) -> Vec<String> {
+    let score = risk
+        .score
+        .map(|score| format!("{score:.1}"))
+        .unwrap_or_else(|| "unavailable".to_owned());
+    let primary_driver = risk
+        .primary_driver
+        .as_ref()
+        .map(|driver| driver.label.clone())
+        .unwrap_or_else(|| "none".to_owned());
 
     vec![
-        "Coverage".to_owned(),
+        "Risk".to_owned(),
+        format!("  Score: {score}"),
+        format!("  Band: {}", risk.band),
+        format!("  Primary driver: {primary_driver}"),
         format!(
-            "  Files analyzed      {}/{}",
-            project.active_file_count, project.active_file_count
+            "  Files by band: extreme {}  high {}  medium {}  low {}",
+            risk.files_by_band.extreme,
+            risk.files_by_band.high,
+            risk.files_by_band.medium,
+            risk.files_by_band.low
         ),
-        format!(
-            "  Production Go       {}/{} scored  ({:.1}%)",
-            project.scored_file_count, project.active_go_file_count, project.coverage_percent
-        ),
-        format!("  Other active files  {other_active_files} indexed, not scored by Go risk model"),
     ]
-}
-
-fn render_confidence(project: Option<&ProjectRiskSummary>, git: &GitSummary) -> Vec<String> {
-    vec![
-        "Confidence".to_owned(),
-        format!("  Git history  {}", git_confidence_sentence(project, git)),
-        format!("  Scoring      {}", scoring_confidence_sentence(project)),
-    ]
-}
-
-fn git_confidence_sentence(project: Option<&ProjectRiskSummary>, git: &GitSummary) -> &'static str {
-    if project.is_some_and(|project| project.git_index_status != "available") {
-        return "Unavailable; scores use file and parser signals only.";
-    }
-
-    match git.confidence.as_deref() {
-        Some("full") => "Full Git history analyzed for this repository.",
-        Some("bounded") => {
-            "Bounded recent history; suitable for hotspot ranking, not full lifetime risk."
-        }
-        Some("not_git" | "shallow_skipped" | "error_skipped") => {
-            "Unavailable; scores use file and parser signals only."
-        }
-        Some("up_to_date") => "Reused previously indexed Git history for the current HEAD.",
-        Some(_) => "Git history quality is known but limited; review limitations before acting.",
-        None => "Unknown; review limitations before acting.",
-    }
-}
-
-fn scoring_confidence_sentence(project: Option<&ProjectRiskSummary>) -> &'static str {
-    match project {
-        Some(project) if project.active_go_file_count == 0 => {
-            "No production Go files were available to score."
-        }
-        Some(project) => match project.confidence.as_str() {
-            "high" => "High coverage for production Go files.",
-            "medium" => "Partial coverage for production Go files.",
-            "low" => "Low coverage; treat repository-level risk as directional.",
-            "none" => "No production Go files were available to score.",
-            _ => "Coverage is available; review limitations before acting.",
-        },
-        None => "No production Go files were available to score.",
-    }
 }
 
 fn render_hotspots(hotspots: &[GoHotspot]) -> Vec<String> {
@@ -532,21 +549,24 @@ fn render_hotspots(hotspots: &[GoHotspot]) -> Vec<String> {
         return lines;
     }
 
-    lines.push("  #  Risk  Severity  File".to_owned());
     for hotspot in hotspots {
-        lines.push(format!(
-            "  {:<2} {:<5.1} {:<9} {}",
-            hotspot.rank, hotspot.risk_10, hotspot.risk_band, hotspot.relative_path
-        ));
-        lines.push(format!(
-            "     reason: {}",
-            hotspot
-                .fact
-                .as_deref()
-                .unwrap_or("No summary fact available.")
-        ));
+        lines.push(String::new());
+        lines.push(format!("{:>2}  {}", hotspot.rank, hotspot.relative_path));
+        if let Some(reason) = hotspot
+            .fact
+            .as_deref()
+            .filter(|reason| !reason.trim().is_empty())
+        {
+            lines.push(format!("    {}", normalize_hotspot_reason(reason)));
+        } else if let Some(phrase) = phrase_for_tags(&hotspot.tags) {
+            lines.push(format!("    {phrase}"));
+        }
     }
     lines
+}
+
+fn normalize_hotspot_reason(reason: &str) -> String {
+    capitalize_first_letter(reason.trim_end_matches(['.', '!', '?']).trim_end())
 }
 
 fn render_limitations(limitations: &[SummaryLimitation]) -> Vec<String> {
@@ -559,13 +579,27 @@ fn render_limitations(limitations: &[SummaryLimitation]) -> Vec<String> {
     lines.extend(
         limitations
             .iter()
-            .map(|limitation| format!("  - {}", limitation.message)),
+            .map(|limitation| format!("  - {}", normalize_limitation_message(&limitation.message))),
     );
     lines
 }
 
-fn render_index() -> Vec<String> {
-    vec!["Index".to_owned(), format!("  {INDEX_DISPLAY_PATH}")]
+fn normalize_limitation_message(message: &str) -> String {
+    let trimmed = message.trim_end_matches(['.', '!', '?']).trim_end();
+    capitalize_first_letter(trimmed)
+}
+
+fn capitalize_first_letter(message: &str) -> String {
+    let mut chars = message.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+
+    if first.is_ascii_lowercase() {
+        format!("{}{}", first.to_ascii_uppercase(), chars.as_str())
+    } else {
+        message.to_owned()
+    }
 }
 
 #[allow(dead_code)]
@@ -584,8 +618,9 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        load_scan_summary_from_connection, render_scan_summary, GitSummary, GoHotspot,
-        ProjectRiskSummary, ScanSummary, SummaryLimitation,
+        load_scan_summary_from_connection, render_scan_summary, BandCounts, GitSummary, GoHotspot,
+        PrimaryDriverSummary, ProjectRiskSummary, RiskSummary, ScanRunInfo, ScanRunSummary,
+        ScanSummary, SummaryLimitation,
     };
 
     #[test]
@@ -598,6 +633,7 @@ mod tests {
                 risk_10: 7.24,
                 risk_band: "high".to_owned(),
                 fact: Some("High total churn: 2500 changed lines".to_owned()),
+                tags: vec!["high churn".to_owned(), "complexity pressure".to_owned()],
             }],
             project: Some(ProjectRiskSummary {
                 risk_10: 6.82,
@@ -627,26 +663,32 @@ mod tests {
             },
             limitations: vec![SummaryLimitation {
                 code: "git".to_owned(),
-                message: "Git warning".to_owned(),
+                message: "git warning".to_owned(),
             }],
         };
 
-        let rendered = render_scan_summary(&summary);
+        let rendered = render_scan_summary(&summary, &example_run_summary());
 
         assert!(rendered.starts_with("Hotpath scan complete"));
-        assert!(rendered.contains("Repository Risk"));
-        assert!(rendered.contains("Advisory score  6.8/10  high"));
-        assert!(rendered.contains("Hotspot spread  1 high, 2 medium-or-higher"));
-        assert!(rendered.contains("Primary driver  churn"));
-        assert!(rendered.contains("Production Go       2/2 scored  (100.0%)"));
-        assert!(rendered.contains(
-            "Git history  Bounded recent history; suitable for hotspot ranking, not full lifetime risk."
-        ));
-        assert!(rendered.contains("  #  Risk  Severity  File"));
-        assert!(rendered.contains("  1  7.2   high      internal/service/a.go"));
-        assert!(rendered.contains("     reason: High total churn: 2500 changed lines"));
+        assert!(rendered.contains("Assessment"));
+        assert!(rendered.contains("  Reliable: true"));
+        assert!(rendered.contains("  Scoring confidence: high"));
+        assert!(rendered.contains("Risk"));
+        assert!(rendered.contains("  Score: 6.8"));
+        assert!(rendered.contains("  Band: high"));
+        assert!(rendered.contains("  Primary driver: Churn"));
+        assert!(!rendered.contains("  Primary driver: churn (Churn)"));
+        assert!(rendered.contains("  Files by band: extreme 0  high 1  medium 1  low 0"));
+        assert!(!rendered.contains("\nScan\n"));
+        assert!(!rendered.contains("duration_ms"));
+        assert!(!rendered.contains("files_detected"));
+        assert!(rendered.contains("Top Hotspots\n\n 1  internal/service/a.go"));
+        assert!(rendered.contains("    High total churn: 2500 changed lines"));
+        assert!(!rendered.contains("  #  Risk  Severity  File"));
+        assert!(!rendered.contains("    Frequently changed, high-complexity file"));
         assert!(rendered.contains("  - Git warning"));
-        assert!(rendered.contains("Index\n  .hotpath/index.sqlite"));
+        assert!(!rendered.contains("  - git warning"));
+        assert!(!rendered.contains("Index\n  .hotpath/index.sqlite"));
         assert!(!rendered.contains("fully_rebuilt"));
         assert!(!rendered.contains("C:\\repo\\.hotpath\\index.sqlite"));
     }
@@ -661,14 +703,38 @@ mod tests {
             limitations: Vec::new(),
         };
 
-        let rendered = render_scan_summary(&summary);
+        let rendered = render_scan_summary(&summary, &unavailable_run_summary());
 
-        assert!(rendered.contains("Advisory score  unavailable"));
-        assert!(rendered.contains("Hotspot spread  no scored production Go files"));
-        assert!(rendered.contains("Files analyzed      0/0"));
-        assert!(rendered.contains("Production Go       0/0 scored  (0.0%)"));
+        assert!(rendered.contains("  Reliable: false"));
+        assert!(rendered.contains("  Scoring confidence: none"));
+        assert!(rendered.contains("  Score: unavailable"));
+        assert!(rendered.contains("  Band: unavailable"));
+        assert!(rendered.contains("  Primary driver: none"));
+        assert!(!rendered.contains("\nScan\n"));
         assert!(rendered.contains("Top Hotspots\n  none"));
         assert!(rendered.contains("Limitations\n  none"));
+    }
+
+    #[test]
+    fn renders_hotspot_tag_phrase_when_fact_is_missing() {
+        let summary = ScanSummary {
+            index_path: PathBuf::from("index.sqlite"),
+            hotspots: vec![GoHotspot {
+                rank: 1,
+                relative_path: "internal/service/a.go".to_owned(),
+                risk_10: 7.24,
+                risk_band: "high".to_owned(),
+                fact: None,
+                tags: vec!["high churn".to_owned(), "complexity pressure".to_owned()],
+            }],
+            project: None,
+            git: GitSummary::default(),
+            limitations: Vec::new(),
+        };
+
+        let rendered = render_scan_summary(&summary, &unavailable_run_summary());
+
+        assert!(rendered.contains("    Frequently changed, high-complexity file"));
     }
 
     #[test]
@@ -698,6 +764,13 @@ mod tests {
                     fact_kind TEXT NOT NULL,
                     message TEXT NOT NULL,
                     PRIMARY KEY (relative_path, formula_id, fact_index)
+                );
+                CREATE TABLE file_risk_terms (
+                    relative_path TEXT NOT NULL,
+                    formula_id TEXT NOT NULL,
+                    term_name TEXT NOT NULL,
+                    normalized_value REAL,
+                    PRIMARY KEY (relative_path, formula_id, term_name)
                 );
                 CREATE TABLE project_risk_summary (
                     formula_id TEXT PRIMARY KEY NOT NULL,
@@ -737,6 +810,9 @@ mod tests {
                 INSERT INTO file_risk_facts VALUES
                     ('a.go', 'hotpath.score.go.v1', 0, 'summary', 'A fact'),
                     ('b.go', 'hotpath.score.go.v1', 0, 'summary', 'B fact');
+                INSERT INTO file_risk_terms VALUES
+                    ('a.go', 'hotpath.score.go.v1', 'churn', 1.0),
+                    ('b.go', 'hotpath.score.go.v1', 'complexity_pressure', 1.0);
                 INSERT INTO project_risk_summary VALUES
                     ('hotpath.project_risk.go.v1', 1, 0.7, 7.0, 'high', 'high', 3, 2, 2, 0.66, 1.0, 0.7, 0.55, 1, 2, 'churn', 0.8, 'available');
                 INSERT INTO project_risk_limitations VALUES
@@ -765,6 +841,8 @@ mod tests {
         assert_eq!(summary.hotspots[0].relative_path, "a.go");
         assert_eq!(summary.hotspots[1].relative_path, "b.go");
         assert_eq!(summary.hotspots.len(), 2);
+        assert_eq!(summary.hotspots[0].tags, vec!["high churn"]);
+        assert_eq!(summary.hotspots[1].tags, vec!["complexity pressure"]);
         let project = summary.project.as_ref().expect("project summary loads");
         assert_eq!(project.coverage_percent, 100.0);
         assert_eq!(project.risk_10, 7.0);
@@ -780,5 +858,62 @@ mod tests {
         );
         assert_eq!(summary.limitations[2].message, "Git diagnostic");
         assert_eq!(summary.limitations.len(), 3);
+    }
+
+    fn example_run_summary() -> ScanRunSummary {
+        ScanRunSummary {
+            assessment_reliable: true,
+            scoring_confidence: "high".to_owned(),
+            risk: RiskSummary {
+                score: Some(6.82),
+                band: "high".to_owned(),
+                primary_driver: Some(PrimaryDriverSummary {
+                    id: "churn".to_owned(),
+                    label: "Churn".to_owned(),
+                }),
+                files_by_band: BandCounts {
+                    extreme: 0,
+                    high: 1,
+                    medium: 1,
+                    low: 0,
+                },
+            },
+            scan: ScanRunInfo {
+                scan_type: "full".to_owned(),
+                duration_ms: 42,
+                files_detected: 3,
+                files_analyzed: 3,
+                git_history: "bounded".to_owned(),
+                commits_processed: 2,
+                commits_total: Some(2),
+            },
+        }
+    }
+
+    fn unavailable_run_summary() -> ScanRunSummary {
+        ScanRunSummary {
+            assessment_reliable: false,
+            scoring_confidence: "none".to_owned(),
+            risk: RiskSummary {
+                score: None,
+                band: "unavailable".to_owned(),
+                primary_driver: None,
+                files_by_band: BandCounts {
+                    extreme: 0,
+                    high: 0,
+                    medium: 0,
+                    low: 0,
+                },
+            },
+            scan: ScanRunInfo {
+                scan_type: "full".to_owned(),
+                duration_ms: 0,
+                files_detected: 0,
+                files_analyzed: 0,
+                git_history: "absent".to_owned(),
+                commits_processed: 0,
+                commits_total: None,
+            },
+        }
     }
 }

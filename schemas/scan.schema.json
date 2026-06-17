@@ -9,8 +9,7 @@
     "schema_version",
     "hotpath_version",
     "scanned_at",
-    "assessment_reliable",
-    "scoring_confidence",
+    "assessment",
     "risk",
     "scan",
     "top_hotspots",
@@ -30,14 +29,8 @@
       "format": "date-time",
       "description": "UTC timestamp when the JSON document was created."
     },
-    "assessment_reliable": {
-      "type": "boolean",
-      "description": "True when scoring confidence is high or medium and Git history is not absent."
-    },
-    "scoring_confidence": {
-      "type": "string",
-      "description": "Repository-level scoring confidence.",
-      "enum": ["high", "medium", "low", "none"]
+    "assessment": {
+      "$ref": "#/$defs/assessment"
     },
     "risk": {
       "$ref": "#/$defs/risk"
@@ -62,6 +55,27 @@
     }
   },
   "$defs": {
+    "assessment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["is_reliable", "scoring_confidence", "reason"],
+      "properties": {
+        "is_reliable": {
+          "type": "boolean",
+          "description": "Convenience signal for automation."
+        },
+        "scoring_confidence": {
+          "type": "string",
+          "description": "Repository-level scoring confidence.",
+          "enum": ["high", "medium", "low", "none"]
+        },
+        "reason": {
+          "type": "string",
+          "description": "Short human-readable explanation for the reliability and confidence values.",
+          "minLength": 1
+        }
+      }
+    },
     "risk": {
       "type": "object",
       "additionalProperties": false,
@@ -133,10 +147,7 @@
         "type",
         "duration_ms",
         "files_detected",
-        "files_analyzed",
-        "git_history",
-        "commits_processed",
-        "commits_total"
+        "files_analyzed"
       ],
       "properties": {
         "type": {
@@ -151,18 +162,6 @@
         },
         "files_analyzed": {
           "$ref": "#/$defs/non_negative_integer"
-        },
-        "git_history": {
-          "type": "string",
-          "enum": ["full", "bounded", "absent"]
-        },
-        "commits_processed": {
-          "$ref": "#/$defs/non_negative_integer"
-        },
-        "commits_total": {
-          "description": "Total Git commits known to the scan planner, or null if unavailable.",
-          "type": ["integer", "null"],
-          "minimum": 0
         }
       }
     },
