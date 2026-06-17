@@ -1,0 +1,223 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/rdzehtsiar/hotpath/schemas/scan.schema.json",
+  "title": "Hotpath scan JSON output",
+  "description": "Schema for the JSON document emitted by `hotpath scan --json`.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "hotpath_version",
+    "scanned_at",
+    "assessment_reliable",
+    "scoring_confidence",
+    "risk",
+    "scan",
+    "top_hotspots",
+    "limitations"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "description": "JSON output schema version."
+    },
+    "hotpath_version": {
+      "type": "string",
+      "description": "Hotpath package version that produced the output."
+    },
+    "scanned_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC timestamp when the JSON document was created."
+    },
+    "assessment_reliable": {
+      "type": "boolean",
+      "description": "True when scoring confidence is high or medium and Git history is not absent."
+    },
+    "scoring_confidence": {
+      "type": "string",
+      "description": "Repository-level scoring confidence.",
+      "enum": ["high", "medium", "low", "none"]
+    },
+    "risk": {
+      "$ref": "#/$defs/risk"
+    },
+    "scan": {
+      "$ref": "#/$defs/scan"
+    },
+    "top_hotspots": {
+      "type": "array",
+      "description": "Top production Go file hotspots from the scan summary.",
+      "maxItems": 5,
+      "items": {
+        "$ref": "#/$defs/hotspot"
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "description": "Limitations and warnings that should be shown with the result.",
+      "items": {
+        "$ref": "#/$defs/limitation"
+      }
+    }
+  },
+  "$defs": {
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["score", "band", "primary_driver", "files_by_band"],
+      "properties": {
+        "score": {
+          "description": "Repository advisory risk score on a 0.0 to 10.0 scale, or null when unavailable.",
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 10
+        },
+        "band": {
+          "$ref": "#/$defs/risk_band_with_unavailable"
+        },
+        "primary_driver": {
+          "description": "Dominant scoring dimension when available.",
+          "oneOf": [
+            {
+              "$ref": "#/$defs/primary_driver"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "files_by_band": {
+          "$ref": "#/$defs/files_by_band"
+        }
+      }
+    },
+    "primary_driver": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "label"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "enum": ["churn", "complexity", "cochange"]
+        },
+        "label": {
+          "type": "string",
+          "enum": ["Churn", "Recent churn", "Complexity", "Co-change"]
+        }
+      }
+    },
+    "files_by_band": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["extreme", "high", "medium", "low"],
+      "properties": {
+        "extreme": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "high": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "medium": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "low": {
+          "$ref": "#/$defs/non_negative_integer"
+        }
+      }
+    },
+    "scan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "duration_ms",
+        "files_detected",
+        "files_analyzed",
+        "git_history",
+        "commits_processed",
+        "commits_total"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["full", "incremental"]
+        },
+        "duration_ms": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "files_detected": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "files_analyzed": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "git_history": {
+          "type": "string",
+          "enum": ["full", "bounded", "absent"]
+        },
+        "commits_processed": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "commits_total": {
+          "description": "Total Git commits known to the scan planner, or null if unavailable.",
+          "type": ["integer", "null"],
+          "minimum": 0
+        }
+      }
+    },
+    "hotspot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rank", "path", "score", "band", "reason"],
+      "properties": {
+        "rank": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 10
+        },
+        "band": {
+          "$ref": "#/$defs/risk_band"
+        },
+        "reason": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "limitation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "risk_band": {
+      "type": "string",
+      "enum": ["low", "medium", "high", "extreme"]
+    },
+    "risk_band_with_unavailable": {
+      "type": "string",
+      "enum": ["low", "medium", "high", "extreme", "unavailable"]
+    },
+    "non_negative_integer": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

@@ -62,24 +62,9 @@ hotpath hotspots
 
 `hotpath scan --json` writes a compact JSON scan summary to stdout with no
 terminal progress output. There is no current CI gate or stable report schema
-beyond the explicitly versioned command JSON.
-
-The v1 schema fields are:
-
-| Field | Type | Description |
-| --- | --- | --- |
-| `schema_version` | integer | Schema version identifier. Currently `1`. |
-| `command` | string | Always `"scan"`. |
-| `files.detected` | integer | Total repository files enumerated (after ignore rules). |
-| `files.analyzed` | integer | Files that completed analysis. |
-| `git.skipped` | boolean | `true` when Git analysis was not attempted. |
-| `git.mode` | string or null | Collection mode: `"full"`, `"incremental"`, or `"up_to_date"`. Null when skipped. |
-| `git.confidence` | string or null | Advisory confidence signal: `"full"`, `"bounded"`, `"incremental"`, `"first_parent_only"`, `"shallow_skipped"`, `"not_git"`, or `"error_skipped"`. Null when skipped. |
-| `git.commits_total` | integer or null | Total reachable commits available to Git. Null when skipped. |
-| `git.commits_processed` | integer | Commits actually processed in this scan. `0` when skipped or reused. |
-| `git.diagnostic` | string or null | Diagnostic code (no message text) when a Git limitation was recorded, e.g. `"merge_heavy"`. Null when none. |
-| `git.index_action` | string or null | How the Git index was handled: `"fully_rebuilt"`, `"incrementally_updated"`, `"reused"`, `"cleared_not_git"`, or `"cleared_options_changed"`. Null when skipped. |
-| `index.records_stored` | integer | Total database records written to the local index. |
+beyond the explicitly versioned command JSON. The current schema is documented
+in [docs/scan-json.md](./docs/scan-json.md), and the machine-readable JSON
+Schema is available at [schemas/scan.schema.json](./schemas/scan.schema.json).
 
 ### `hotpath hotspots`
 
