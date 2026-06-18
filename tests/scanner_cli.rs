@@ -331,7 +331,14 @@ fn scan_summary_reports_no_go_coverage_and_limitation() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.contains("Assessment"));
     assert!(stdout.contains("  Reliable: false"));
+    assert!(stdout.contains("  Scoring confidence: none"));
+    assert!(stdout.contains(
+        "  Reason: Files were scanned, but no production Go files were available for the current Go-only scoring model."
+    ));
+    assert!(!stdout.contains("No production Go files were scored."));
+    assert!(stdout.contains("Risk"));
     assert!(stdout.contains("  Score: unavailable"));
     assert!(stdout.contains("  Band: unavailable"));
     assert!(stdout.contains("  Primary driver: none"));
