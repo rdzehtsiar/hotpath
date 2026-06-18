@@ -241,7 +241,7 @@ fn scan_json_pretty_prints_with_four_space_indentation() {
 }
 
 #[test]
-fn scan_pretty_requires_json() {
+fn release_smoke_scan_pretty_without_json_fails_with_helpful_clap_error() {
     let fixture = Fixture::new("scan-pretty-without-json");
 
     let output = hotpath(&["scan", "--pretty"], &fixture.path);
@@ -250,7 +250,52 @@ fn scan_pretty_requires_json() {
     assert!(output.stdout.is_empty());
 
     let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
-    assert!(stderr.contains("--json"));
+    assert!(
+        stderr.contains("error:"),
+        "stderr:
+{stderr}"
+    );
+    assert!(
+        stderr.contains("--pretty"),
+        "stderr:
+{stderr}"
+    );
+    assert!(
+        stderr.contains("--json"),
+        "stderr:
+{stderr}"
+    );
+}
+
+#[test]
+fn release_smoke_scan_full_succeeds_from_existing_index() {
+    let fixture = Fixture::new("scan-full-existing-index");
+    fixture.write("main.go", "package main\n");
+
+    let initial = hotpath(&["scan", "--json"], &fixture.path);
+    assert!(
+        initial.status.success(),
+        "initial scan failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&initial.stdout),
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    assert!(fixture.path.join(".hotpath").join("index.sqlite").exists());
+
+    let output = hotpath(&["scan", "--full", "--json"], &fixture.path);
+
+    assert!(
+        output.status.success(),
+        "hotpath scan --full --json failed from existing index\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    let json: Value = serde_json::from_str(&stdout).expect("stdout should be JSON");
+    assert_eq!(json["scan"]["type"], "full");
+    assert_eq!(json["scan"]["files_detected"], 1);
+    assert_eq!(json["scan"]["files_analyzed"], 1);
 }
 
 #[test]
@@ -1661,7 +1706,7 @@ fn removed_commands_fail_as_unknown_commands() {
 }
 
 #[test]
-fn scan_json_flag_is_recognized_by_clap() {
+fn release_smoke_scan_help_mentions_json_pretty_and_full_rebuild() {
     let fixture = Fixture::new("scan-json-help");
 
     let output = hotpath(&["scan", "--help"], &fixture.path);
@@ -1675,7 +1720,12 @@ fn scan_json_flag_is_recognized_by_clap() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     assert!(stdout.contains("Usage:"));
     assert!(stdout.contains("--json"));
+    assert!(stdout.contains("stable JSON scan summary"));
     assert!(stdout.contains("--pretty"));
+    assert!(stdout.contains("requires --json"));
+    assert!(stdout.contains("--full"));
+    assert!(stdout.contains("full rebuild"));
+    assert!(stdout.contains("existing local index"));
     assert!(!stdout.contains("--verbose"));
 }
 
