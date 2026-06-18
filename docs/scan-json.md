@@ -2,7 +2,8 @@
 
 `hotpath scan --json` emits one compact JSON document to stdout after a scan
 completes. It suppresses terminal progress output so callers can parse stdout
-directly.
+directly. Use `hotpath scan --json --pretty` to emit the same document with
+four-space indentation for human inspection.
 
 The current schema is versioned with `schema_version: 1`. The matching
 machine-readable JSON Schema is in

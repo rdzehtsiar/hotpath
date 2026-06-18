@@ -47,6 +47,9 @@ struct ScanArgs {
     /// Write a stable JSON scan summary instead of terminal progress.
     #[arg(long)]
     json: bool,
+    /// Pretty-print JSON output with four-space indentation.
+    #[arg(long, requires = "json")]
+    pretty: bool,
     /// Force a complete scan, ignoring any prior results.
     #[arg(long)]
     full: bool,
@@ -158,7 +161,7 @@ fn run_scan(args: ScanArgs) -> ExitCode {
         let run_summary = build_scan_run_summary(&outcome.state, summary.as_ref(), &band_counts);
         let output = ScanJsonOutput::build(&run_summary, summary.as_ref());
 
-        match serde_json::to_string(&output) {
+        match serialize_scan_json(&output, args.pretty) {
             Ok(json) => {
                 println!("{json}");
                 return ExitCode::SUCCESS;
@@ -319,6 +322,21 @@ fn run_hotspots(args: HotspotsArgs) -> ExitCode {
         );
     }
     ExitCode::SUCCESS
+}
+
+fn serialize_scan_json(output: &ScanJsonOutput, pretty: bool) -> Result<String, serde_json::Error> {
+    if !pretty {
+        return serde_json::to_string(output);
+    }
+
+    let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+    let mut buffer = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut buffer, formatter);
+    output.serialize(&mut serializer)?;
+
+    String::from_utf8(buffer).map_err(|error| {
+        serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    })
 }
 
 #[derive(Debug, Serialize)]

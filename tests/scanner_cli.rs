@@ -174,6 +174,48 @@ fn scan_json_reports_stable_non_git_summary_without_progress() {
 }
 
 #[test]
+fn scan_json_pretty_prints_with_four_space_indentation() {
+    let fixture = Fixture::new("scan-json-pretty");
+    fixture.write("main.go", "package main\n");
+
+    let output = hotpath(&["scan", "--json", "--pretty"], &fixture.path);
+
+    assert!(
+        output.status.success(),
+        "hotpath scan --json --pretty failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.ends_with('\n'));
+    assert!(stdout.lines().count() > 1);
+    assert!(stdout.contains("\n    \"schema_version\""));
+    assert!(stdout.contains("\n        \"is_reliable\""));
+    assert!(!stdout.contains("\n  \"schema_version\""));
+    assert!(!stdout.contains("| speed"));
+    assert!(!stdout.contains("Hotpath scan complete"));
+
+    let json: Value = serde_json::from_str(&stdout).expect("stdout should be JSON");
+    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["scan"]["files_detected"], 1);
+}
+
+#[test]
+fn scan_pretty_requires_json() {
+    let fixture = Fixture::new("scan-pretty-without-json");
+
+    let output = hotpath(&["scan", "--pretty"], &fixture.path);
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert!(stderr.contains("--json"));
+}
+
+#[test]
 fn scan_json_reports_stable_git_summary() {
     let fixture = GitFixture::new("scan-json-git");
     let author = GitIdentity::new("Hotpath Test", "hotpath.test@example.invalid");
@@ -1595,6 +1637,7 @@ fn scan_json_flag_is_recognized_by_clap() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     assert!(stdout.contains("Usage:"));
     assert!(stdout.contains("--json"));
+    assert!(stdout.contains("--pretty"));
     assert!(!stdout.contains("--verbose"));
 }
 

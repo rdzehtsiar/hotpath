@@ -27,6 +27,9 @@ hotpath explain internal/service/service.go
 # Emit a machine-readable JSON summary instead of terminal output
 hotpath scan --json
 
+# Pretty-print the same JSON for human inspection
+hotpath scan --json --pretty
+
 # Delete and fully rebuild the local index
 Remove-Item -Recurse -Force .hotpath; hotpath scan
 ```
@@ -61,10 +64,11 @@ hotpath hotspots
 - prints terminal progress for file and Git processing
 
 `hotpath scan --json` writes a compact JSON scan summary to stdout with no
-terminal progress output. There is no current CI gate or stable report schema
-beyond the explicitly versioned command JSON. The command JSON schema is
-versioned for consumers, but Hotpath is pre-1.0 and the scoring model remains
-experimental. The current schema is documented in
+terminal progress output. Use `hotpath scan --json --pretty` to print the same
+JSON with four-space indentation for human inspection. There is no current CI
+gate or stable report schema beyond the explicitly versioned command JSON. The
+command JSON schema is versioned for consumers, but Hotpath is pre-1.0 and the
+scoring model remains experimental. The current schema is documented in
 [docs/scan-json.md](./docs/scan-json.md), and the machine-readable JSON Schema
 is available at [schemas/scan.schema.json](./schemas/scan.schema.json).
 
