@@ -82,7 +82,12 @@ fn scan_prints_file_and_git_progress_summary() {
     assert!(stdout.contains("  Scoring confidence: high"));
     assert!(stdout.contains("Risk"));
     assert!(stdout.contains("  Files by band:"));
-    assert!(!stdout.contains("\nScan\n"));
+    assert!(stdout.contains("\nScan\n"));
+    assert!(stdout.contains("  Type: full"));
+    assert!(stdout.contains("  Files: 2/2 analyzed"));
+    assert!(stdout.contains("  Git history: absent"));
+    assert!(stdout.contains("  Commits: 0/"));
+    assert!(stdout.contains("  Duration: "));
     assert!(!stdout.contains("files_detected"));
     assert!(!stdout.contains("files_analyzed"));
     assert!(!stdout.contains("git_history"));
@@ -335,6 +340,9 @@ fn scan_summary_reports_no_go_coverage_and_limitation() {
     assert!(stdout.contains("  Score: unavailable"));
     assert!(stdout.contains("  Band: unavailable"));
     assert!(stdout.contains("  Primary driver: none"));
+    assert!(stdout.contains("  Files: 1/1 analyzed"));
+    assert!(stdout.contains("  Git history: absent"));
+    assert!(stdout.contains("  Commits: 0/"));
     assert!(!stdout.contains("files_detected"));
     assert!(!stdout.contains("files_analyzed"));
     assert!(stdout.contains("Top Hotspots\n  none"));
@@ -692,7 +700,8 @@ fn scan_reports_actionable_non_git_diagnostic() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
-    assert!(!stdout.contains("\nScan\n"));
+    assert!(stdout.contains("\nScan\n"));
+    assert!(stdout.contains("  Git history: absent"));
     assert!(stdout.contains("Git analysis skipped: current directory is not a Git worktree"));
     assert!(!stdout.contains("diagnostic not_git"));
     assert!(!stdout.contains("index_action cleared_not_git"));
@@ -816,6 +825,12 @@ fn scan_reports_git_progress_for_git_repository() {
     assert!(final_lines.is_empty());
     assert!(stdout.contains("Hotpath scan complete"));
     assert!(stdout.contains("Assessment"));
+    assert!(stdout.contains("\nScan\n"));
+    assert!(stdout.contains("  Type: full"));
+    assert!(stdout.contains("  Files: 1/1 analyzed"));
+    assert!(stdout.contains("  Git history: bounded"));
+    assert!(stdout.contains("  Commits:"));
+    assert!(stdout.contains("  Duration: "));
 
     let connection =
         Connection::open(fixture.path().join(".hotpath").join("index.sqlite")).expect("db opens");
@@ -1305,6 +1320,10 @@ func Stop(enabled bool) int {
     assert!(stdout.contains("Top Hotspots"));
     assert!(stdout.contains("cmd/app/main.go"));
     assert!(stdout.contains("internal/service/a.go"));
+    assert!(stdout.contains("\nScan\n"));
+    assert!(stdout.contains("  Type: full"));
+    assert!(stdout.contains("  Git history: absent"));
+    assert!(stdout.contains("  Commits: 0/"));
     assert!(!stdout.contains("files_detected"));
     assert!(!stdout.contains("files_analyzed"));
     assert!(!stdout.contains("git_history"));
