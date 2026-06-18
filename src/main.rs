@@ -387,6 +387,9 @@ struct ScanJsonScanInfo {
     duration_ms: u64,
     files_detected: u64,
     files_analyzed: u64,
+    git_history: String,
+    commits_processed: u64,
+    commits_total: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -432,6 +435,9 @@ impl ScanJsonOutput {
             duration_ms: run.scan.duration_ms,
             files_detected: run.scan.files_detected,
             files_analyzed: run.scan.files_analyzed,
+            git_history: run.scan.git_history.clone(),
+            commits_processed: run.scan.commits_processed,
+            commits_total: run.scan.commits_total,
         };
 
         let top_hotspots = summary
@@ -491,16 +497,16 @@ fn assessment_reason(run: &ScanRunSummary) -> String {
         run.scoring_confidence.as_str(),
         run.scan.git_history.as_str(),
     ) {
-        (true, "high", _) => "High scoring coverage and repository context are available.",
-        (true, "medium", _) => "Medium scoring coverage and repository context are available.",
-        (false, "none", _) => "No production Go files were scored.",
-        (false, "low", _) => "Scoring coverage is low.",
+        (true, "high", _) => "High scoring coverage and repository context are available",
+        (true, "medium", _) => "Medium scoring coverage and repository context are available",
+        (false, "none", _) => "No production Go files were scored",
+        (false, "low", _) => "Scoring coverage is low",
         (false, confidence @ ("high" | "medium"), "absent") => match confidence {
-            "high" => "High scoring coverage, but repository context is unavailable.",
-            _ => "Medium scoring coverage, but repository context is unavailable.",
+            "high" => "High scoring coverage, but repository context is unavailable",
+            _ => "Medium scoring coverage, but repository context is unavailable",
         },
-        (true, _, _) => "Scoring coverage and repository context are available.",
-        (false, _, _) => "Assessment reliability is limited by incomplete scoring context.",
+        (true, _, _) => "Scoring coverage and repository context are available",
+        (false, _, _) => "Assessment reliability is limited by incomplete scoring context",
     }
     .to_owned()
 }

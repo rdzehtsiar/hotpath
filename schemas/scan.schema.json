@@ -147,7 +147,10 @@
         "type",
         "duration_ms",
         "files_detected",
-        "files_analyzed"
+        "files_analyzed",
+        "git_history",
+        "commits_processed",
+        "commits_total"
       ],
       "properties": {
         "type": {
@@ -162,6 +165,20 @@
         },
         "files_analyzed": {
           "$ref": "#/$defs/non_negative_integer"
+        },
+        "git_history": {
+          "type": "string",
+          "enum": ["full", "bounded", "incremental", "first_parent_only", "absent"],
+          "description": "Git history context used by the assessment."
+        },
+        "commits_processed": {
+          "$ref": "#/$defs/non_negative_integer",
+          "description": "Git commits processed during this scan."
+        },
+        "commits_total": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Total Git commits planned for this scan context, or null when planning did not report a total."
         }
       }
     },

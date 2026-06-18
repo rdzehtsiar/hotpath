@@ -23,7 +23,7 @@ format.
   "assessment": {
     "is_reliable": true,
     "scoring_confidence": "high",
-    "reason": "High scoring coverage and repository context are available."
+    "reason": "High scoring coverage and repository context are available"
   },
   "risk": {
     "score": 6.8,
@@ -43,7 +43,10 @@ format.
     "type": "full",
     "duration_ms": 143,
     "files_detected": 42,
-    "files_analyzed": 42
+    "files_analyzed": 42,
+    "git_history": "bounded",
+    "commits_processed": 128,
+    "commits_total": 512
   },
   "top_hotspots": [
     {
@@ -57,7 +60,7 @@ format.
   "limitations": [
     {
       "code": "language_scope",
-      "message": "Only production Go files receive risk scores in the default summary."
+      "message": "Only production Go files receive risk scores in the default summary"
     }
   ]
 }
@@ -146,6 +149,9 @@ files, vendored files, or Go test files excluded from the production summary.
 | `duration_ms` | integer | yes | Total scan duration in milliseconds. This is runtime metadata and is not deterministic. |
 | `files_detected` | integer | yes | Repository files enumerated after local ignore rules. |
 | `files_analyzed` | integer | yes | Files that completed analysis. |
+| `git_history` | string | yes | Git history context used by the assessment: `full`, `bounded`, `incremental`, `first_parent_only`, or `absent`. |
+| `commits_processed` | integer | yes | Git commits processed during this scan. This is `0` when Git history is unavailable or an incremental scan reuses existing history. |
+| `commits_total` | integer or null | yes | Total Git commits planned for this scan context, or `null` when planning did not report a total. For incremental scans, this can be the incremental range rather than the repository's full commit count. |
 
 ## `top_hotspots`
 

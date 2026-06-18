@@ -137,7 +137,7 @@ fn scan_json_reports_stable_non_git_summary_without_progress() {
     assert_eq!(json["assessment"]["scoring_confidence"], "high");
     assert_eq!(
         json["assessment"]["reason"],
-        "High scoring coverage, but repository context is unavailable."
+        "High scoring coverage, but repository context is unavailable"
     );
     assert!(json.get("assessment_reliable").is_none());
     assert!(json.get("scoring_confidence").is_none());
@@ -161,9 +161,9 @@ fn scan_json_reports_stable_non_git_summary_without_progress() {
     assert!(json["scan"]["duration_ms"].as_u64().is_some());
     assert_eq!(json["scan"]["files_detected"], 2);
     assert_eq!(json["scan"]["files_analyzed"], 2);
-    assert!(json["scan"].get("git_history").is_none());
-    assert!(json["scan"].get("commits_processed").is_none());
-    assert!(json["scan"].get("commits_total").is_none());
+    assert_eq!(json["scan"]["git_history"], "absent");
+    assert_eq!(json["scan"]["commits_processed"], 0);
+    assert_eq!(json["scan"]["commits_total"], 0);
     assert!(json["top_hotspots"].is_array());
     let hotspots = json["top_hotspots"].as_array().unwrap();
     assert!(hotspots.len() <= 5);
@@ -293,7 +293,7 @@ fn scan_json_reports_stable_git_summary() {
     assert_eq!(json["assessment"]["scoring_confidence"], "high");
     assert_eq!(
         json["assessment"]["reason"],
-        "High scoring coverage and repository context are available."
+        "High scoring coverage and repository context are available"
     );
     assert!(json.get("assessment_reliable").is_none());
     assert!(json.get("scoring_confidence").is_none());
@@ -307,9 +307,9 @@ fn scan_json_reports_stable_git_summary() {
     assert!(json["scan"]["duration_ms"].as_u64().is_some());
     assert_eq!(json["scan"]["files_detected"], 1);
     assert_eq!(json["scan"]["files_analyzed"], 1);
-    assert!(json["scan"].get("git_history").is_none());
-    assert!(json["scan"].get("commits_processed").is_none());
-    assert!(json["scan"].get("commits_total").is_none());
+    assert_ne!(json["scan"]["git_history"], "absent");
+    assert_eq!(json["scan"]["commits_processed"], 2);
+    assert_eq!(json["scan"]["commits_total"], 2);
     assert!(json["top_hotspots"].is_array());
     assert!(json["limitations"].is_array());
     assert_json_has_no_empty_or_placeholder_limitations(&json);
@@ -1521,12 +1521,12 @@ fn second_scan_skips_git_when_head_is_unchanged() {
     assert_eq!(json["assessment"]["scoring_confidence"], "high");
     assert_eq!(
         json["assessment"]["reason"],
-        "High scoring coverage and repository context are available."
+        "High scoring coverage and repository context are available"
     );
     assert_eq!(json["scan"]["type"], "incremental");
-    assert!(json["scan"].get("git_history").is_none());
-    assert!(json["scan"].get("commits_processed").is_none());
-    assert!(json["scan"].get("commits_total").is_none());
+    assert_eq!(json["scan"]["git_history"], "incremental");
+    assert_eq!(json["scan"]["commits_processed"], 0);
+    assert_eq!(json["scan"]["commits_total"], 1);
 
     let connection =
         Connection::open(fixture.path().join(".hotpath").join("index.sqlite")).expect("db opens");
@@ -1611,12 +1611,12 @@ fn second_scan_processes_only_new_git_commits_when_head_advances() {
     assert_eq!(json["assessment"]["scoring_confidence"], "high");
     assert_eq!(
         json["assessment"]["reason"],
-        "High scoring coverage and repository context are available."
+        "High scoring coverage and repository context are available"
     );
     assert_eq!(json["scan"]["type"], "incremental");
-    assert!(json["scan"].get("git_history").is_none());
-    assert!(json["scan"].get("commits_processed").is_none());
-    assert!(json["scan"].get("commits_total").is_none());
+    assert_eq!(json["scan"]["git_history"], "incremental");
+    assert_eq!(json["scan"]["commits_processed"], 1);
+    assert_eq!(json["scan"]["commits_total"], 1);
 
     let connection =
         Connection::open(fixture.path().join(".hotpath").join("index.sqlite")).expect("db opens");
