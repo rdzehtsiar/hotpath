@@ -339,9 +339,38 @@ fn scan_summary_reports_no_go_coverage_and_limitation() {
     assert!(!stdout.contains("files_analyzed"));
     assert!(stdout.contains("Top Hotspots\n  none"));
     assert!(stdout.contains("  - No Go file risk scores are available"));
+    assert!(!stdout.contains("  - Only a small share of active files has Go risk scores"));
     assert!(!stdout.contains("  - \n"));
     assert!(!stdout.contains("  - No Go file risk scores are available."));
     assert!(!stdout.contains("Index\n  .hotpath/index.sqlite"));
+}
+
+#[test]
+fn scan_json_reports_direct_no_score_limitation_without_overlap() {
+    let fixture = Fixture::new("scan-json-no-score-limitations");
+    fixture.write("README.md", "hello\n");
+
+    let output = hotpath(&["scan", "--json"], &fixture.path);
+
+    assert!(
+        output.status.success(),
+        "hotpath scan --json failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    let json: Value = serde_json::from_str(&stdout).expect("stdout should be JSON");
+
+    assert_eq!(json["risk"]["band"], "unavailable");
+    let codes = limitation_codes(&json);
+    assert_eq!(codes.first(), Some(&"no_scored_files"));
+    assert!(codes.contains(&"git_index_unavailable"));
+    assert!(!codes.contains(&"low_language_coverage"));
+    assert!(!codes.contains(&"partial_go_score_coverage"));
+    assert_json_has_no_empty_or_placeholder_limitations(&json);
+    assert_json_limitation_messages_are_sentences(&json);
 }
 
 #[test]
@@ -1760,6 +1789,19 @@ fn assert_json_has_no_empty_or_placeholder_limitations(json: &Value) {
         );
         assert_ne!(message, "Limitation details are unavailable");
     }
+}
+
+fn limitation_codes(json: &Value) -> Vec<&str> {
+    json["limitations"]
+        .as_array()
+        .expect("limitations should be an array")
+        .iter()
+        .map(|limitation| {
+            limitation["code"]
+                .as_str()
+                .expect("limitation code should be a string")
+        })
+        .collect()
 }
 
 fn create_index_lock(root: &Path, contents: &str) {

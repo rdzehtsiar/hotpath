@@ -34,13 +34,13 @@ impl RepoRiskAssessor {
                 message: "No Go file risk scores are available.",
             });
         }
-        if matches!(confidence, "low" | "none") {
+        if scored_file_count > 0 && matches!(confidence, "low" | "none") {
             limitations.push(ProjectRiskLimitation {
                 code: "low_language_coverage",
                 message: "Only a small share of active files has Go risk scores.",
             });
         }
-        if go_score_coverage.is_some_and(|coverage| coverage < 1.0) {
+        if scored_file_count > 0 && go_score_coverage.is_some_and(|coverage| coverage < 1.0) {
             limitations.push(ProjectRiskLimitation {
                 code: "partial_go_score_coverage",
                 message: "Some active Go files do not have persisted risk scores.",
@@ -387,6 +387,10 @@ mod tests {
             .limitations
             .iter()
             .any(|limitation| limitation.code == "no_scored_files"));
+        assert!(!assessment
+            .limitations
+            .iter()
+            .any(|limitation| limitation.code == "low_language_coverage"));
     }
 
     #[test]
@@ -431,6 +435,61 @@ mod tests {
             .limitations
             .iter()
             .any(|limitation| limitation.code == "low_language_coverage"));
+    }
+
+    #[test]
+    fn limitations_are_direct_for_zero_scored_files() {
+        let assessment = RepoRiskAssessor::new().assess(&RepoRiskInput {
+            active_file_count: 3,
+            active_go_file_count: 2,
+            git_index_status: "available".to_owned(),
+            files: Vec::new(),
+            terms: Vec::new(),
+        });
+
+        assert_eq!(limitation_codes(&assessment), vec!["no_scored_files"]);
+        assert_eq!(assessment.confidence, "none");
+    }
+
+    #[test]
+    fn limitations_warn_for_partial_scored_files() {
+        let assessment = RepoRiskAssessor::new().assess(&RepoRiskInput {
+            active_file_count: 10,
+            active_go_file_count: 2,
+            git_index_status: "available".to_owned(),
+            files: vec![file("a.go", 0.3)],
+            terms: Vec::new(),
+        });
+
+        assert_eq!(
+            limitation_codes(&assessment),
+            vec!["low_language_coverage", "partial_go_score_coverage"]
+        );
+        assert_eq!(assessment.confidence, "low");
+        assert_eq!(assessment.go_score_coverage, Some(0.5));
+    }
+
+    #[test]
+    fn limitations_are_empty_for_healthy_go_scoring_coverage() {
+        let assessment = RepoRiskAssessor::new().assess(&RepoRiskInput {
+            active_file_count: 3,
+            active_go_file_count: 3,
+            git_index_status: "available".to_owned(),
+            files: vec![file("a.go", 0.3), file("b.go", 0.4), file("c.go", 0.5)],
+            terms: Vec::new(),
+        });
+
+        assert_eq!(limitation_codes(&assessment), Vec::<&str>::new());
+        assert_eq!(assessment.confidence, "high");
+        assert_eq!(assessment.go_score_coverage, Some(1.0));
+    }
+
+    fn limitation_codes(assessment: &super::RepoRiskAssessment) -> Vec<&'static str> {
+        assessment
+            .limitations
+            .iter()
+            .map(|limitation| limitation.code)
+            .collect()
     }
 
     fn file(relative_path: &str, score: f64) -> ProjectFileRiskInput {
