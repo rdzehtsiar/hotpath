@@ -82,7 +82,7 @@ fn scan_prints_file_and_git_progress_summary() {
     assert!(stdout.contains("  Scoring confidence: high"));
     assert!(stdout.contains("Risk"));
     assert!(stdout.contains("  Files by band:"));
-    assert!(!stdout.contains("\nScan\n"));
+    assert!(stdout.contains("\nScan\n"));
     assert!(!stdout.contains("files_detected"));
     assert!(!stdout.contains("files_analyzed"));
     assert!(!stdout.contains("git_history"));
@@ -95,6 +95,65 @@ fn scan_prints_file_and_git_progress_summary() {
     let connection =
         Connection::open(fixture.path.join(".hotpath").join("index.sqlite")).expect("db opens");
     assert_eq!(row_count(&connection, "file_analysis"), 2);
+}
+
+#[test]
+fn scan_human_summary_matches_first_run_golden_for_tiny_go_repo() {
+    let fixture = Fixture::new("scan-human-golden");
+    fixture.write(
+        "main.go",
+        "package main\n\nfunc main() {\n\tprintln(\"hello\")\n}\n",
+    );
+
+    let output = hotpath(&["scan"], &fixture.path);
+
+    assert!(
+        output.status.success(),
+        "hotpath scan failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.ends_with('\n'));
+    assert!(!stdout.contains("\u{1b}["));
+    assert!(!stdout.contains("| speed"));
+    assert!(!stdout.contains(&fixture.path.display().to_string()));
+
+    let normalized = normalize_scan_duration(&stdout);
+    let expected = "\
+Hotpath scan complete
+
+Assessment
+  Reliable: false
+  Scoring confidence: high
+  Reason: High scoring coverage, but repository context is unavailable.
+
+Scan
+  Type: full
+  Duration: <duration-ms> ms
+  Files: 1 detected, 1 analyzed
+  Git history: absent
+  Commits processed: 0 of 0
+
+Risk
+  Score: 0.0
+  Band: low
+  Primary driver: none
+  Files by band: extreme 0  high 0  medium 0  low 1
+
+Top Hotspots
+
+ 1  main.go
+    Advisory risk score 0.001 from local file, Git, source coupling pressure, and complexity pressure signals
+
+Limitations
+  - Git-derived repository context is unavailable
+  - Git analysis skipped: current directory is not a Git worktree
+";
+
+    assert_eq!(normalized, expected);
 }
 
 #[test]
@@ -692,7 +751,7 @@ fn scan_reports_actionable_non_git_diagnostic() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
-    assert!(!stdout.contains("\nScan\n"));
+    assert!(stdout.contains("\nScan\n"));
     assert!(stdout.contains("Git analysis skipped: current directory is not a Git worktree"));
     assert!(!stdout.contains("diagnostic not_git"));
     assert!(!stdout.contains("index_action cleared_not_git"));
@@ -1699,6 +1758,21 @@ fn final_scan_lines(stdout: &str) -> Vec<String> {
         .collect();
 
     progress_lines[progress_lines.len().saturating_sub(3)..].to_vec()
+}
+
+fn normalize_scan_duration(stdout: &str) -> String {
+    stdout
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("Duration: ") {
+                "  Duration: <duration-ms> ms"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
 }
 
 fn strip_ansi(input: &str) -> String {

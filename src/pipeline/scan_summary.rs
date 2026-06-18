@@ -244,6 +244,8 @@ pub fn render_scan_summary(summary: &ScanSummary, run: &ScanRunSummary) -> Strin
     lines.push(String::new());
     lines.extend(render_assessment(run));
     lines.push(String::new());
+    lines.extend(render_scan(&run.scan));
+    lines.push(String::new());
     lines.extend(render_risk(&run.risk));
     lines.push(String::new());
     lines.extend(render_hotspots(&summary.hotspots));
@@ -516,6 +518,25 @@ fn assessment_reason(run: &ScanRunSummary) -> &'static str {
     }
 }
 
+fn render_scan(scan: &ScanRunInfo) -> Vec<String> {
+    let commits = scan
+        .commits_total
+        .map(|total| format!("{} of {total}", scan.commits_processed))
+        .unwrap_or_else(|| scan.commits_processed.to_string());
+
+    vec![
+        "Scan".to_owned(),
+        format!("  Type: {}", scan.scan_type),
+        format!("  Duration: {} ms", scan.duration_ms),
+        format!(
+            "  Files: {} detected, {} analyzed",
+            scan.files_detected, scan.files_analyzed
+        ),
+        format!("  Git history: {}", scan.git_history),
+        format!("  Commits processed: {commits}"),
+    ]
+}
+
 fn render_risk(risk: &RiskSummary) -> Vec<String> {
     let score = risk
         .score
@@ -679,7 +700,9 @@ mod tests {
         assert!(rendered.contains("  Primary driver: Churn"));
         assert!(!rendered.contains("  Primary driver: churn (Churn)"));
         assert!(rendered.contains("  Files by band: extreme 0  high 1  medium 1  low 0"));
-        assert!(!rendered.contains("\nScan\n"));
+        assert!(rendered.contains("\nScan\n"));
+        assert!(rendered.contains("  Type: full"));
+        assert!(rendered.contains("  Files: 3 detected, 3 analyzed"));
         assert!(!rendered.contains("duration_ms"));
         assert!(!rendered.contains("files_detected"));
         assert!(rendered.contains("Top Hotspots\n\n 1  internal/service/a.go"));
@@ -710,7 +733,8 @@ mod tests {
         assert!(rendered.contains("  Score: unavailable"));
         assert!(rendered.contains("  Band: unavailable"));
         assert!(rendered.contains("  Primary driver: none"));
-        assert!(!rendered.contains("\nScan\n"));
+        assert!(rendered.contains("\nScan\n"));
+        assert!(rendered.contains("  Files: 0 detected, 0 analyzed"));
         assert!(rendered.contains("Top Hotspots\n  none"));
         assert!(rendered.contains("Limitations\n  none"));
     }
