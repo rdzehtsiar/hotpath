@@ -319,7 +319,10 @@ fn scan_json_reports_stable_git_summary() {
 #[test]
 fn scan_summary_reports_no_go_coverage_and_limitation() {
     let fixture = Fixture::new("scan-no-go-summary");
-    fixture.write("README.md", "hello\n");
+    fixture.write(
+        "src/main.rs",
+        "fn main() { println!(\"hello from rust\"); }\n",
+    );
 
     let output = hotpath(&["scan"], &fixture.path);
 
@@ -332,6 +335,10 @@ fn scan_summary_reports_no_go_coverage_and_limitation() {
 
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     assert!(stdout.contains("  Reliable: false"));
+    assert!(stdout.contains("  Scoring confidence: none"));
+    assert!(stdout.contains(
+        "  Reason: No production Go files were scored because project risk scoring is Go-only."
+    ));
     assert!(stdout.contains("  Score: unavailable"));
     assert!(stdout.contains("  Band: unavailable"));
     assert!(stdout.contains("  Primary driver: none"));
@@ -342,6 +349,11 @@ fn scan_summary_reports_no_go_coverage_and_limitation() {
     assert!(!stdout.contains("  - \n"));
     assert!(!stdout.contains("  - No Go file risk scores are available."));
     assert!(!stdout.contains("Index\n  .hotpath/index.sqlite"));
+    assert_text_limitations_are_not_repetitive(&stdout);
+
+    let connection =
+        Connection::open(fixture.path.join(".hotpath").join("index.sqlite")).expect("db opens");
+    assert_eq!(row_count(&connection, "file_analysis"), 1);
 }
 
 #[test]
@@ -1744,6 +1756,22 @@ fn assert_json_limitation_messages_are_sentences(json: &Value) {
             "limitation message should not end with a period: {message}"
         );
     }
+}
+
+fn assert_text_limitations_are_not_repetitive(stdout: &str) {
+    let limitation_lines = stdout
+        .lines()
+        .filter(|line| line.starts_with("  - "))
+        .collect::<Vec<_>>();
+    let unique = limitation_lines
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        limitation_lines.len(),
+        unique.len(),
+        "limitations should not repeat:\n{stdout}"
+    );
 }
 
 fn assert_json_has_no_empty_or_placeholder_limitations(json: &Value) {

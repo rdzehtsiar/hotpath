@@ -493,7 +493,9 @@ fn assessment_reason(run: &ScanRunSummary) -> String {
     ) {
         (true, "high", _) => "High scoring coverage and repository context are available.",
         (true, "medium", _) => "Medium scoring coverage and repository context are available.",
-        (false, "none", _) => "No production Go files were scored.",
+        (false, "none", _) => {
+            "No production Go files were scored because project risk scoring is Go-only."
+        }
         (false, "low", _) => "Scoring coverage is low.",
         (false, confidence @ ("high" | "medium"), "absent") => match confidence {
             "high" => "High scoring coverage, but repository context is unavailable.",
