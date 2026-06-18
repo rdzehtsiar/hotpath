@@ -174,6 +174,44 @@ fn scan_json_reports_stable_non_git_summary_without_progress() {
 }
 
 #[test]
+fn scan_json_stdout_validates_against_documented_schema() {
+    let fixture = Fixture::new("scan-json-schema");
+    fixture.write("main.go", "package main\n\nfunc main() {}\n");
+
+    let output = hotpath(&["scan", "--json"], &fixture.path);
+
+    assert!(
+        output.status.success(),
+        "hotpath scan --json failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    let json: Value = serde_json::from_str(&stdout).expect("stdout should be JSON");
+    let schema_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("schemas")
+        .join("scan.schema.json");
+    let schema: Value = serde_json::from_str(
+        &fs::read_to_string(&schema_path).expect("scan JSON schema should be readable"),
+    )
+    .expect("scan JSON schema should be JSON");
+    let validator = jsonschema::JSONSchema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .compile(&schema)
+        .expect("scan JSON schema should compile");
+
+    if let Err(errors) = validator.validate(&json) {
+        let messages = errors
+            .map(|error| format!("{}: {}", error.instance_path, error))
+            .collect::<Vec<_>>()
+            .join("\n");
+        panic!("scan --json output did not match {schema_path:?}\n{messages}");
+    };
+}
+
+#[test]
 fn scan_json_pretty_prints_with_four_space_indentation() {
     let fixture = Fixture::new("scan-json-pretty");
     fixture.write("main.go", "package main\n");
