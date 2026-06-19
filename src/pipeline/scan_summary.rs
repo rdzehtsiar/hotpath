@@ -505,7 +505,9 @@ fn assessment_reason(run: &ScanRunSummary) -> &'static str {
     ) {
         (true, "high", _) => "High scoring coverage and repository context are available.",
         (true, "medium", _) => "Medium scoring coverage and repository context are available.",
-        (false, "none", _) => "No production Go files were scored.",
+        (false, "none", _) => {
+            "Files were scanned, but no production Go files were available for the current Go-only scoring model."
+        }
         (false, "low", _) => "Scoring coverage is low.",
         (false, "high", "absent") => {
             "High scoring coverage, but repository context is unavailable."
@@ -733,6 +735,10 @@ mod tests {
 
         assert!(rendered.contains("  Reliable: false"));
         assert!(rendered.contains("  Scoring confidence: none"));
+        assert!(rendered.contains(
+            "  Reason: Files were scanned, but no production Go files were available for the current Go-only scoring model."
+        ));
+        assert!(!rendered.contains("No production Go files were scored."));
         assert!(rendered.contains("  Score: unavailable"));
         assert!(rendered.contains("  Band: unavailable"));
         assert!(rendered.contains("  Primary driver: none"));

@@ -10,6 +10,8 @@ const COUNT_VALUE_WIDTH: usize = 9;
 const TOTAL_VALUE_WIDTH: usize = 10;
 const SPEED_VALUE_WIDTH: usize = 10;
 const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(100);
+const UNICODE_PROGRESS_BOUNDARY: &str = "│";
+const UNICODE_PROGRESS_FILL: &str = "█";
 #[cfg(windows)]
 const UTF8_CODE_PAGE: u32 = 65001;
 
@@ -217,7 +219,11 @@ fn render_progress_bar_with_style(
 
     match style {
         ProgressBarStyle::Unicode => {
-            format!("│{}{}│", "█".repeat(filled), " ".repeat(width - filled))
+            format!(
+                "{UNICODE_PROGRESS_BOUNDARY}{}{spaces}{UNICODE_PROGRESS_BOUNDARY}",
+                UNICODE_PROGRESS_FILL.repeat(filled),
+                spaces = " ".repeat(width - filled)
+            )
         }
         ProgressBarStyle::Ascii => {
             format!("[{}{}]", "#".repeat(filled), " ".repeat(width - filled))
@@ -296,9 +302,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ascii_only_terminal_for, render_progress_bar, render_progress_row, render_report_lines,
-        render_report_lines_with_style, PipelineReporter, ProgressBarStyle, StdioReporter,
-        TerminalPlatform,
+        ascii_only_terminal_for, render_progress_bar, render_progress_bar_with_style,
+        render_progress_row, render_report_lines, render_report_lines_with_style, PipelineReporter,
+        ProgressBarStyle, StdioReporter, TerminalPlatform,
     };
     use crate::pipeline::events::{GitStatus, PipelineState};
 
@@ -415,10 +421,16 @@ mod tests {
         assert_eq!(render_progress_bar(1, 2, 4), "│██  │");
         assert_eq!(render_progress_bar(4, 4, 4), "│████│");
         assert_eq!(render_progress_bar(5, 4, 4), "│████│");
+        assert_eq!(render_progress_bar(4, 8, 8), "│████    │");
     }
 
     #[test]
     fn ascii_progress_bar_is_available_as_fallback() {
+        assert_eq!(
+            render_progress_bar_with_style(4, Some(8), 8, ProgressBarStyle::Ascii),
+            "[####    ]"
+        );
+
         let state = PipelineState {
             total_files: Some(2),
             analyzed_files: 1,

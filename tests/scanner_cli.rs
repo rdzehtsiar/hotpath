@@ -103,6 +103,65 @@ fn scan_prints_file_and_git_progress_summary() {
 }
 
 #[test]
+fn scan_human_summary_matches_first_run_golden_for_tiny_go_repo() {
+    let fixture = Fixture::new("scan-human-golden");
+    fixture.write(
+        "main.go",
+        "package main\n\nfunc main() {\n\tprintln(\"hello\")\n}\n",
+    );
+
+    let output = hotpath(&["scan"], &fixture.path);
+
+    assert!(
+        output.status.success(),
+        "hotpath scan failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.ends_with('\n'));
+    assert!(!stdout.contains("\u{1b}["));
+    assert!(!stdout.contains("| speed"));
+    assert!(!stdout.contains(&fixture.path.display().to_string()));
+
+    let normalized = normalize_scan_duration(&stdout);
+    let expected = "\
+Hotpath scan complete
+
+Assessment
+  Reliable: false
+  Scoring confidence: high
+  Reason: High scoring coverage, but repository context is unavailable.
+
+Risk
+  Score: 0.0
+  Band: low
+  Primary driver: none
+  Files by band: extreme 0  high 0  medium 0  low 1
+
+Scan
+  Type: full
+  Files: 1/1 analyzed
+  Git history: absent
+  Commits: 0/0
+  Duration: <duration-ms> ms
+
+Top Hotspots
+
+ 1  main.go
+    Advisory risk score 0.001 from local file, Git, source coupling pressure, and complexity pressure signals
+
+Limitations
+  - Git-derived repository context is unavailable
+  - Git analysis skipped: current directory is not a Git worktree
+";
+
+    assert_eq!(normalized, expected);
+}
+
+#[test]
 fn scan_json_reports_stable_non_git_summary_without_progress() {
     let fixture = Fixture::new("scan-json-non-git");
     fixture.write("main.go", "package main\n");
@@ -246,7 +305,7 @@ fn scan_json_pretty_prints_with_four_space_indentation() {
 }
 
 #[test]
-fn scan_pretty_requires_json() {
+fn release_smoke_scan_pretty_without_json_fails_with_helpful_clap_error() {
     let fixture = Fixture::new("scan-pretty-without-json");
 
     let output = hotpath(&["scan", "--pretty"], &fixture.path);
@@ -255,7 +314,52 @@ fn scan_pretty_requires_json() {
     assert!(output.stdout.is_empty());
 
     let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
-    assert!(stderr.contains("--json"));
+    assert!(
+        stderr.contains("error:"),
+        "stderr:
+{stderr}"
+    );
+    assert!(
+        stderr.contains("--pretty"),
+        "stderr:
+{stderr}"
+    );
+    assert!(
+        stderr.contains("--json"),
+        "stderr:
+{stderr}"
+    );
+}
+
+#[test]
+fn release_smoke_scan_full_succeeds_from_existing_index() {
+    let fixture = Fixture::new("scan-full-existing-index");
+    fixture.write("main.go", "package main\n");
+
+    let initial = hotpath(&["scan", "--json"], &fixture.path);
+    assert!(
+        initial.status.success(),
+        "initial scan failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&initial.stdout),
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    assert!(fixture.path.join(".hotpath").join("index.sqlite").exists());
+
+    let output = hotpath(&["scan", "--full", "--json"], &fixture.path);
+
+    assert!(
+        output.status.success(),
+        "hotpath scan --full --json failed from existing index\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    let json: Value = serde_json::from_str(&stdout).expect("stdout should be JSON");
+    assert_eq!(json["scan"]["type"], "full");
+    assert_eq!(json["scan"]["files_detected"], 1);
+    assert_eq!(json["scan"]["files_analyzed"], 1);
 }
 
 #[test]
@@ -324,7 +428,10 @@ fn scan_json_reports_stable_git_summary() {
 #[test]
 fn scan_summary_reports_no_go_coverage_and_limitation() {
     let fixture = Fixture::new("scan-no-go-summary");
-    fixture.write("README.md", "hello\n");
+    fixture.write(
+        "src/main.rs",
+        "fn main() { println!(\"hello from rust\"); }\n",
+    );
 
     let output = hotpath(&["scan"], &fixture.path);
 
@@ -336,7 +443,14 @@ fn scan_summary_reports_no_go_coverage_and_limitation() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.contains("Assessment"));
     assert!(stdout.contains("  Reliable: false"));
+    assert!(stdout.contains("  Scoring confidence: none"));
+    assert!(stdout.contains(
+        "  Reason: Files were scanned, but no production Go files were available for the current Go-only scoring model."
+    ));
+    assert!(!stdout.contains("No production Go files were scored."));
+    assert!(stdout.contains("Risk"));
     assert!(stdout.contains("  Score: unavailable"));
     assert!(stdout.contains("  Band: unavailable"));
     assert!(stdout.contains("  Primary driver: none"));
@@ -351,6 +465,11 @@ fn scan_summary_reports_no_go_coverage_and_limitation() {
     assert!(!stdout.contains("  - \n"));
     assert!(!stdout.contains("  - No Go file risk scores are available."));
     assert!(!stdout.contains("Index\n  .hotpath/index.sqlite"));
+    assert_text_limitations_are_not_repetitive(&stdout);
+
+    let connection =
+        Connection::open(fixture.path.join(".hotpath").join("index.sqlite")).expect("db opens");
+    assert_eq!(row_count(&connection, "file_analysis"), 1);
 }
 
 #[test]
@@ -1709,7 +1828,7 @@ fn removed_commands_fail_as_unknown_commands() {
 }
 
 #[test]
-fn scan_json_flag_is_recognized_by_clap() {
+fn release_smoke_scan_help_mentions_json_pretty_and_full_rebuild() {
     let fixture = Fixture::new("scan-json-help");
 
     let output = hotpath(&["scan", "--help"], &fixture.path);
@@ -1723,7 +1842,12 @@ fn scan_json_flag_is_recognized_by_clap() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     assert!(stdout.contains("Usage:"));
     assert!(stdout.contains("--json"));
+    assert!(stdout.contains("stable JSON scan summary"));
     assert!(stdout.contains("--pretty"));
+    assert!(stdout.contains("requires --json"));
+    assert!(stdout.contains("--full"));
+    assert!(stdout.contains("full rebuild"));
+    assert!(stdout.contains("existing local index"));
     assert!(!stdout.contains("--verbose"));
 }
 
@@ -1747,6 +1871,21 @@ fn final_scan_lines(stdout: &str) -> Vec<String> {
         .collect();
 
     progress_lines[progress_lines.len().saturating_sub(3)..].to_vec()
+}
+
+fn normalize_scan_duration(stdout: &str) -> String {
+    stdout
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("Duration: ") {
+                "  Duration: <duration-ms> ms"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
 }
 
 fn strip_ansi(input: &str) -> String {
@@ -1792,6 +1931,22 @@ fn assert_json_limitation_messages_are_sentences(json: &Value) {
             "limitation message should not end with a period: {message}"
         );
     }
+}
+
+fn assert_text_limitations_are_not_repetitive(stdout: &str) {
+    let limitation_lines = stdout
+        .lines()
+        .filter(|line| line.starts_with("  - "))
+        .collect::<Vec<_>>();
+    let unique = limitation_lines
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        limitation_lines.len(),
+        unique.len(),
+        "limitations should not repeat:\n{stdout}"
+    );
 }
 
 fn assert_json_has_no_empty_or_placeholder_limitations(json: &Value) {
